@@ -10,7 +10,7 @@
 [![bun](https://img.shields.io/npm/v/@pipo/brain?label=bun&logo=bun&color=%23f9f1e1)](https://bun.sh/packages/@pipo/brain)
 [![License](https://img.shields.io/badge/license-RSALv2-blue)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Bun-%23f9f1e1)](https://bun.sh)
-[![Website](https://img.shields.io/badge/website-pipo-ke.com-black)](https://pipo-ke.com)
+[![Website](https://img.shields.io/static/v1?label=website&message=pipo-ke.com&color=black)](https://pipo-ke.com)
 
 _An autonomous workflow daemon with desktop awareness, multi-agent delegation, visual workflows, and explicit authority controls._
 
