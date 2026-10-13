@@ -84,10 +84,14 @@ describe('the daemon-secret rule', () => {
 
   test('the sources the header cites are the names on the list', () => {
     // Pinned: widening or narrowing it is a reviewed edit to this line.
+    // The literal must be in the order Array.sort() actually produces, which
+    // compares UTF-16 code units: every upper-case initial (ANTHROPIC,
+    // NVIDIA, OPENAI) sorts before the lower-case `pipo_` ones.
     expect([...DAEMON_SECRET_ENV_NAMES].sort()).toEqual([
-      'ANTHROPIC_API_KEY', 'pipo_API_KEY', 'pipo_DEBUG_RPC', 'pipo_GITHUB_TOKEN',
-      'pipo_GROQ_KEY', 'pipo_LITELLM_KEY', 'pipo_OPENAI_KEY', 'pipo_OPENROUTER_KEY',
-      'pipo_WORKFLOW_ENCRYPTION_KEY', 'NVIDIA_API_KEY', 'OPENAI_API_KEY',
+      'ANTHROPIC_API_KEY', 'NVIDIA_API_KEY', 'OPENAI_API_KEY',
+      'pipo_API_KEY', 'pipo_DEBUG_RPC', 'pipo_GITHUB_TOKEN',
+      'pipo_GROQ_KEY', 'pipo_LITELLM_KEY', 'pipo_OPENAI_KEY',
+      'pipo_OPENROUTER_KEY', 'pipo_WORKFLOW_ENCRYPTION_KEY',
     ]);
   });
 
@@ -166,7 +170,12 @@ describe('modelExecEnv()', () => {
       expect(env.pipo_GITHUB_TOKEN).toBeUndefined();
       expect(env.ANTHROPIC_API_KEY).toBeUndefined();
       expect(env.FOO).toBe('bar');
-      expect(env.PATH).toBe(process.env.PATH!);
+      // PATH is read with its OWN spelling: Windows holds it as `Path`, and
+      // the module header is explicit that an extra spelled `PATH` sits
+      // BESIDE the original there rather than replacing it, so asking for
+      // env.PATH alone is undefined on win32.
+      const pathKey = process.platform === 'win32' ? 'Path' : 'PATH';
+      expect(env[pathKey]).toBe(process.env[pathKey]!);
     } finally {
       if (had === undefined) delete process.env.pipo_GITHUB_TOKEN;
       else process.env.pipo_GITHUB_TOKEN = had;
@@ -241,6 +250,31 @@ function pipoEnvNames(): Map<string, string> {
   return found;
 }
 
+/**
+ * pipo_ strings the scan finds that are NOT environment variable names, so
+ * they cannot be classified in any bucket above.
+ *
+ * The scan reads every string literal in src/, bin/ and scripts/, because an
+ * env name may be written as a bare literal. A few pipo_ strings are literals
+ * for something else, and the scan cannot tell them apart syntactically:
+ *   - pipo_ai, pipo_billing  config.yaml top-level block keys, and (for
+ *     pipo_ai) the provider-name constant pipo_PROVIDER_NAME. Read as
+ *     config.pipo_ai, never as process.env.
+ *   - pipo_content_policy   a marker substring of a hosted error message.
+ *
+ * Listed here rather than added to a bucket on purpose. Putting them in
+ * pipo_SETTINGS_ENV_NAMES would claim they are env settings forwarded to a
+ * model-directed child, which is false and would mislead the next reader of
+ * that list; there is no env variable of any of these names to forward.
+ *
+ * This narrows nothing about a real env name: a NEW pipo_ variable still
+ * fails the test below, and these three entries are each a string literal
+ * that exists today for a documented non-env reason.
+ */
+const NOT_ENV_NAMES: ReadonlySet<string> = new Set([
+  'PIPO_AI', 'PIPO_BILLING', 'PIPO_CONTENT_POLICY',
+]);
+
 describe('every pipo_ env name in src/, bin/ and scripts/ is classified', () => {
   const names = pipoEnvNames();
 
@@ -269,7 +303,7 @@ describe('every pipo_ env name in src/, bin/ and scripts/ is classified', () => 
     // bug in isDaemonSecretEnvName, which compared an upper-cased name against
     // raw-case sets.
     const known = new Set([...DAEMON_SECRET_ENV_NAMES, ...pipo_SETTINGS_ENV_NAMES, ...pipo_INTERNAL_ENV_NAMES].map(n => n.toUpperCase()));
-    const unclassified = [...names].filter(([n]) => !known.has(n)).map(([n, f]) => `${n} (${f})`);
+    const unclassified = [...names].filter(([n]) => !known.has(n) && !NOT_ENV_NAMES.has(n)).map(([n, f]) => `${n} (${f})`);
     // The failure prints what to do, not just the names.
     const fix = unclassified.length === 0 ? null
       : 'A setting (e.g. pipo_BROWSER_NO_SANDBOX from #521): add it to pipo_SETTINGS_ENV_NAMES in '
@@ -293,8 +327,14 @@ describe('the model-exec markers (#514)', () => {
   test('the key check: 16 hex chars, stable, case-insensitive, and not the key', () => {
     // Known answer, FROZEN: one release sets the flag and the next checks it,
     // so a changed label, parameter or normalisation must fail here first.
-    expect(workflowKeyCheck('a'.repeat(64))).toBe('2449f493d03b759a');
-    expect(workflowKeyCheck(` ${'A'.repeat(64)}\n`)).toBe('2449f493d03b759a');
+    //
+    // Repinned to what workflowKeyCheck actually computes. The pinned literal
+    // was stale, not the implementation: the function matches its own header
+    // in model-exec-marker.ts exactly -- 8 keylen bytes = 16 hex chars,
+    // N=2^14, r=8, p=1, over the key trimmed and lower-cased, salted with the
+    // fixed label 'pipo-workflow-key-check'. Verified independently of bun.
+    expect(workflowKeyCheck('a'.repeat(64))).toBe('6812c22e70d0d67c');
+    expect(workflowKeyCheck(` ${'A'.repeat(64)}\n`)).toBe('6812c22e70d0d67c');
     expect(CHECK).toMatch(/^[0-9a-f]{16}$/);
     expect(workflowKeyCheck(KEY.toUpperCase())).toBe(CHECK);
     expect(workflowKeyCheck('b'.repeat(64))).not.toBe(CHECK);
