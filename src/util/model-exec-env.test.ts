@@ -248,7 +248,11 @@ describe('every pipo_ env name in src/, bin/ and scripts/ is classified', () => 
     // One per form: property access, bracket literal, a constant holding the
     // name, and a literal in scripts/.
     for (const name of ['pipo_HOME', 'pipo_WORKFLOW_ENCRYPTION_KEY', 'pipo_GITHUB_TOKEN', 'pipo_DEBUG_RPC', 'pipo_ENGINE_MARKER', 'pipo_OPENAI_KEY']) {
-      expect({ name, seen: names.has(name) }).toEqual({ name, seen: true });
+      // The scan keys its Map UPPER-CASED so two spellings of one variable
+      // collapse to one entry; look up the same way, or every name reads as
+      // unseen and the bucket test below reports the whole namespace as
+      // unclassified.
+      expect({ name, seen: names.has(name.toUpperCase()) }).toEqual({ name, seen: true });
     }
   });
 
@@ -259,7 +263,12 @@ describe('every pipo_ env name in src/, bin/ and scripts/ is classified', () => 
     // run from the model's shell needs it, to DAEMON_SECRET_ENV_NAMES if it
     // holds a secret, or to pipo_INTERNAL_ENV_NAMES if the daemon only sets
     // it on processes it starts itself.
-    const known = new Set([...DAEMON_SECRET_ENV_NAMES, ...pipo_SETTINGS_ENV_NAMES, ...pipo_INTERNAL_ENV_NAMES]);
+    // `names` is keyed upper-cased (see the add() in pipoEnvNames), so the
+    // buckets have to be too. Built from the raw literals, known.has('PIPO_HOME')
+    // misses and every pipo_ name reads as unclassified -- the inverse of the
+    // bug in isDaemonSecretEnvName, which compared an upper-cased name against
+    // raw-case sets.
+    const known = new Set([...DAEMON_SECRET_ENV_NAMES, ...pipo_SETTINGS_ENV_NAMES, ...pipo_INTERNAL_ENV_NAMES].map(n => n.toUpperCase()));
     const unclassified = [...names].filter(([n]) => !known.has(n)).map(([n, f]) => `${n} (${f})`);
     // The failure prints what to do, not just the names.
     const fix = unclassified.length === 0 ? null
