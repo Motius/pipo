@@ -213,19 +213,28 @@ export const pipo_INTERNAL_ENV_NAMES: readonly string[] = Object.freeze([
   'pipo_CAPTURE_PATH',
 ]);
 
-const SECRET_EXACT: ReadonlySet<string> = new Set(DAEMON_SECRET_ENV_NAMES);
-const SETTINGS: ReadonlySet<string> = new Set(pipo_SETTINGS_ENV_NAMES);
+// Upper-cased on BOTH sides of the comparison below. Building these from the
+// raw literals while looking names up upper-cased misses every mixed-case
+// entry -- which is every pipo_ one -- and silently turns the namespace rule
+// below into the only defence, so a name it cannot see is forwarded instead of
+// stripped. Normalise once, here, so the rule cannot be defeated by spelling.
+const SECRET_EXACT: ReadonlySet<string> = new Set(DAEMON_SECRET_ENV_NAMES.map(n => n.toUpperCase()));
+const SETTINGS: ReadonlySet<string> = new Set(pipo_SETTINGS_ENV_NAMES.map(n => n.toUpperCase()));
 
 /**
  * True for a variable holding one of the daemon's own secrets.
  *
  * Case-insensitive on every platform: Windows treats env names that way, and
  * a lowercase spelling of a daemon name has no legitimate user to break.
+ *
+ * The prefix is compared UPPER-CASED (`PIPO_`, not `pipo_`): `upper` is
+ * already upper-cased, so a lowercase literal here could never match and the
+ * rule would quietly stop holding for a spelling no user asked for.
  */
 export function isDaemonSecretEnvName(name: string): boolean {
   const upper = name.toUpperCase();
   if (SECRET_EXACT.has(upper)) return true;
-  return upper.startsWith('pipo_') && !SETTINGS.has(upper);
+  return upper.startsWith('PIPO_') && !SETTINGS.has(upper);
 }
 
 /** Pure form, for tests: `base` without the daemon's secrets. */

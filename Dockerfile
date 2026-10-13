@@ -92,17 +92,18 @@ COPY scripts/ scripts/
 COPY tsconfig.json ./
 
 # Copy ONNX wake-word models and WASM runtime from node_modules into ui/public/
-RUN mkdir -p ui/public/openwakeword/models ui/public/ort && \
-    cp node_modules/openwakeword-wasm-browser/models/melspectrogram.onnx \
-       node_modules/openwakeword-wasm-browser/models/embedding_model.onnx \
-       node_modules/openwakeword-wasm-browser/models/silero_vad.onnx \
-       node_modules/openwakeword-wasm-browser/models/hey_pipo_v0.1.onnx \
-       ui/public/openwakeword/models/ && \
-    cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm \
-       node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm \
-       node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs \
-       node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs \
-       ui/public/ort/
+#
+# `bun run copy:models`, not a second copy of the file list (#622, the same
+# shape as the build:ui decision below). The list cannot be duplicated here:
+# copy-models.ts discovers the wake-word model by REGEX
+# (/^hey_.*_v0\.1\.onnx$/i) and copies it to the name `hey_pipo_v0.1.onnx`, so
+# that file is a destination this repo invents and is not in the npm package at
+# all. A literal list naming it as a source dies with
+# `cp: cannot stat .../hey_pipo_v0.1.onnx` -- which is exactly how this build
+# broke. One list, in the script; `set -eu` keeps it fail-fast, and
+# copy-models.ts throws by name if a model ever disappears from the package.
+RUN set -eu; \
+    bun run copy:models
 
 # Build the dashboard UI bundle.
 #
@@ -116,20 +117,18 @@ RUN mkdir -p ui/public/openwakeword/models ui/public/ort && \
 # duplicated in the Dockerfile drifts silently, and the drift is the defect.
 #
 # Note `bun run build:ui` also runs `prebuild:ui` -> `copy:models`, bun's
-# pre-script hook, which is a byte-identical duplicate of the explicit model
-# copy above -- same eight files, same order. So that RUN no longer provides the
-# fail-fast it was keeping: a vanished model now fails HERE instead, with cp's
-# own message naming the file, because `bun run` propagates a pre-hook's
-# non-zero exit and `set -eu` is on.
+# pre-script hook, which is the SAME command the model-copy step above runs
+# rather than a hand-rolled duplicate of it. It is idempotent (plain
+# copyFile into a `mkdir -p`'d directory), so running it twice copies the same
+# bytes over themselves and the second run is free of consequence.
 #
-# It is kept for one narrower reason: it is the only thing that asserts those
-# models are present if `prebuild:ui` is ever dropped from package.json, in
-# which case the image would otherwise ship a model-less ui/public silently.
+# The copy is therefore no longer asserted twice. It still fails fast, because
+# `bun run` propagates a pre-hook's non-zero exit and `set -eu` is on, so a
+# model that vanishes from the npm package fails the build by name rather than
+# shipping a model-less ui/public.
+#
 # The cost is a second ~41 MB layer in this stage (the production stage re-COPYs
-# the directory, so nothing is duplicated in the shipped image). Deleting it in
-# favour of an explicit presence assertion would be a fair follow-up; it is not
-# done here because this Dockerfile cannot be built in the environment this
-# change was made in.
+# the directory, so nothing is duplicated in the shipped image).
 #
 # The assertion derives what it demands from the build:ui script itself rather
 # than naming the documents again: a second list here would re-create exactly
