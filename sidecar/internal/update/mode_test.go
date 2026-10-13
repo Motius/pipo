@@ -1,0 +1,181 @@
+//go:build !windows && !darwin
+
+package update
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestDetectModePackageManager(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BUN_INSTALL", "")
+	prev := npmGlobalModules
+	npmGlobalModules = func() string { return "/usr/lib/node_modules" }
+	t.Cleanup(func() { npmGlobalModules = prev })
+
+	cases := map[string]Mode{
+		home + "/.bun/install/global/node_modules/@pipo/sidecar-linux-x64/bin/pipo": {Kind: ModePackageManager, PackageManager: "bun"},
+		"/usr/lib/node_modules/@pipo/sidecar-linux-x64/bin/pipo":                    {Kind: ModePackageManager, PackageManager: "npm"},
+	}
+	for exe, want := range cases {
+		if m := DetectMode(exe); m.Kind != want.Kind || m.PackageManager != want.PackageManager {
+			t.Errorf("DetectMode(%q) = %+v, want %+v", exe, m, want)
+		}
+	}
+}
+
+// Only bun's and npm's global trees can be updated with `bun add -g` /
+// `npm install -g`; any other node_modules would get a second copy installed
+// beside it while it stayed outdated, so it is left to the user.
+func TestDetectModeOtherNodeModulesIsManual(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("BUN_INSTALL", "")
+	prev := npmGlobalModules
+	npmGlobalModules = func() string { return "/usr/lib/node_modules" }
+	t.Cleanup(func() { npmGlobalModules = prev })
+
+	for _, exe := range []string{
+		"/home/u/.local/share/pnpm/global/5/node_modules/@pipo/sidecar-linux-x64/bin/pipo",
+		"/home/u/.npm/_npx/abc123/node_modules/@pipo/sidecar-linux-x64/bin/pipo",
+		"/home/u/project/node_modules/@pipo/sidecar-linux-x64/bin/pipo",
+	} {
+		if m := DetectMode(exe); m.Kind != ModeManual {
+			t.Errorf("DetectMode(%q) = %+v, want manual", exe, m)
+		}
+	}
+}
+
+// A custom BUN_INSTALL moves bun's global tree.
+func TestDetectModeHonorsBunInstall(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("BUN_INSTALL", root)
+	prev := npmGlobalModules
+	npmGlobalModules = func() string { return "" }
+	t.Cleanup(func() { npmGlobalModules = prev })
+
+	exe := root + "/install/global/node_modules/@pipo/sidecar-linux-x64/bin/pipo"
+	if m := DetectMode(exe); m.Kind != ModePackageManager || m.PackageManager != "bun" {
+		t.Errorf("DetectMode(%q) = %+v, want bun", exe, m)
+	}
+}
+
+func TestDetectModeNativeWritableDir(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "pipo")
+	if err := os.WriteFile(exe, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	m := DetectMode(exe)
+	if m.Kind != ModeNative || m.InstallDir != dir {
+		t.Fatalf("DetectMode = %+v, want native in %s", m, dir)
+	}
+}
+
+func TestDetectModeManual(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write anywhere")
+	}
+	dir := t.TempDir()
+	ro := filepath.Join(dir, "ro")
+	if err := os.MkdirAll(ro, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ro, "pipo"), []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ro, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ro, 0755) })
+
+	if m := DetectMode(filepath.Join(ro, "pipo")); m.Kind != ModeManual || m.Reason == "" {
+		t.Errorf("unwritable dir: DetectMode = %+v, want manual with a reason", m)
+	}
+	// `go run` / a renamed binary: not a layout we know how to swap.
+	other := filepath.Join(dir, "sidecar-dev")
+	if err := os.WriteFile(other, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if m := DetectMode(other); m.Kind != ModeManual {
+		t.Errorf("unexpected name: DetectMode = %+v, want manual", m)
+	}
+}
+
+func TestPackageManagerArgsPinTheVersion(t *testing.T) {
+	if got, err := PackageManagerArgs("bun", "0.10.0"); err != nil || len(got) != 4 || got[0] != "bun" || got[3] != "@pipo/sidecar@0.10.0" {
+		t.Errorf("bun args = %v, %v", got, err)
+	}
+	if got, err := PackageManagerArgs("npm", "0.10.0"); err != nil || len(got) != 4 || got[0] != "npm" || got[3] != "@pipo/sidecar@0.10.0" {
+		t.Errorf("npm args = %v, %v", got, err)
+	}
+}
+
+// The version becomes a package spec: anything but a canonical version (a
+// URL, a git spec, a tag) must never reach the package manager.
+func TestPackageManagerArgsRefuseNonVersions(t *testing.T) {
+	for _, v := range []string{"latest", "v0.10.0", "0.10.0 ", "git+https://evil/x.git", "file:../x", "0.10.0+build", ""} {
+		if got, err := PackageManagerArgs("npm", v); err == nil {
+			t.Errorf("PackageManagerArgs(npm, %q) = %v, want an error", v, got)
+		}
+	}
+}
+
+// A sidecar launched by autostart has a minimal PATH: the tool is found next
+// to the global tree that owns the binary, and the install is pinned to the
+// updater's registry.
+func TestPackageManagerInvocationFindsToolNextToTree(t *testing.T) {
+	t.Setenv("PATH", "/nonexistent")
+	root := t.TempDir()
+	bunBin := filepath.Join(root, "bin", "bun")
+	if err := os.MkdirAll(filepath.Dir(bunBin), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bunBin, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(root, "install", "global", "node_modules", "@pipo", "sidecar-linux-x64", "bin", "pipo")
+
+	tool, args, pathEnv, err := PackageManagerInvocation("bun", "0.10.0", "https://registry.npmjs.org", exe)
+	if err != nil {
+		t.Fatalf("PackageManagerInvocation: %v", err)
+	}
+	if tool != bunBin {
+		t.Errorf("tool = %q, want %q", tool, bunBin)
+	}
+	want := []string{bunBin, "add", "-g", "@pipo/sidecar@0.10.0", "--registry", "https://registry.npmjs.org"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Errorf("args = %v, want %v", args, want)
+	}
+	if !strings.HasPrefix(pathEnv, filepath.Join(root, "bin")+string(os.PathListSeparator)) {
+		t.Errorf("PATH = %q, want the tree's bin first", pathEnv)
+	}
+}
+
+func TestPackageManagerInvocationNpmPrefix(t *testing.T) {
+	t.Setenv("PATH", "/nonexistent")
+	prefix := t.TempDir()
+	npmBin := filepath.Join(prefix, "bin", "npm")
+	if err := os.MkdirAll(filepath.Dir(npmBin), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(npmBin, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(prefix, "lib", "node_modules", "@pipo", "sidecar-linux-x64", "bin", "pipo")
+	tool, _, _, err := PackageManagerInvocation("npm", "0.10.0", "", exe)
+	if err != nil || tool != npmBin {
+		t.Fatalf("tool = %q, %v; want %q", tool, err, npmBin)
+	}
+}
+
+func TestPackageManagerInvocationToolMissing(t *testing.T) {
+	t.Setenv("PATH", "/nonexistent")
+	t.Setenv("HOME", t.TempDir())
+	if _, _, _, err := PackageManagerInvocation("bun", "0.10.0", "", "/x/install/global/node_modules/@pipo/sidecar-linux-x64/bin/pipo"); err == nil {
+		t.Skip("a bun exists in a common location on this machine")
+	}
+}

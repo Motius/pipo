@@ -1,0 +1,781 @@
+import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
+import { loadConfig, readRawConfigFile } from './loader.ts';
+import { DEFAULT_CONFIG, USER_OWNED_SECTIONS } from './types.ts';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, isAbsolute } from 'node:path';
+
+let TEST_CONFIG_DIR: string;
+let TEST_CONFIG_PATH: string;
+
+async function createTestConfigPath(): Promise<void> {
+  TEST_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'pipo-test-config-'));
+  TEST_CONFIG_PATH = join(TEST_CONFIG_DIR, 'config.yaml');
+}
+
+describe('Config Loader', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('pipo_ai survives the load intact while llm: is discarded', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      [
+        'pipo_ai:',
+        '  base_url: https://llm.pipo.host',
+        '  api_key: sk-uj-test0123456789abcdef',
+        // The llm block MUST stay ignored — DB is the sole authority there.
+        'llm:',
+        '  default: "openai:gpt-x"',
+        '  providers:',
+        '    evil: { kind: openai, api_key: sneaky }',
+        '',
+      ].join('\n'),
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.pipo_ai).toEqual({
+      base_url: 'https://llm.pipo.host',
+      api_key: 'sk-uj-test0123456789abcdef',
+    });
+    // llm from the file contributed NOTHING (existing rule, still true).
+    expect(loaded.llm.default).toBeUndefined();
+    expect(loaded.llm.providers).toEqual({});
+  });
+
+  test('pipo_billing survives the load intact', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      [
+        'pipo_billing:',
+        '  url: https://app.pipo.dev/api/billing/instance',
+        '  instance_id: 11111111-2222-3333-4444-555555555555',
+        `  secret: ${'e'.repeat(64)}`,
+        '  page_url: https://app.pipo.dev/billing',
+        '',
+      ].join('\n'),
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    // Unquoted, exactly as the control plane renders it: every value must
+    // still arrive as a string.
+    expect(loaded.pipo_billing).toEqual({
+      url: 'https://app.pipo.dev/api/billing/instance',
+      instance_id: '11111111-2222-3333-4444-555555555555',
+      secret: 'e'.repeat(64),
+      page_url: 'https://app.pipo.dev/billing',
+    });
+  });
+
+  test('reloadpipoBillingBlock: rotation lands, removal clears, corruption keeps the current value', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    const { reloadpipoBillingBlock } = await import('./loader.ts');
+    const block = (secret: string) =>
+      `pipo_billing:\n  url: https://cp.example/api/billing/instance\n  instance_id: i-1\n  secret: ${secret}\n  page_url: https://app.example/billing\n`;
+    await writeFile(TEST_CONFIG_PATH, block('a'.repeat(64)));
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.pipo_billing?.secret).toBe('a'.repeat(64));
+
+    await writeFile(TEST_CONFIG_PATH, block('b'.repeat(64)));
+    await reloadpipoBillingBlock(config, TEST_CONFIG_PATH);
+    expect(config.pipo_billing?.secret).toBe('b'.repeat(64));
+
+    await writeFile(TEST_CONFIG_PATH, 'pipo_billing: [unclosed');
+    await reloadpipoBillingBlock(config, TEST_CONFIG_PATH);
+    expect(config.pipo_billing?.secret).toBe('b'.repeat(64));
+
+    await writeFile(TEST_CONFIG_PATH, 'daemon:\n  port: 1846\n');
+    await reloadpipoBillingBlock(config, TEST_CONFIG_PATH);
+    expect(config.pipo_billing).toBeUndefined();
+  });
+
+  test('reloadpipoAiBlock: rotation lands, removal un-hosts, corruption keeps the current value', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    const { reloadpipoAiBlock } = await import('./loader.ts');
+    await writeFile(
+      TEST_CONFIG_PATH,
+      'pipo_ai:\n  base_url: https://llm.pipo.host\n  api_key: sk-uj-old\n',
+    );
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.pipo_ai?.api_key).toBe('sk-uj-old');
+
+    // Provisioner rotates the key: SIGHUP re-read must pick it up.
+    await writeFile(
+      TEST_CONFIG_PATH,
+      'pipo_ai:\n  base_url: https://llm.pipo.host\n  api_key: sk-uj-rotated\n',
+    );
+    await reloadpipoAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.pipo_ai?.api_key).toBe('sk-uj-rotated');
+
+    // Corrupt file: keep the current value (a write race must not un-host).
+    await writeFile(TEST_CONFIG_PATH, 'pipo_ai: [unclosed\n  broken');
+    await reloadpipoAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.pipo_ai?.api_key).toBe('sk-uj-rotated');
+
+    // Block removed: the install is no longer hosted.
+    await writeFile(TEST_CONFIG_PATH, 'daemon:\n  port: 8788\n');
+    await reloadpipoAiBlock(config, TEST_CONFIG_PATH);
+    expect(config.pipo_ai).toBeUndefined();
+  });
+
+  test('workflows SYSTEM path keys survive the user-section discard; user fields do not', async () => {
+    // A hosted/system config carries only the ready-made artifact paths;
+    // any user-tunable workflow fields in the FILE have no authority (they
+    // live in the DB) — but the paths are file-owned and must survive.
+    const yaml = `
+workflows:
+  enabled: false
+  engine_dir: /opt/pipo-engine/\${version}
+  pieces_dir: /srv/pieces
+  piece_metadata_cache: /srv/piece-metadata.json
+`;
+    await Bun.write(TEST_CONFIG_PATH, yaml);
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.workflows?.engine_dir).toBe('/opt/pipo-engine/\${version}');
+    expect(loaded.workflows?.pieces_dir).toBe('/srv/pieces');
+    expect(loaded.workflows?.piece_metadata_cache).toBe('/srv/piece-metadata.json');
+    // The file's `enabled: false` was discarded with the user section.
+    expect(loaded.workflows?.enabled).toBeUndefined();
+  });
+
+  test('returns default config when file does not exist', async () => {
+    const config = await loadConfig('/tmp/nonexistent-config.yaml');
+    // Paths should be tilde-expanded, but all other fields match defaults
+    expect(config.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
+    expect(config.daemon.data_dir).not.toContain('~');
+    expect(config.daemon.db_path).not.toContain('~');
+    expect(config.llm).toEqual(DEFAULT_CONFIG.llm);
+    expect(config.personality).toEqual(DEFAULT_CONFIG.personality);
+    expect(config.authority).toEqual(DEFAULT_CONFIG.authority);
+    expect(config.active_role).toBe(DEFAULT_CONFIG.active_role);
+  });
+
+  test('deep merges partial config with defaults; any llm block is discarded', async () => {
+    // The llm block is legacy and must be ignored entirely - LLM config
+    // comes only from the DB.
+    const partialYaml = `
+daemon:
+  port: 8888
+
+llm:
+  primary: "openai"
+`;
+
+    await Bun.write(TEST_CONFIG_PATH, partialYaml);
+
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+
+    // Should have our custom values
+    expect(loaded.daemon.port).toBe(8888);
+    // The llm block has no authority and is discarded back to the empty default.
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
+
+    // Should have defaults for missing values (paths are tilde-expanded)
+    expect(loaded.daemon.data_dir).not.toContain('~');
+    expect(loaded.personality.core_traits).toEqual(DEFAULT_CONFIG.personality.core_traits);
+    expect(loaded.authority.default_level).toBe(DEFAULT_CONFIG.authority.default_level);
+  });
+
+  test('user-owned sections in the file have no authority (discarded like llm)', async () => {
+    // config.yaml is a SYSTEM config. User sections live in the vault DB
+    // settings store; a file that still carries them (legacy) contributes
+    // nothing to loadConfig - they are imported into the DB once at daemon
+    // boot and merged from there.
+    const legacyYaml = `
+daemon:
+  port: 7777
+personality:
+  core_traits: ["sarcastic"]
+  assistant_name: "HAL"
+active_role: "villain"
+stt:
+  provider: groq
+channels:
+  telegram:
+    enabled: true
+    bot_token: "legacy-token"
+authority:
+  default_level: 1
+`;
+    await Bun.write(TEST_CONFIG_PATH, legacyYaml);
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+
+    // System keys stick...
+    expect(loaded.daemon.port).toBe(7777);
+    // ...user sections do not.
+    expect(loaded.personality).toEqual(DEFAULT_CONFIG.personality);
+    expect(loaded.active_role).toBe(DEFAULT_CONFIG.active_role);
+    expect(loaded.stt).toEqual(DEFAULT_CONFIG.stt);
+    expect(loaded.channels).toEqual(DEFAULT_CONFIG.channels);
+    expect(loaded.authority.default_level).toBe(DEFAULT_CONFIG.authority.default_level);
+  });
+
+  test('system-owned sections survive: daemon, auth, google', async () => {
+    const systemYaml = `
+daemon:
+  port: 9090
+  brain_domain: "u1.vps1.pipo.host"
+  public_url: "https://pipo.example.com"
+auth:
+  insecure_open_access: true
+google:
+  client_id: "company-client.apps.googleusercontent.com"
+  client_secret: "company-secret"
+`;
+    await Bun.write(TEST_CONFIG_PATH, systemYaml);
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.brain_domain).toBe('u1.vps1.pipo.host');
+    expect(loaded.daemon.public_url).toBe('https://pipo.example.com');
+    expect(loaded.auth?.insecure_open_access).toBe(true);
+    // google is system-owned when the file provides it (hosted: the shared
+    // company OAuth client). The DB fallback only applies when absent here.
+    expect(loaded.google?.client_id).toBe('company-client.apps.googleusercontent.com');
+  });
+
+  test('log_file_path / log_file_max_bytes survive the user-section discard', async () => {
+    // They live under `daemon:` precisely because of that discard - a
+    // top-level `logging:` block would be dropped on every load (docs/LOGS.md,
+    // "The brain's side").
+    await Bun.write(
+      TEST_CONFIG_PATH,
+      'daemon:\n  log_file_path: /home/u_abc123/.pipo/logs/pipo.log\n  log_file_max_bytes: 2097152\n',
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.log_file_path).toBe('/home/u_abc123/.pipo/logs/pipo.log');
+    expect(loaded.daemon.log_file_max_bytes).toBe(2097152);
+  });
+
+  test('log_file_path is absent by default (no DEFAULT_CONFIG entry, no file written)', async () => {
+    expect(DEFAULT_CONFIG.daemon.log_file_path).toBeUndefined();
+    expect(DEFAULT_CONFIG.daemon.log_file_max_bytes).toBeUndefined();
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  port: 1846\n');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.log_file_path).toBeUndefined();
+  });
+
+  test('expands ~ in log_file_path (openSync does not understand it)', async () => {
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  log_file_path: "~/.pipo/logs/pipo.log"\n');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.log_file_path).not.toContain('~');
+    expect(isAbsolute(loaded.daemon.log_file_path!)).toBe(true);
+    expect(loaded.daemon.log_file_path).toEndWith('/.pipo/logs/pipo.log');
+  });
+
+  test('a non-string log_file_path is dropped, not fatal', async () => {
+    // `log_file_path: true` made expandTilde throw "filepath.startsWith is not
+    // a function", and the daemon then exited reporting "Failed to parse config
+    // file" - which is not what was wrong with it.
+    for (const value of ['true', '42', '[a, b]']) {
+      await Bun.write(TEST_CONFIG_PATH, `daemon:\n  log_file_path: ${value}\n`);
+      const loaded = await loadConfig(TEST_CONFIG_PATH);
+      expect(loaded.daemon.log_file_path).toBeUndefined();
+      // And the rest of the config still loads.
+      expect(loaded.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
+    }
+  });
+
+  test('loadConfig does not mutate DEFAULT_CONFIG', async () => {
+    // Regression test: a previous implementation of deepMerge returned
+    // DEFAULT_CONFIG by reference when the parsed YAML was empty/null, so
+    // subsequent tilde-expansion mutated the shared defaults.
+    const snapshot = structuredClone(DEFAULT_CONFIG);
+
+    // 1) Empty / comment-only file — exercises the `doc.toJS() ?? {}` branch.
+    await Bun.write(TEST_CONFIG_PATH, '# empty config\n');
+    await loadConfig(TEST_CONFIG_PATH);
+    expect(DEFAULT_CONFIG).toEqual(snapshot);
+
+    // 2) Partial config — exercises deepMerge with nested overlap.
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  port: 12345\n');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.port).toBe(12345);
+    expect(DEFAULT_CONFIG).toEqual(snapshot);
+
+    // 3) User-section discard clones defaults — mutating the loaded config
+    // must never leak back into DEFAULT_CONFIG.
+    loaded.personality.core_traits.push('mutated');
+    (loaded.authority as { default_level: number }).default_level = 99;
+    expect(DEFAULT_CONFIG).toEqual(snapshot);
+
+    // 4) Missing config file — the "defaults only" path.
+    await loadConfig('/tmp/pipo-loader-mutation-absent.yaml');
+    expect(DEFAULT_CONFIG).toEqual(snapshot);
+  });
+
+  test('returns defaults cleanly for an empty config file', async () => {
+    await Bun.write(TEST_CONFIG_PATH, '');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
+    expect(loaded.llm).toEqual(DEFAULT_CONFIG.llm);
+    expect(loaded.daemon.data_dir).not.toContain('~');
+  });
+
+  test('returns defaults cleanly for a comment-only config file', async () => {
+    await Bun.write(TEST_CONFIG_PATH, '# just a header\n# no content yet\n');
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+    expect(loaded.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
+    expect(loaded.personality.core_traits).toEqual(DEFAULT_CONFIG.personality.core_traits);
+  });
+
+  test('parse errors include line:column diagnostics', async () => {
+    const badYaml = 'daemon:\n  port: 1846\n    bad_indent: true\n';
+    await Bun.write(TEST_CONFIG_PATH, badYaml);
+
+    try {
+      await loadConfig(TEST_CONFIG_PATH);
+      throw new Error('expected loadConfig to throw');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      expect(msg).toContain(TEST_CONFIG_PATH);
+      // The `yaml` library embeds "at line X, column Y:" in each error message.
+      expect(msg).toMatch(/line \d+, column \d+/);
+    }
+  });
+});
+
+describe('readRawConfigFile', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('returns the raw sections loadConfig would discard (for the legacy import)', async () => {
+    await Bun.write(
+      TEST_CONFIG_PATH,
+      'daemon:\n  port: 7777\nstt:\n  provider: groq\nactive_role: "villain"\n',
+    );
+    const raw = await readRawConfigFile(TEST_CONFIG_PATH);
+    expect(raw).not.toBeNull();
+    expect((raw!.stt as { provider: string }).provider).toBe('groq');
+    expect(raw!.active_role).toBe('villain');
+    // No defaults are merged in: absent sections stay absent.
+    expect(raw!.personality).toBeUndefined();
+  });
+
+  test('returns null for a missing file and throws on bad YAML', async () => {
+    expect(await readRawConfigFile('/tmp/pipo-definitely-not-here.yaml')).toBeNull();
+    await Bun.write(TEST_CONFIG_PATH, 'daemon:\n  port: 1846\n    bad: true\n');
+    await expect(readRawConfigFile(TEST_CONFIG_PATH)).rejects.toThrow();
+  });
+});
+
+describe('Default Config', () => {
+  test('has all required fields', () => {
+    expect(DEFAULT_CONFIG.daemon).toBeDefined();
+    expect(DEFAULT_CONFIG.daemon.port).toBe(1846);
+    expect(DEFAULT_CONFIG.daemon.data_dir).toBe('~/.pipo');
+    expect(DEFAULT_CONFIG.daemon.db_path).toBe('~/.pipo/pipo.db');
+
+    expect(DEFAULT_CONFIG.llm).toBeDefined();
+    expect(DEFAULT_CONFIG.llm.providers).toBeDefined();
+    expect(DEFAULT_CONFIG.llm.tiers).toBeDefined();
+
+    expect(DEFAULT_CONFIG.personality).toBeDefined();
+    expect(DEFAULT_CONFIG.personality.core_traits).toBeInstanceOf(Array);
+
+    expect(DEFAULT_CONFIG.authority).toBeDefined();
+    expect(DEFAULT_CONFIG.authority.default_level).toBe(3);
+
+    expect(DEFAULT_CONFIG.active_role).toBe('personal-assistant');
+  });
+
+  test('has correct personality traits', () => {
+    const traits = DEFAULT_CONFIG.personality.core_traits;
+    expect(traits).toContain('loyal');
+    expect(traits).toContain('efficient');
+    expect(traits).toContain('proactive');
+    expect(traits).toContain('respectful');
+    expect(traits).toContain('adaptive');
+  });
+
+  test('has correct LLM defaults', () => {
+    // Default config ships empty providers + tiers. Users configure their
+    // own providers via the dashboard.
+    expect(DEFAULT_CONFIG.llm.providers).toEqual({});
+    expect(DEFAULT_CONFIG.llm.tiers).toEqual({});
+    expect(DEFAULT_CONFIG.llm.default).toBeUndefined();
+  });
+
+  test('every user-owned section is a real pipoConfig key', () => {
+    // Guards the registry against typos: a misspelled section would silently
+    // never discard/import/merge.
+    const knownKeys = new Set(Object.keys(DEFAULT_CONFIG));
+    // Sections without a default (optional in pipoConfig) are still valid;
+    // list them explicitly so a typo can't hide behind "optional".
+    const optionalWithoutDefault = new Set(['cron', 'desktop', 'sites', 'goals', 'workflows', 'onboarding']);
+    for (const section of USER_OWNED_SECTIONS) {
+      expect(knownKeys.has(section) || optionalWithoutDefault.has(section)).toBe(true);
+    }
+  });
+});
+
+describe('Config Parse Errors', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('throws on malformed YAML when file exists', async () => {
+    const badYaml = `
+daemon:
+  port: 1846
+    bad_indent: true
+  this is: not: valid
+`;
+    await Bun.write(TEST_CONFIG_PATH, badYaml);
+
+    await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow();
+  });
+
+  test('uses defaults when file does not exist (no throw)', async () => {
+    const config = await loadConfig('/tmp/pipo-definitely-not-here.yaml');
+    expect(config.daemon.port).toBe(DEFAULT_CONFIG.daemon.port);
+    expect(config.daemon.data_dir).not.toContain('~');
+    expect(config.daemon.db_path).not.toContain('~');
+  });
+
+  test('expands tildes in parsed config', async () => {
+    const yamlWithTilde = `
+daemon:
+  data_dir: "~/.pipo"
+  db_path: "~/.pipo/pipo.db"
+`;
+    await Bun.write(TEST_CONFIG_PATH, yamlWithTilde);
+
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.daemon.data_dir).not.toContain('~');
+    expect(config.daemon.db_path).not.toContain('~');
+    expect(isAbsolute(config.daemon.data_dir)).toBe(true);
+    expect(isAbsolute(config.daemon.db_path)).toBe(true);
+  });
+});
+
+describe('Voice Config', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    delete process.env.pipo_WAKE_ENGINE;
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('defaults wake_engine to openwakeword (privacy-preserving local path)', async () => {
+    const config = await loadConfig('/tmp/pipo-voice-defaults.yaml');
+    expect(config.voice?.wake_engine).toBe('openwakeword');
+  });
+
+  test('file-provided voice config is discarded (user-owned, DB is authoritative)', async () => {
+    const yaml = `
+voice:
+  wake_engine: webspeech
+`;
+    await Bun.write(TEST_CONFIG_PATH, yaml);
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.voice?.wake_engine).toBe('openwakeword');
+  });
+
+  test('pipo_WAKE_ENGINE env override wins over YAML and the discard', async () => {
+    const yaml = `
+voice:
+  wake_engine: openwakeword
+`;
+    await Bun.write(TEST_CONFIG_PATH, yaml);
+    process.env.pipo_WAKE_ENGINE = 'auto';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.voice?.wake_engine).toBe('auto');
+  });
+
+  test('invalid pipo_WAKE_ENGINE is ignored, default is preserved', async () => {
+    process.env.pipo_WAKE_ENGINE = 'siri';
+    const config = await loadConfig('/tmp/pipo-voice-invalid-env.yaml');
+    expect(config.voice?.wake_engine).toBe('openwakeword');
+  });
+});
+
+describe('Path Expansion', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  test('expands tilde in paths', async () => {
+    const config = await loadConfig();
+
+    // Should expand ~ to home directory
+    expect(config.daemon.data_dir).not.toContain('~');
+    expect(config.daemon.db_path).not.toContain('~');
+  });
+
+  test('preserves non-tilde paths', async () => {
+    await Bun.write(
+      TEST_CONFIG_PATH,
+      'daemon:\n  data_dir: "/absolute/path"\n  db_path: "/absolute/db.db"\n',
+    );
+    const loaded = await loadConfig(TEST_CONFIG_PATH);
+
+    expect(loaded.daemon.data_dir).toBe('/absolute/path');
+    expect(loaded.daemon.db_path).toBe('/absolute/db.db');
+  });
+});
+
+/**
+ * The SYSTEM-owned `tools:` section (docs/tool-relevance-filtering.md).
+ *
+ * A comment in types.ts used to claim that any new top-level key is
+ * "silently dropped on every load", which is why `log_file_path` lives under
+ * `daemon:`. That is over-broad: only the sections LISTED in
+ * USER_OWNED_SECTIONS are replaced, and deepMerge copies unknown keys
+ * through. These tests pin the real behaviour, so nobody restores a discard
+ * that does not exist and quietly disables the filter's kill switch.
+ */
+describe('tools: relevance filter config', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    delete process.env.pipo_TOOL_FILTER;
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  test('a tools block survives loadConfig while a user-owned section does not', async () => {
+    await write([
+      'tools:',
+      '  relevance_filter:',
+      '    enabled: true',
+      '    max_params_b: 9',
+      '    models:',
+      '      - "ollama:qwen2.5:7b"',
+      'personality:',
+      '  assistant_name: ShouldBeDiscarded',
+      '',
+    ].join('\n'));
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(true);
+    expect(config.tools?.relevance_filter?.max_params_b).toBe(9);
+    expect(config.tools?.relevance_filter?.models).toEqual(['ollama:qwen2.5:7b']);
+    // The contrast that makes the point: `personality` IS user-owned, so the
+    // file has no authority over it and it comes back as the default.
+    expect(config.personality.assistant_name).not.toBe('ShouldBeDiscarded');
+  });
+
+  test('tools is not a user-owned section', () => {
+    expect(USER_OWNED_SECTIONS as readonly string[]).not.toContain('tools');
+  });
+
+  test('absent means off: no tools block leaves it undefined', async () => {
+    await write('daemon:\n  port: 1846\n');
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools).toBeUndefined();
+    expect(DEFAULT_CONFIG).not.toHaveProperty('tools');
+  });
+
+  test('pipo_TOOL_FILTER=off overrides an enabled file', async () => {
+    await write('tools:\n  relevance_filter:\n    enabled: true\n');
+    process.env.pipo_TOOL_FILTER = 'off';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(false);
+  });
+
+  test('pipo_TOOL_FILTER=on enables it with no tools block at all', async () => {
+    await write('daemon:\n  port: 1846\n');
+    process.env.pipo_TOOL_FILTER = 'on';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(true);
+  });
+
+  test('an unrecognised pipo_TOOL_FILTER value is ignored, not guessed at', async () => {
+    await write('tools:\n  relevance_filter:\n    enabled: true\n');
+    process.env.pipo_TOOL_FILTER = 'perhaps';
+    const config = await loadConfig(TEST_CONFIG_PATH);
+    expect(config.tools?.relevance_filter?.enabled).toBe(true);
+  });
+});
+
+// The daemon binds `daemon.port` and the CLI prints/opens a URL resolved in the
+// same precedence (src/cli/lifecycle.ts resolveDashboardTarget). A pipo_PORT
+// one of them accepts and the other rejects would put the daemon on one port and
+// every printed URL on another (#544).
+describe('pipo_PORT agrees with the port the CLI resolves', () => {
+  let prev: string | undefined;
+
+  beforeEach(async () => {
+    await createTestConfigPath();
+    prev = process.env.pipo_PORT;
+  });
+
+  afterEach(async () => {
+    if (prev === undefined) delete process.env.pipo_PORT;
+    else process.env.pipo_PORT = prev;
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  test('a port in range overrides daemon.port', async () => {
+    await write('daemon:\n  port: 5000\n');
+    process.env.pipo_PORT = '7000';
+    expect((await loadConfig(TEST_CONFIG_PATH)).daemon.port).toBe(7000);
+  });
+
+  test.each(['0', '70000', '-1', 'not-a-port', ''])('%p is ignored, like validPort ignores it', async (value) => {
+    await write('daemon:\n  port: 5000\n');
+    process.env.pipo_PORT = value;
+    expect((await loadConfig(TEST_CONFIG_PATH)).daemon.port).toBe(5000);
+  });
+
+  test('a trailing fraction truncates the same way on both sides', async () => {
+    // parseInt on both sides, so `8080.5` is 8080 here and 8080 in validPort.
+    await write('daemon:\n  port: 5000\n');
+    process.env.pipo_PORT = '8080.5';
+    expect((await loadConfig(TEST_CONFIG_PATH)).daemon.port).toBe(8080);
+  });
+});
+
+// The daemon binds whatever `daemon.port` resolves to, and `pipo stop` reads
+// the same key out of the same file to decide which port to signal
+// (src/cli/lifecycle.ts). A value only one of them understands means the daemon
+// is on one port and the CLI aims SIGTERM then SIGKILL at another - which is not
+// pipo (#550). The shared reading lives in src/config/port.ts.
+describe('daemon.port is coerced, or the config is refused', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+    delete process.env.pipo_PORT;
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  const portOf = async () => (await loadConfig(TEST_CONFIG_PATH)).daemon.port;
+
+  test('a quoted port loads as the same number as an unquoted one', async () => {
+    await write('daemon:\n  port: "8080"\n');
+    const quoted = await portOf();
+    await write('daemon:\n  port: 8080\n');
+    expect(quoted).toBe(await portOf());
+    // A number, not the string YAML produced: writeLockedPort takes only a
+    // number, and its silent no-op is how the lockfile ended up empty.
+    expect(quoted).toBe(8080);
+    expect(typeof quoted).toBe('number');
+  });
+
+  test('an absent or empty daemon.port is the default, as before', async () => {
+    await write('daemon:\n  data_dir: /tmp/pipo-test\n');
+    expect(await portOf()).toBe(DEFAULT_CONFIG.daemon.port);
+    // `port:` with nothing after it parses as null.
+    await write('daemon:\n  port:\n');
+    expect(await portOf()).toBe(DEFAULT_CONFIG.daemon.port);
+  });
+
+  test.each(['0', '65536', '-1', '8080.5', '"8080abc"', '""', 'true', '[8080]', '{ nope: true }'])(
+    'refuses daemon.port: %s rather than falling back to a port nobody asked for',
+    async (value) => {
+      await write(`daemon:\n  port: ${value}\n`);
+      await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow(/daemon\.port in .* must be a whole number between 1 and 65535/);
+    },
+  );
+
+  test('the refusal names the file, so the user knows which one to edit', async () => {
+    await write('daemon:\n  port: "8080abc"\n');
+    await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow(TEST_CONFIG_PATH);
+  });
+
+  test('a broken daemon.port is reported even when pipo_PORT would have covered it', async () => {
+    // Deliberate: the env var is a convenience a stale shell export can carry,
+    // the file is edited on purpose, and a typo that only surfaces once the
+    // export is gone is the worse of the two.
+    await write('daemon:\n  port: "8080abc"\n');
+    process.env.pipo_PORT = '7000';
+    await expect(loadConfig(TEST_CONFIG_PATH)).rejects.toThrow(/daemon\.port in /);
+  });
+
+  test('pipo_PORT still wins over a valid quoted port', async () => {
+    await write('daemon:\n  port: "8080"\n');
+    process.env.pipo_PORT = '7000';
+    expect(await portOf()).toBe(7000);
+  });
+});
+
+// The escape hatch for #546's prctl(PR_SET_DUMPABLE, 0). The daemon tests the
+// resolved value with `=== true`, so what matters here is that the loader hands
+// it a real BOOLEAN: `allow_process_inspection: yes` is a string in the YAML
+// 1.2 core schema the parser uses, and a string would have left the hatch
+// silently shut for the spelling most people write.
+describe('daemon.allow_process_inspection is coerced to a boolean', () => {
+  beforeEach(async () => {
+    await createTestConfigPath();
+  });
+
+  afterEach(async () => {
+    await rm(TEST_CONFIG_DIR, { recursive: true, force: true });
+  });
+
+  const write = async (body: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(TEST_CONFIG_PATH, body);
+  };
+
+  const allowOf = async () =>
+    (await loadConfig(TEST_CONFIG_PATH)).daemon.allow_process_inspection;
+
+  test.each(['true', 'yes', '"true"', 'on', '1'])('%s opens the hatch as a real boolean', async (value) => {
+    await write(`daemon:\n  allow_process_inspection: ${value}\n`);
+    expect(await allowOf()).toBe(true);
+  });
+
+  test.each(['false', 'no', 'off', '0', '"false"'])('%s leaves the daemon hardened', async (value) => {
+    await write(`daemon:\n  allow_process_inspection: ${value}\n`);
+    expect(await allowOf()).toBe(false);
+  });
+
+  test('absent is false, so the default is hardened', async () => {
+    await write('daemon:\n  port: 1846\n');
+    expect(await allowOf()).toBe(false);
+    // The key with no value parses as null.
+    await write('daemon:\n  allow_process_inspection:\n');
+    expect(await allowOf()).toBe(false);
+  });
+
+  test('a value nobody can read fails CLOSED instead of refusing the config', async () => {
+    // Unlike daemon.port this does NOT throw: one reader, and a safe reading.
+    // Half the CLI going down over a typo in a defense-in-depth knob costs
+    // more than it buys, so it warns and hardens.
+    for (const value of ['maybe', '[true]', '{ allow: true }', '2', '"enabled"']) {
+      await write(`daemon:\n  allow_process_inspection: ${value}\n`);
+      expect(await allowOf()).toBe(false);
+    }
+  });
+
+  test('a missing config file leaves it hardened too', async () => {
+    expect((await loadConfig(join(TEST_CONFIG_DIR, 'nope.yaml'))).daemon.allow_process_inspection).toBe(false);
+  });
+});

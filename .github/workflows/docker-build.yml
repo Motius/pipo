@@ -1,0 +1,173 @@
+name: Docker Build
+
+# Validates the Dockerfile builds cleanly when image-relevant files change,
+# and then RUNS the image the way a user does.
+#
+# The run half exists because #613 and #614 both shipped in a published image
+# and were found by an outside reporter: this workflow built the image but
+# never started it, so nothing checked that the container reports itself
+# healthy, that its health endpoint answers without credentials, or that every
+# service actually bootstrapped. See .github/scripts/docker-smoke.sh.
+
+# `push` is main-only, matching test.yml. With `branches: ["**"]` a push to a
+# PR branch triggered this twice — push + pull_request — and since both runs
+# write `cache-to: type=gha,mode=max` into the SAME cache scope, the duplicate
+# pair raced over that scope on every push. The paths filter below includes
+# bun.lock and package.json, so dependency changes hit this most often.
+on:
+  # No `paths:` on the push trigger, unlike the PR one below. The smoke check
+  # guards a runtime class -- a service that stops bootstrapping -- that no
+  # build-time path filter can predict with certainty, so every merge to main
+  # runs it once, cache-warm. The PR filter below is wide but still a filter:
+  # a merge of something it does not list would otherwise never be checked.
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "bun.lock"
+      - "package.json"
+      - ".github/workflows/docker-build.yml"
+      - ".github/scripts/docker-smoke.sh"
+      - ".github/scripts/version-stamp-cache.sh"
+      - ".github/scripts/version-stamp-cache.test.sh"
+      # The image prebuilds the workflow runtime (#613), so a source change can
+      # fail the image build without touching the Dockerfile -- and the build's
+      # own assertion that every piece is on the content-hash fast path is
+      # exactly the thing worth catching before a merge, not after. Deliberately
+      # the whole tree rather than a hand list: the prebuild's cache key reaches
+      # outside src/workflows (PATCHED_VENDOR_SOURCES escapes into
+      # src/workflows/runtime, src/lib and src/util, and pieceHash() reads
+      # src/actions/action-outcome.ts). The rest is every path the image copies
+      # or compiles: src/, bin/, roles/ and tsconfig.json into the runtime
+      # layer, scripts/ into the build stages, and ui/, which `bun build`
+      # compiles during the build.
+      #
+      # This is the expensive half of the trade, and it is taken on purpose: a
+      # PR touching src/ now pays an image build. The alternative -- a narrow
+      # filter plus manual dispatch -- leaves a window where a PR breaks the
+      # prebuild and only the post-merge push run says so.
+      - "src/**"
+      - "scripts/**"
+      - "ui/**"
+      - "bin/**"
+      - "roles/**"
+      - "tsconfig.json"
+  # Manual dispatch, so the container check can be run against any ref without
+  # waiting for a qualifying path change.
+  workflow_dispatch:
+
+# One in-flight image build per ref; never cancel main, whose run is the
+# post-merge verdict on the Dockerfile.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Read-only, written down (#646). Without this every job inherits the
+# repository's default token scope -- read-only today, but a setting outside
+# this file, one toggle away from write. This workflow builds and STARTS a
+# container from the PR's own tree; it pushes nothing and has no registry
+# login, so it needs to read the repository and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+    env:
+      # Run-scoped rather than a bare `pipo:ci`. On a GitHub-hosted runner
+      # each job gets a fresh VM so it makes no difference, but `concurrency` is
+      # per-ref: on a self-hosted runner two refs can build at once, and a
+      # shared tag would mean one ref's smoke check running the other ref's
+      # image, then one job deleting the tag out from under the other.
+      IMAGE_TAG: pipo:ci-${{ github.run_id }}-${{ github.run_attempt }}
+    # The build is the long pole; the smoke check adds ~2-3 minutes on the
+    # happy path and fails at ~100s on the #614 shape. Nothing bounds the
+    # docker build or `docker run` themselves, and the default is 6 hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # PR check is single-arch for speed; release workflow validates linux/amd64 + linux/arm64.
+      #
+      # `load: true` is what lets the smoke step below actually run this image.
+      # setup-buildx-action creates a `docker-container`-driver builder, whose
+      # output otherwise stays in the BuildKit cache and never reaches dockerd's
+      # image store -- `docker run pipo:ci` would fail with "image not found".
+      # It costs a docker-exporter tar plus unpack (~1GB, roughly 30-60s) on
+      # every run, including full cache hits. That is the accepted price of
+      # reusing this build instead of rebuilding in a second job or shipping the
+      # image between jobs as a multi-hundred-MB artifact. `load` forces the
+      # docker exporter, which is single-platform -- already true here.
+      #
+      # VERSION is passed, and is now REQUIRED by the Dockerfile (#625). Before,
+      # this workflow passed nothing, the Dockerfile's stamp step skipped itself,
+      # and the image smoked here carried whatever version was committed to
+      # package.json rather than a release's -- so CI proved a slightly
+      # different artifact healthy, and the stamp instruction itself ran in no CI
+      # job at all. 0.0.0-ci is deliberately recognisable as not-a-release, and
+      # it is never pushed anywhere: push: false, and this workflow has no
+      # registry login.
+      - name: Build Docker image (validate)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_TAG }}
+          build-args: VERSION=0.0.0-ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Runs the image with a fresh volume, no config file and the default
+      # command, then asserts: it reaches `healthy`; the endpoint its own
+      # HEALTHCHECK probes answers 200 without credentials from the host; no
+      # service logged a startup failure; /health answers on the published
+      # port; and all of that again on a second run over the written volume and
+      # on a second clean run. Dumps docker logs and the health log on failure.
+      - name: Smoke-test the image (run it like a user does)
+        env:
+          # Unique per run AND per re-run, so a retry can never collide with a
+          # leftover from the attempt before it.
+          SMOKE_PREFIX: pipo-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./.github/scripts/docker-smoke.sh "$IMAGE_TAG"
+
+      # #647: a release must reuse this workflow's cache. A release commit
+      # changes only package.json's version (and passes a new VERSION), and
+      # the Dockerfile keeps both away from the expensive steps: deps and the
+      # workflow prebuild read a version-neutral package.json from the
+      # `manifest` stage, and the stamp is the build stage's last instruction.
+      # This checks the behaviour rather than the layout: it builds a copy of
+      # the tracked tree, bumps the copy's version as a release commit does,
+      # rebuilds, and fails naming any deps/build/workflows step that re-ran.
+      #
+      # Two full builds on a builder the script creates and removes, not this
+      # job's. That isolation is the #688 fix: on the shared builder the warm
+      # build was served from gha entries the image build above imported and
+      # never materialised, so BuildKit could not match the bump build's
+      # locally-computed layers and the guard red-flagged four correct PR
+      # branches in a row. The cost is that the warm build is genuinely cold.
+      # Source assertions on the guard below, in the shape of
+      # chromium-test-partition.test.sh (#648). Seconds, no Docker. It runs
+      # FIRST so a disarmed guard is named here rather than passing vacuously
+      # in the step after it.
+      - name: Check the release cache guard has not been disarmed
+        run: ./.github/scripts/version-stamp-cache.test.sh
+
+      - name: Check a release re-runs only its version-dependent steps
+        run: ./.github/scripts/version-stamp-cache.sh .
+
+      # The script removes the containers and volumes it created, by name, in
+      # its own EXIT trap. It deliberately does not touch the image, since a
+      # caller may own it -- this workflow built the tag, so this workflow
+      # removes it. By exact tag: no prune, which would hit a shared runner's
+      # other work.
+      - name: Remove the image tag this job built
+        if: always()
+        run: docker image rm "$IMAGE_TAG" || true

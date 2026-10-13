@@ -1,0 +1,168 @@
+/**
+ * Skill compiler: turns a recorded interaction sequence into a Skill.
+ *
+ * Three transformations:
+ *  1. Coalesce: a click that focuses a field immediately followed by typing
+ *     into that same field becomes one `set_value` step (the natural unit).
+ *  2. Parameterize: typed values become named params so the skill is reusable
+ *     (heuristic naming here; an optional LLM pass can rename/describe later).
+ *     A step always carries `{{param}}`, never the literal. The text the
+ *     person typed is kept as the param's DEFAULT, so the skill runs as
+ *     demonstrated when the caller supplies nothing and the model can name
+ *     what will be typed on the approval card. The exception is a value the
+ *     redaction rules flagged (recorder.ts): that param is required, marked
+ *     secret, and has no default, so the secret is never stored.
+ *  3. Derive postconditions: a set_value gets a value_equals check; a click
+ *     that is the last interaction on a surface gets surface_changed (the
+ *     click did something); launch_app gets window_appeared. Each is verified
+ *     against a before/after surface pair at run time, never vacuously.
+ */
+
+import type { RawInteraction } from './recorder.ts';
+import type { SkillParam, SkillStep } from './types.ts';
+
+export type CompileOptions = {
+  name: string;
+  app?: string;
+  description?: string;
+};
+
+export type CompiledSkill = {
+  name: string;
+  app: string;
+  description: string;
+  match: { keywords?: string[]; processNames?: string[] };
+  params: SkillParam[];
+  steps: SkillStep[];
+  provenance: 'recorded';
+};
+
+/**
+ * Process names of the Windows Start / Search UI. Typing an app name there
+ * and pressing Enter is how most people open an app, but it cannot be
+ * replayed as a field edit: the search UI is not on screen at replay time.
+ * It compiles to a launch_app step instead, and clicks inside the search UI
+ * (picking the result) are dropped.
+ */
+const WINDOWS_SEARCH_HOSTS: ReadonlySet<string> = new Set(['searchhost', 'searchapp', 'searchui', 'startmenuexperiencehost']);
+
+function isWindowsSearchHost(it: RawInteraction): boolean {
+  return it.app !== undefined && WINDOWS_SEARCH_HOSTS.has(it.app.toLowerCase());
+}
+
+function refFocusesSameField(clickRef: RawInteraction, typeInto: RawInteraction): boolean {
+  if (!clickRef.ref || !typeInto.ref) return false;
+  return clickRef.ref.sig !== '' && clickRef.ref.sig === typeInto.ref.sig
+    ? true
+    : clickRef.ref.role === typeInto.ref.role && clickRef.ref.name === typeInto.ref.name;
+}
+
+/** Snake-case a field name into a param identifier, deduping collisions. */
+function paramNameFor(ref: RawInteraction, used: Set<string>): string {
+  const base = (ref.ref?.name || 'value')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 24) || 'value';
+  let name = base;
+  let n = 2;
+  while (used.has(name)) name = `${base}_${n++}`;
+  used.add(name);
+  return name;
+}
+
+export function compileSkill(interactions: RawInteraction[], opts: CompileOptions): CompiledSkill {
+  // 1. Coalesce click-then-type on the same field.
+  const coalesced: RawInteraction[] = [];
+  for (let i = 0; i < interactions.length; i++) {
+    const cur = interactions[i]!;
+    const next = interactions[i + 1];
+    if (cur.action === 'click' && next && next.action === 'set_value' && refFocusesSameField(cur, next)) {
+      coalesced.push({ ...next }); // the set_value carries the field ref + value
+      i++; // consume the click
+    } else {
+      coalesced.push(cur);
+    }
+  }
+
+  // 2 + 3. Build steps, parameterize typed values, derive postconditions.
+  const params: SkillParam[] = [];
+  const usedNames = new Set<string>();
+  const steps: SkillStep[] = [];
+  const apps = new Set<string>();
+
+  for (let i = 0; i < coalesced.length; i++) {
+    const it = coalesced[i]!;
+    const surface = it.surface ?? 'desktop';
+
+    if (isWindowsSearchHost(it)) {
+      const typed = it.value?.trim() ?? '';
+      const redacted = it.value === '{{REDACTED}}' || it.secure === true;
+      if (it.action === 'set_value' && typed && !redacted) {
+        const last = steps[steps.length - 1];
+        if (!(last && last.action === 'launch_app' && last.value === typed)) {
+          steps.push({ action: 'launch_app', surface: 'desktop', value: typed, postcondition: { kind: 'window_appeared' }, note: `open ${typed} from Windows search` });
+        }
+      }
+      continue;
+    }
+    if (it.app) apps.add(it.app);
+
+    if (it.action === 'set_value') {
+      if (!it.ref) continue; // nothing to replay against
+      const pname = paramNameFor(it, usedNames);
+      const wasRedacted = it.value === '{{REDACTED}}' || it.secure === true || it.value === undefined;
+      params.push({
+        name: pname,
+        type: 'string',
+        description: wasRedacted
+          ? `Value for ${it.ref.name || 'field'} (was a secret; not stored, must be supplied)`
+          : `Value for ${it.ref.name || 'field'} (defaults to what was typed when recording)`,
+        required: wasRedacted,
+        ...(wasRedacted ? { secret: true } : { default: it.value }),
+      });
+      steps.push({
+        action: 'set_value',
+        surface,
+        ref: it.ref,
+        value: `{{${pname}}}`,
+        // A secret field's value_equals would leak nothing useful and often
+        // won't read back (masked), so skip its postcondition.
+        postcondition: wasRedacted ? undefined : { kind: 'value_equals', value: `{{${pname}}}` },
+        note: `type into ${it.ref.name || 'field'}`,
+      });
+    } else if (it.action === 'click') {
+      if (!it.ref) continue;
+      const isLastOnSurface = i === coalesced.length - 1 || (coalesced[i + 1]!.surface ?? 'desktop') !== surface;
+      steps.push({
+        action: 'click',
+        surface,
+        ref: it.ref,
+        // A terminal click (submit/next) must visibly do something: the
+        // element goes away, the title changes, or new content appears.
+        postcondition: isLastOnSurface ? { kind: 'surface_changed' } : undefined,
+        note: `click ${it.ref.name || 'element'}`,
+      });
+    } else if (it.action === 'launch_app') {
+      steps.push({ action: 'launch_app', surface: 'desktop', value: it.value, postcondition: { kind: 'window_appeared' } });
+    } else if (it.action === 'navigate') {
+      steps.push({ action: 'navigate', surface: 'browser', value: it.value });
+    } else if (it.action === 'press_keys') {
+      steps.push({ action: 'press_keys', surface, value: it.value });
+    }
+  }
+
+  const app = opts.app ?? [...apps][0] ?? '';
+  return {
+    name: opts.name,
+    app,
+    description: opts.description ?? `Recorded skill for ${app || 'an app'}`,
+    match: {
+      keywords: app ? [app.toLowerCase()] : undefined,
+      processNames: apps.size ? [...apps].map((a) => a.toLowerCase()) : undefined,
+    },
+    params,
+    steps,
+    provenance: 'recorded',
+  };
+}

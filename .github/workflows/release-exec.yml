@@ -1,0 +1,988 @@
+name: Release Executor
+
+# Builds and publishes a release for an existing version tag: npm packages,
+# Docker image, GitHub Release, Discord notification. Normally dispatched by
+# the Release workflow (release.yml), which bumps package.json and creates the
+# tag first. Pushing a v* tag by hand also triggers it, as an escape hatch.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — build and validate everything without publishing"
+        type: boolean
+        default: true
+      tag:
+        description: "Version tag to simulate (e.g. v0.1.0-test.1)"
+        required: true
+        default: "v0.0.0-dry-run"
+
+# Nothing by default (#646). The workflow-level block used to be
+# contents: write + packages: write, which every job without its own block
+# inherited -- including `test`, which runs `bun install` (dependency
+# lifecycle scripts) and the whole suite with a token that could push to the
+# repository and the registry. Every job now asks for exactly what it uses,
+# and a job added later starts with no token instead of a write one.
+permissions: {}
+
+# One release at a time (#645). Two tag pushes, or a push racing a dispatch,
+# used to run side by side: both reached publish-docker, both pushed
+# `:latest` for a non-prerelease, and whichever finished second owned it --
+# not necessarily the higher version. Both also wrote `cache-to: type=gha`
+# into the same scope.
+#
+# Global, not per ref: `:latest` is one pointer for the whole repository, so
+# a group keyed on the tag would let exactly the two runs that matter race.
+# release.yml uses its own group (`release`), so its dispatch of this workflow
+# cannot deadlock against itself.
+#
+# cancel-in-progress: false, because cancelling a half-finished publish (npm
+# out, Docker not) is worse than waiting.
+#
+# queue: max, because the default queue (`single`) holds ONE pending run and
+# cancels it when another is queued: a third release arriving while one runs
+# and one waits would silently drop the waiting one. (release.yml now waits
+# for the run it dispatches (#683) and would go red, but a hand-pushed tag
+# has no such watcher.) `max` keeps up to 100 pending runs and starts
+# them in order (GitHub docs, workflow-level `concurrency.queue`; changelog
+# 2026-05-07). It is rejected only together with cancel-in-progress: true.
+#
+# Dry runs share the group. They push nothing, but they do build and smoke
+# the image, so a rehearsal can delay a real release by one gate's length --
+# never cancel it, which under `single` it could have.
+#
+# actionlint 1.7.x predates the `queue` key and reports it as unexpected; that
+# is the linter, not this file.
+concurrency:
+  group: release-exec
+  cancel-in-progress: false
+  queue: max
+
+env:
+  # Pinned to match test.yml: the jobs below install with --frozen-lockfile,
+  # and a floating Bun that migrates the lockfile format would fail a RELEASE.
+  BUN_VERSION: "1.4.2"
+  # Everything below is code a SHA-pinned action or a `run:` step downloads
+  # and executes AFTER the pin has done its job, so it is pinned too (#681).
+  # None of it is something Dependabot can see: bump by hand, and keep the
+  # same values in sidecar-release.yml (NPM_VERSION) and in both jobs here
+  # (they read these, so they cannot drift apart).
+  #
+  # npm Trusted Publishing needs npm >= 11.5.1 and Node 22 bundles npm 10, so
+  # the publish jobs install npm -- formerly `npm@latest`, i.e. whatever the
+  # registry's dist-tag pointed at, into a job holding id-token: write.
+  # 12.1.0 is what the last two releases ran (v0.14.0 on 2026-09-22 and
+  # v0.15.0 on 2026-09-30 both installed `latest` after 12.1.0 was published
+  # and before 12.2.0 was); npm versions are immutable once published.
+  NPM_VERSION: "12.1.0"
+  # The QEMU binfmt image runs --privileged on the runner and its emulators
+  # execute every arm64 build step. Was the action's default
+  # `docker.io/tonistiigi/binfmt:latest`. qemu-v10.2.3 is the image `latest`
+  # pointed at for v0.15.0 (same digest in that run's log).
+  BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  # The BuildKit daemon that produces the published layers, and the GHA cache
+  # entries both docker jobs share. Was the action's default
+  # `moby/buildkit:buildx-stable-1`, which v0.33.1 is as of 2026-10-06.
+  BUILDKIT_IMAGE: moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+  SIDECAR_BIN: pipo
+  # The one dry-run decision (#685), spelled the same everywhere it has to be
+  # made: here, the sidecar call input, discord-notify's `if:` and
+  # publish-brain's environment name. Those three cannot read this env (a
+  # job-level `if:`, a reusable-workflow `with:` and `environment.name` do not
+  # get the `env` context), so they repeat `inputs.dry_run == true` instead.
+  # On a tag push there are no inputs and it is false. Every step reads
+  # DRY_RUN, only ever compared with 'true'. release-exec.test.sh evaluates
+  # all four under a push, a real dispatch and a dry dispatch and fails unless
+  # they agree: a half-dry release could announce a version it never
+  # published, or publish one it never announced.
+  DRY_RUN: ${{ inputs.dry_run == true }}
+  # There is deliberately no RELEASE_TAG here (#644). The raw tag --
+  # `inputs.tag || github.ref_name` -- is read through an expression in exactly
+  # one place, the validate-tag job below, and every other job takes the
+  # checked value from its outputs. A workflow-level env would hand the
+  # unchecked string to every job and invite the next `${{ env.RELEASE_TAG }}`
+  # inside a `run:`. (The runner still puts $GITHUB_REF_NAME in every job's
+  # environment; no step outside validate-tag may read it, and the test below
+  # enforces that too.)
+
+jobs:
+  # ─── Gate: the tag must be v<semver> before anything reads it ──
+  # #644. The release tag is attacker-shaped input on both manual paths: a
+  # hand-pushed tag (git accepts `v1.0.0";id;"` and `v1.0.0$(id)` as ref
+  # names) and the free-form workflow_dispatch input, which can also carry a
+  # newline. It used to reach `run:` scripts through `${{ }}`, which GitHub
+  # substitutes into the script text BEFORE bash parses it -- in publish-brain,
+  # a job holding `id-token: write` for npm Trusted Publishing. A newline could
+  # also write extra KEY=value lines into $GITHUB_OUTPUT.
+  #
+  # The control is here, once, at the source:
+  #   - the only job that reads the raw tag through an expression, with no
+  #     token scopes at all (`permissions: {}`) and no checkout, so the step
+  #     below is the whole of what runs with the raw value in reach;
+  #   - the raw value arrives through `env:` and is only ever a quoted "$RAW_TAG"
+  #     operand, never script text;
+  #   - an anchored match on the whole string. bash's =~ is POSIX ERE without
+  #     REG_NEWLINE, so `$` is end-of-string and a newline-bearing value cannot
+  #     match line-by-line. LC_ALL=C first: under a UTF-8 locale such as
+  #     en_US.UTF-8, glibc's [A-Za-z] and [0-9] also match letters and digits
+  #     outside ASCII (measured: `v1.2.3-é` and an Arabic-Indic major version
+  #     both matched), and the alphabet claim below would not hold;
+  #   - nothing is written to $GITHUB_OUTPUT until the value has matched, and
+  #     what matched cannot contain a newline, quote, `$`, backtick, `;` or
+  #     space -- the alphabet is ASCII [0-9A-Za-z.-] after the leading `v`.
+  #
+  # Every other job takes `needs.validate-tag.outputs.*`, and a `run:` that
+  # needs one consumes it through `env:` as a quoted "$VAR", never `${{ }}`.
+  # .github/scripts/release-exec.test.sh executes this step's script verbatim
+  # against hostile tags and checks that structure, so neither can drift.
+  #
+  # The Dockerfile's semver check (#625) also rejects metacharacters, and used
+  # to be the only thing standing in the way. It is not the control: it sits in
+  # a different job three files from the sink and holds only while build-docker
+  # gates the publish jobs. It may not even hold today. A newline in the
+  # dispatch input could make the extracted VERSION multi-line via
+  # $GITHUB_OUTPUT's `NAME<<DELIM` syntax; build-push-action splits
+  # `build-args:` on newlines, so a clean first line would reach the Dockerfile
+  # as VERSION and the rest as a second, ignored build-arg (buildx accepts one
+  # named `";id;"` and builds green -- checked locally), while publish-brain
+  # substituted the whole value into its script. That chain is reasoned from
+  # the documented behaviour of both, not run on GitHub.
+  #
+  # What counts as valid, and why it is stricter than "looks like semver":
+  #   - The leading `v` is required. Every path that reaches this workflow
+  #     names a v-tag (release.yml dispatches `v${NEW}`, the push trigger is
+  #     `v*`), and the tag is used verbatim as github-release's `tag_name`: a
+  #     bare `1.2.3` would name a tag that does not exist, which
+  #     action-gh-release creates rather than rejects.
+  #   - Pre-release identifiers follow SemVer 2.0 one by one: no empty
+  #     identifier, no leading zero on a numeric one. A looser pattern let
+  #     `v1.2.3-01` and `v1.2.3-rc..1` through, which `npm version` then refused
+  #     -- after the sidecar had already published.
+  #   - No build metadata. npm drops it: `1.2.3+x` IS `1.2.3` to node-semver
+  #     (checked), so `npm publish` of `v1.2.3+x` would collide with 1.2.3,
+  #     publish-brain's "already on npm; treating as success" branch would take
+  #     it, and publish-docker would move `:latest` to a build no npm release
+  #     matches. release.yml never produces build metadata.
+  #   - On a real (non-dry) run the tag must be the ref being built: a tag push,
+  #     or a dispatch made `--ref <the same tag>` (release.yml does exactly
+  #     that). Otherwise `tag` is free text, and a dispatch from any branch with
+  #     tag=v9.9.9 would publish that branch as 9.9.9 and have
+  #     action-gh-release create the tag on the default branch. A dry run may
+  #     rehearse any ref, since it publishes nothing.
+  #   - Sizes every publisher accepts: each of major.minor.patch at most 16
+  #     digits (node-semver's MAX_SAFE_COMPONENT_LENGTH) and the version at
+  #     most 128 characters -- Docker's tag limit, which publish-docker hits
+  #     with the bare `{{version}}` tag AFTER npm has published, and the
+  #     tighter of it and npm's 256. An oversized tag fails here instead of
+  #     half-publishing. (node-semver also refuses a 16-digit component above
+  #     2^53-1; that sliver still fails late.)
+  #
+  # What this gate is and is not. It stops malformed and hostile tag TEXT, and
+  # a release of one ref under another ref's version. It is not a control
+  # against anyone who can create tags or run workflows: nothing in this
+  # repository restricts who creates a `v*` tag or what it points at (no tag
+  # ruleset), and a writer can dispatch a modified copy of this file from
+  # their own branch. What stands between that and an npm publish is the
+  # `release` environment's required reviewers on publish-brain and
+  # publish-sidecar (#679, #756), not this gate. Nothing equivalent gates
+  # publish-docker's push to GHCR: only the `needs:` order in this file.
+  validate-tag:
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+      prerelease: ${{ steps.validate.outputs.prerelease }}
+    steps:
+      - name: Validate the release tag
+        id: validate
+        env:
+          RAW_TAG: ${{ inputs.tag || github.ref_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          num='(0|[1-9][0-9]{0,15})'
+          re="^v(${num}[.]${num}[.]${num}(-${id}([.]${id})*)?)\$"
+          if [ "${#RAW_TAG}" -gt 129 ] || ! [[ "$RAW_TAG" =~ $re ]]; then
+            # %q, so a newline in the value cannot start a workflow command of
+            # its own in the log.
+            printf '::error::Release tag is not v<semver> without build metadata (e.g. v1.2.3, v1.2.3-rc.1): %q\n' "$RAW_TAG"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          # Group 5 is the whole `-pre.release` part, if any.
+          if [ -n "${BASH_REMATCH[5]}" ]; then prerelease=true; else prerelease=false; fi
+          if [ "$DRY_RUN" != "true" ] && { [ "$REF_TYPE" != "tag" ] || [ "$REF_NAME" != "$RAW_TAG" ]; }; then
+            printf '::error::A real release must build the tag it publishes: tag input %q, but this run is on %s %q. Dispatch with --ref %q, or set dry_run.\n' \
+              "$RAW_TAG" "$REF_TYPE" "$REF_NAME" "$RAW_TAG"
+            exit 1
+          fi
+          {
+            echo "tag=v${version}"
+            echo "version=${version}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release tag v${version} (pre-release: ${prerelease})"
+
+  # ─── Gate: run tests before anything else ───────────────────────
+  test:
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # The Actions cache is writable by any run on main; see #681.
+          no-cache: true
+          bun-version: ${{ env.BUN_VERSION }}
+      # --frozen-lockfile: the release must build from exactly the versions the
+      # lockfile records — the PR gate enforces this, and the shipping path is
+      # where it matters most.
+      - run: bun install --frozen-lockfile
+      # `--retry=2`, matching test.yml (which has had it since #501's Chromium
+      # flake class was identified). This gate has run bare `bun test` since
+      # #230, which made it STRICTER than the PR gate on exactly the tests
+      # known to flake -- so a release could fail on something no PR would.
+      #
+      # The 2026-10-07 dry run (#774's validation) failed here on three of
+      # them: `launchChrome on this host (real headless Chromium)` twice and
+      # the webapp-template browser integration test, 7994 pass / 3 fail. And
+      # because this gate is first, every publish job downstream skipped -- so
+      # a flake here does not just delay a release, it hides whether the rest
+      # of the path works.
+      #
+      # --retry is per TEST, not a step-level retry: a flaky test gets three
+      # attempts while a deterministic failure still fails all three, and
+      # retried tests print as "(attempt N)" so a flake stays visible rather
+      # than silent.
+      - run: bun test --retry=2
+      - run: bunx tsc --noEmit
+
+  # ─── Gate: build AND RUN the image before publishing anything ──
+  # A no-push multi-arch build so a broken Dockerfile fails the entire release
+  # (npm, GitHub Release, Docker push) rather than just one job, and then the
+  # same container smoke check docker-build.yml runs on PRs.
+  #
+  # The run half is #621. This gate used to build only, and a successful build
+  # was all it proved -- which is why #613 and #614 both shipped: both built
+  # cleanly and failed only at runtime, and both were found by an outside
+  # reporter. The release path was the weaker of the two checks while being the
+  # one that matters. See .github/scripts/docker-smoke.sh for what it asserts.
+  build-docker:
+    needs: [validate-tag, test]
+    runs-on: ubuntu-latest
+    # This job neither pushes an image nor writes to the repo, and it EXECUTES
+    # the image it built, so it takes the narrowest scope: a container escape
+    # here must not land in a job whose runner holds a publish-capable token.
+    # (Since #646 the workflow-level block is `{}`, so this is what every job
+    # does; it was written when this job was the exception.)
+    # persist-credentials: false below is the other half -- nothing after the
+    # checkout runs git, so the token has no reason to be on disk.
+    permissions:
+      contents: read
+    # Multi-arch (arm64 under QEMU) plus a second single-arch build plus three
+    # smoke phases. docker-build.yml allows 30 for the single-arch half alone.
+    # Generous on purpose: a too-tight bound on a release gate turns a slow
+    # release into a failed one, and the default is 6 hours.
+    timeout-minutes: 90
+    env:
+      # Run-scoped, matching docker-build.yml, and removed by name at the end.
+      GATE_IMAGE_TAG: pipo:release-gate-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned images: see BINFMT_IMAGE and BUILDKIT_IMAGE at the top.
+      # cache-image: false, because with it on the action `docker load`s the
+      # privileged binfmt image from the Actions cache -- which any workflow
+      # run on main can write -- before every pull, and runs that copy if the
+      # pull fails. A loaded tar can also bring tags of its own into dockerd.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Build Docker image (validate, no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: VERSION=${{ needs.validate-tag.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # This job runs the image on the runner's own architecture only, so the
+      # smoke check below covers linux/amd64 ONLY. arm64 stays build-validated
+      # by the step above and is never started. Starting it IS possible -- the
+      # QEMU handlers installed above are exactly what would make a foreign-arch
+      # container execute -- and is declined rather than impossible: it is very
+      # slow, and a QEMU-emulated boot is not what an arm64 user executes, so a
+      # pass there would prove less than it appears to. An arm64-only runtime
+      # defect is a gap this gate does not close, deliberately.
+      #
+      # `load: true` is what puts the image in dockerd's image store so
+      # docker-smoke.sh can run it: setup-buildx-action's docker-container
+      # driver otherwise leaves the result in the BuildKit cache only. `load`
+      # forces the single-platform docker exporter, which is why this cannot
+      # just be added to the multi-arch step above.
+      #
+      # cache-from WITHOUT cache-to. The step above exports
+      # `type=gha,mode=max` with no `scope:`, shared with docker-build.yml's
+      # PR builds, and an extra export covering only amd64 risks leaving that
+      # scope covering only amd64. Before #782 that mattered more:
+      # publish-docker read the same scope, so its multi-arch build could then
+      # rebuild the arm64 leg -- published layers this gate never ran. It now
+      # builds cold, so the remaining cost of a thin scope is only a slower
+      # validation here. (Not the engine
+      # bundle: the `workflows` stage is pinned to BUILDPLATFORM and both legs
+      # COPY from it, so it is in the amd64 graph and an arm64 rebuild reuses
+      # it. The exposure is the arm64 `deps`/`build` stages, which are not
+      # pinned.) Reading the cache is all this step needs anyway: it shares one
+      # buildx builder with the step above, whose amd64 result is a local cache
+      # hit, and cache-from is the fallback if that result came from the remote
+      # cache in the first place.
+      - name: Build the amd64 image again, loaded, so it can be run
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.GATE_IMAGE_TAG }}
+          build-args: VERSION=${{ needs.validate-tag.outputs.version }}
+          cache-from: type=gha
+
+      # Runs with no DRY_RUN condition on purpose: a dry run exists to rehearse
+      # the release, and skipping the only check that starts the image would
+      # make the rehearsal quieter than the real thing.
+      #
+      # SMOKE_CONTAINER_PORT is deliberately unset: the image EXPOSEs 1846 and
+      # defaults to it, which is the script's own default.
+      #
+      # What this proves, stated narrowly so nobody reads more into a green
+      # gate: an amd64 image built from this Dockerfile and this cache state
+      # boots healthy, answers /health unauthenticated, logs no startup
+      # failure, and does it again over a written volume. It does NOT prove byte
+      # identity with the manifest publish-docker pushes -- that is a separate
+      # build in a separate job, with no digest carried between them. Closing
+      # that needs a build-once/push-by-digest restructure, which is filed
+      # separately and is not what #621 asked for.
+      - name: Smoke-test the image (run it like a user does)
+        env:
+          # Unique per run AND per re-run, so a retry cannot collide with a
+          # leftover container or volume from the attempt before it.
+          SMOKE_PREFIX: pipo-release-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./.github/scripts/docker-smoke.sh "$GATE_IMAGE_TAG"
+
+      # The script removes the containers and volumes it created, by name, in
+      # its own EXIT trap, and deliberately leaves the image to its caller.
+      # By exact tag: no prune.
+      #
+      # `|| true` so a cleanup problem cannot redden an otherwise green gate,
+      # which does mean a leak goes unreported: if the script is SIGKILLed its
+      # trap never runs, the leftover container holds the image, and this rm
+      # fails silently. Acceptable because every runner here is a GitHub-hosted
+      # ephemeral VM that is destroyed with the job. On a self-hosted runner
+      # this would need to report what it could not remove.
+      - name: Remove the image tag this job loaded
+        if: always()
+        run: docker image rm "$GATE_IMAGE_TAG" || true
+
+  # ─── Sidecar release (reusable, versioned from sidecar/VERSION) ─
+  # Builds + publishes the sidecar at its own version, gated behind the Docker
+  # validation like the brain publish. Idempotent: a no-op when that version is
+  # already on npm, so a brain release ships the sidecar only when it actually
+  # changed. See sidecar-release.yml.
+  sidecar:
+    needs: [test, build-docker]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/sidecar-release.yml
+    # Exactly the Apple signing credentials, not `secrets: inherit` (#682):
+    # inherit made every repository secret -- DISCORD_WEBHOOK_URL, NPM_TOKEN,
+    # and any added later -- referenceable from the called workflow, whose
+    # publish-sidecar job holds id-token. These five must reach it or its
+    # macOS signing steps silently skip; sidecar-release.yml declares the
+    # same five under workflow_call, and workflow-hardening.test.sh checks
+    # that the two lists match.
+    # Windows signing needs no secret at all: it federates into Google Cloud
+    # with the id-token granted above (repository *variables* are visible to
+    # called workflows without passing anything).
+    secrets:
+      APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+    with:
+      dry_run: ${{ inputs.dry_run == true }}
+
+  # --- Build the brain tarball (no OIDC) ---
+  # Split from publish-brain (#682). Everything that runs repository and
+  # dependency code -- `bun install` lifecycle scripts, prepublishOnly's UI and
+  # workflow builds, the tarball check -- runs here, in a job that cannot mint
+  # an OIDC token, and its one product is the tarball plus its digest.
+  # publish-brain then publishes that file and runs nothing else: npm runs no
+  # lifecycle scripts when publishing a tarball, only a directory.
+  #
+  # It runs dependency code, and every job in this run can write this run's
+  # artifacts, so it starts only once the sidecar workflow has published and
+  # build-docker is done: a lifecycle script left running here must not be
+  # able to swap the sidecar binaries between their upload and
+  # publish-sidecar's download. publish-brain waits for both anyway, so this
+  # costs no time. The timeout bounds how long anything it starts can linger.
+  pack-brain:
+    needs: [validate-tag, test, build-docker, sidecar]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # The Actions cache is writable by any run on main; see #681.
+          no-cache: true
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # The same npm that publishes packs, so the tarball is the one npm
+      # itself would have built from the directory.
+      - name: Install the pinned npm
+        run: |
+          set -euo pipefail
+          npm install -g "npm@${NPM_VERSION}"
+          got="$(npm --version)"
+          [ "$got" = "$NPM_VERSION" ] || { echo "::error::npm on PATH is $got, expected $NPM_VERSION"; exit 1; }
+
+      # Frozen here too: this job runs prepublishOnly and builds the tarball,
+      # so it must not resolve a version bun.lock never recorded.
+      - run: bun install --frozen-lockfile
+
+      - name: Set package version
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Build UI
+        run: bun run prepublishOnly
+
+      # Assert the tarball ABOUT TO BE PUBLISHED still contains every file an
+      # out-of-repo consumer resolves by path. The PR gate runs this too, but
+      # only this job holds the real artifact: a `files` edit merged after CI,
+      # or an npm/bun disagreement about `files`, is caught here or not at all.
+      # npm is on PATH in this job, so the check runs npm's own packer.
+      # npm versions are immutable -- one minute here beats a fix-forward.
+      - name: Check published tarball contents
+        run: bun run scripts/check-package-files.ts
+
+      # `npm pack` runs prepack/prepare/postpack but not prepublishOnly, which
+      # is why the step above runs it explicitly: the result is what a
+      # directory `npm publish` would have uploaded.
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/brain-pack"
+          mkdir -p "$dir"
+          name="$(npm pack --pack-destination "$dir" | tail -n1)"
+          [ -f "$dir/$name" ] || { echo "::error::npm pack did not produce $dir/$name"; exit 1; }
+          sum="$(sha256sum "$dir/$name" | cut -d' ' -f1)"
+          echo "tarball=$name" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "Packed $name (sha256 $sum)"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: brain-tarball
+          path: ${{ runner.temp }}/brain-pack/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─── Publish main brain package to npm ─────────────────────────
+  # After the sidecar: a published brain advertises the sidecar it ships with
+  # (SIDECAR_LATEST_VERSION) to every connecting sidecar, which offers to
+  # install it, so that sidecar has to be on npm first. The sidecar job is a
+  # no-op success when its version is already published.
+  #
+  # The only job here that can mint an OIDC token for npm, so it checks out
+  # nothing, installs no dependencies and runs no repository code (#682): it
+  # verifies pack-brain's tarball against the digest pack-brain reported and
+  # publishes it.
+  publish-brain:
+    needs: [validate-tag, pack-brain, build-docker, sidecar]
+    runs-on: ubuntu-latest
+    # npm Trusted Publishing for @pipo/brain requires this environment, so
+    # the OIDC token this job mints must carry the claim or npm refuses the
+    # publish (#679). It is also the gate: the environment's required reviewers
+    # mean a stolen token or a compromised action cannot publish unattended --
+    # automation cannot click Approve. Changing the real-run name here does not
+    # loosen a check, it breaks publishing outright.
+    #
+    # A dry run uses a DIFFERENT environment, because naming one records a
+    # GitHub deployment against it. Two jobs carry this, so each dry run wrote
+    # two deployments claiming `release` for a version it never published, and
+    # the Deployments page then showed a rehearsal as the live state. Only
+    # `github`, `inputs`, `vars`, `needs`, `strategy` and `matrix` are allowed
+    # in an environment name -- NOT `env`, so this reads `inputs.dry_run`
+    # rather than the DRY_RUN env every other step uses.
+    environment:
+      name: ${{ inputs.dry_run == true && 'release-dry-run' || 'release' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Exact version: see NPM_VERSION at the top. The check is there so a
+      # pin that silently did not take (a PATH shadowing the global install)
+      # fails here instead of publishing with the bundled npm 10.
+      - name: Ensure npm supports Trusted Publishing
+        run: |
+          set -euo pipefail
+          npm install -g "npm@${NPM_VERSION}"
+          got="$(npm --version)"
+          [ "$got" = "$NPM_VERSION" ] || { echo "::error::npm on PATH is $got, expected $NPM_VERSION"; exit 1; }
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: brain-tarball
+          path: ${{ runner.temp }}/brain-pack
+
+      # The digest travels as a job output, which only pack-brain can set; the
+      # artifact store is writable by every job in this run. A mismatch means
+      # the file is not the one pack-brain built.
+      - name: Verify the tarball
+        env:
+          TARBALL: ${{ needs.pack-brain.outputs.tarball }}
+          SHA256: ${{ needs.pack-brain.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$TARBALL" =~ ^pipo-brain-[0-9A-Za-z.-]+\.tgz$ ]] || { echo "::error::unexpected tarball name"; exit 1; }
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::pack-brain reported no digest"; exit 1; }
+          echo "${SHA256}  ${RUNNER_TEMP}/brain-pack/${TARBALL}" | sha256sum -c -
+
+      - name: Publish to npm
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+          PRERELEASE: ${{ needs.validate-tag.outputs.prerelease }}
+          TARBALL: ${{ needs.pack-brain.outputs.tarball }}
+        run: |
+          flags=()
+          if [ "$DRY_RUN" = "true" ]; then flags+=(--dry-run); fi
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--tag next); fi
+          pkg="@pipo/brain"
+
+          if ! npm publish "${RUNNER_TEMP}/brain-pack/${TARBALL}" --access public "${flags[@]}"; then
+            if [ "$DRY_RUN" != "true" ] && npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${pkg}@${VERSION} is already on npm; treating as success."
+            else
+              exit 1
+            fi
+          fi
+
+  # ─── Create the brain GitHub Release ───────────────────────────
+  # Gated by publish-docker (itself gated by the npm publishes), so a failed
+  # publish means no release and no Discord ping. Carries the brain notes the
+  # Discord step summarizes and, when the sidecar was (re)built this run,
+  # attaches the sidecar binaries — so the downloads live on the brain's v*
+  # release with no separate sidecar tag. The sidecar itself ships via npm
+  # (sidecar-release.yml).
+  github-release:
+    needs: [validate-tag, publish-docker, sidecar]
+    runs-on: ubuntu-latest
+    # Creating the release (and its generated notes) is a contents write. The
+    # sidecar artifacts come from this same run, which needs no token scope.
+    permissions:
+      contents: write
+    steps:
+      # persist-credentials: false (#682). Nothing in this job runs git:
+      # action-gh-release creates the release through the API with its own
+      # token input. Left on, the contents: write token sat in .git/config
+      # for every later step to read.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The sidecar binaries are uploaded as artifacts by the reusable
+      # sidecar-release workflow (same run); pull them in only when it actually
+      # built this run.
+      - name: Download sidecar binaries
+        if: needs.sidecar.outputs.released == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: sidecar-*
+
+      # Exactly the bytes publish-sidecar published (#682): its digests come
+      # as a job output; the artifacts themselves could have been replaced by
+      # any job in this run since -- pack-brain runs dependency code in
+      # between.
+      - name: Verify sidecar binaries
+        if: needs.sidecar.outputs.released == 'true'
+        env:
+          SUMS: ${{ needs.sidecar.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [ -n "$SUMS" ] || { echo "::error::the sidecar workflow reported no digests"; exit 1; }
+          cd artifacts
+          printf '%s' "$SUMS" | base64 -d | sha256sum --strict -c -
+
+      - name: Package sidecar assets
+        if: needs.sidecar.outputs.released == 'true'
+        env:
+          SIDECAR_VERSION: ${{ needs.sidecar.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          # Tarballs are named for the sidecar's own version.
+          # darwin: the artifact is already a tar.gz of pipo.app (signed +
+          # notarized when CI has the Apple credentials, ocr-helper inside) —
+          # attach it under the release name.
+          for platform in darwin-arm64 darwin-x64; do
+            cp "artifacts/sidecar-${platform}/pipo-app.tar.gz" \
+              "release/${SIDECAR_BIN}-v${SIDECAR_VERSION}-${platform}.tar.gz"
+          done
+
+          for platform in linux-x64 linux-arm64; do
+            chmod +x "artifacts/sidecar-${platform}/${SIDECAR_BIN}"
+            tar -czf "release/${SIDECAR_BIN}-v${SIDECAR_VERSION}-${platform}.tar.gz" \
+              -C "artifacts/sidecar-${platform}" "${SIDECAR_BIN}"
+          done
+
+          # Windows gets a zip (the .exe is Authenticode-signed at build time
+          # when Windows signing is configured — see sidecar-release.yml)
+          cd "artifacts/sidecar-win32-x64"
+          zip "../../release/${SIDECAR_BIN}-v${SIDECAR_VERSION}-win32-x64.zip" \
+            "${SIDECAR_BIN}.exe"
+          cd "$GITHUB_WORKSPACE"
+
+          # Checksums for every attached asset
+          (cd release && sha256sum * > SHA256SUMS)
+
+      - name: Create GitHub Release
+        if: env.DRY_RUN != 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.validate-tag.outputs.tag }}
+          # The commit this run built. Without it, a tag deleted mid-run would
+          # be re-created by action-gh-release at the default branch's tip.
+          target_commitish: ${{ github.sha }}
+          name: pipo ${{ needs.validate-tag.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.validate-tag.outputs.prerelease == 'true' }}
+          # Empty when the sidecar didn't change this run — attach what's there.
+          fail_on_unmatched_files: false
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/SHA256SUMS
+
+      # `generate_release_notes: true` above means GitHub composes the notes, so
+      # skipping that step on a dry run skipped the notes with it -- the one
+      # human-facing output of a release went unrehearsed. This renders them
+      # through the generate-notes endpoint, which returns a body and creates
+      # NOTHING, and puts them in the job summary to be read.
+      - name: Render the release notes this would publish
+        if: env.DRY_RUN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate-tag.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          notes=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$SHA" --jq .body)
+          {
+            echo "## Release notes this run would publish"
+            echo
+            echo "Rendered for \`${TAG}\` at \`${SHA}\`. No release was created."
+            echo
+            echo "$notes"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$notes"
+
+      - name: Dry-run summary
+        if: env.DRY_RUN == 'true'
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          echo "::notice::DRY RUN — skipped GitHub Release creation"
+          echo "Would have created release v${VERSION}"
+          ls -lh release/ 2>/dev/null || true
+
+  # ─── Build and push Docker images ──────────────────────────────
+  # Gated by the npm publishes — if any npm publish fails, docker never
+  # pushes. Keeps the release atomic from the user-visible side: a Docker
+  # image tagged vX.Y.Z always has matching @pipo/* npm versions.
+  publish-docker:
+    needs: [validate-tag, sidecar, publish-brain]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned images: see BINFMT_IMAGE and BUILDKIT_IMAGE at the top.
+      # cache-image: false, because with it on the action `docker load`s the
+      # privileged binfmt image from the Actions cache -- which any workflow
+      # run on main can write -- before every pull, and runs that copy if the
+      # pull fails. A loaded tar can also bring tags of its own into dockerd.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      # Only when something will be pushed (#682): a dry run builds with
+      # push: false and has no use for a registry credential on disk.
+      - name: Log in to GitHub Container Registry
+        if: env.DRY_RUN != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.validate-tag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate-tag.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.validate-tag.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.title=pipo
+            org.opencontainers.image.description=P.I.P.O. — Always-on autonomous AI daemon
+            org.opencontainers.image.vendor=Motius
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}
+
+      # Built cold, with no cache-from or cache-to (#782). This is the only
+      # build whose output ships, and the GHA cache it used to read is
+      # writable by any workflow run on main and by every job in this run, so
+      # the pushed layers could be assembled from cache entries nobody built
+      # here. build-docker keeps the cache: it builds the same two-platform
+      # image only to validate and smoke-test it, and nothing reads its
+      # output. Measured cost: publish-docker 1m55s cold against 52s warm,
+      # about +63s per release (runs 37613557506 cold, 37610958257 warm; the
+      # cold log has no cache import and no CACHED step). The dry-run build
+      # below is cold too, so a rehearsal times and builds what a release does.
+      #
+      # The trade: the image docker-smoke.sh starts in build-docker is now a
+      # separate, cache-assisted build of the same source, no longer the bytes
+      # this job pushes (it never was byte-proven; see build-docker).
+      - name: Build and push Docker image
+        if: env.DRY_RUN != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ needs.validate-tag.outputs.version }}
+
+      - name: Build Docker image (dry run)
+        if: env.DRY_RUN == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ needs.validate-tag.outputs.version }}
+
+      - name: Dry-run summary
+        if: env.DRY_RUN == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "::notice::DRY RUN — Docker image built but not pushed"
+          echo "Tags that would have been pushed:"
+          printf '%s\n' "$TAGS"
+
+  # ─── Notify Discord about the new release ──────────────────────
+  discord-notify:
+    needs: [validate-tag, github-release]
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Get release notes
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.validate-tag.outputs.tag }}
+        run: |
+          RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")
+          BODY=$(echo "$RELEASE_JSON" | jq -r '.body')
+          HTML_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+
+          # Store in files to avoid delimiter issues
+          echo "$BODY" > /tmp/whats_changed.txt
+          echo "$HTML_URL" > /tmp/html_url.txt
+          echo "$TAG" > /tmp/tag.txt
+
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=en_US.UTF-8
+
+          TAG=$(cat /tmp/tag.txt)
+          HTML_URL=$(cat /tmp/html_url.txt)
+
+          # Strip GitHub HTML comments and the redundant "## What's Changed" header
+          # (the message prefix already announces the release).
+          CLEAN=$(sed -e '/^<!--/d' -e '/^## What.s Changed$/d' /tmp/whats_changed.txt)
+          CLEAN=$(printf '%s\n' "$CLEAN" | awk 'NF{p=1} p')
+
+          PREFIX=$'@everyone\n\n**pipo '"${TAG}"$' has been released!** 🎉\n\n'
+          SUFFIX=$'\n\n🔗 **Full release:** <'"${HTML_URL}"'>'
+
+          TOTAL_PRS=$(printf '%s\n' "$CLEAN" | grep -c '^\* ' || true)
+
+          # Per-section bullet counts in the full changelog (preserves order).
+          SECTIONS_FULL=$(printf '%s\n' "$CLEAN" | awk '
+            /^### / { current=$0; if (!(current in seen)) { order[++n]=current; seen[current]=1 } next }
+            /^\* / && current { count[current]++ }
+            END { for (i=1;i<=n;i++) printf "%d\t%s\n", count[order[i]]+0, order[i] }
+          ')
+
+          # Reserve worst-case marker length (assume every section appears in the dropped list).
+          ALL_HEADERS=$(printf '%s\n' "$SECTIONS_FULL" | cut -f2- | sed 's/^### //' | paste -sd ', ' -)
+          MARKER_WORST=$(printf '\n\n*...and %d more changes across %s.*' "$TOTAL_PRS" "$ALL_HEADERS")
+
+          BUDGET=$(( 2000 - ${#PREFIX} - ${#SUFFIX} - ${#MARKER_WORST} ))
+
+          USED=0
+          KEPT=""
+          TRUNCATED=0
+          while IFS= read -r LINE; do
+            COST=$(( ${#LINE} + 1 ))
+            if (( USED + COST <= BUDGET )); then
+              KEPT+="${LINE}"$'\n'
+              USED=$(( USED + COST ))
+            else
+              TRUNCATED=1
+              break
+            fi
+          done < <(printf '%s\n' "$CLEAN")
+
+          if (( TRUNCATED )); then
+            # Drop trailing dangling section headers (no bullets kept under them).
+            KEPT=$(printf '%s' "$KEPT" | awk '
+              { lines[NR]=$0 }
+              END {
+                n=NR
+                while (n>0 && lines[n] ~ /^### /) n--
+                for (i=1;i<=n;i++) print lines[i]
+              }')
+
+            KEPT_PRS=$(printf '%s\n' "$KEPT" | grep -c '^\* ' || true)
+            DROPPED=$(( TOTAL_PRS - KEPT_PRS ))
+
+            SECTIONS_KEPT=$(printf '%s\n' "$KEPT" | awk '
+              /^### / { current=$0; if (!(current in seen)) { order[++n]=current; seen[current]=1 } next }
+              /^\* / && current { count[current]++ }
+              END { for (i=1;i<=n;i++) printf "%d\t%s\n", count[order[i]]+0, order[i] }
+            ')
+
+            DROPPED_SECTIONS=$(awk -F'\t' '
+              NR==FNR { kept[$2]=$1; next }
+              {
+                full=$1; header=$2
+                k = (header in kept) ? kept[header] : 0
+                if (k < full) print header
+              }
+            ' <(printf '%s\n' "$SECTIONS_KEPT") <(printf '%s\n' "$SECTIONS_FULL") | sed 's/^### //')
+
+            N=$(printf '%s\n' "$DROPPED_SECTIONS" | sed '/^$/d' | wc -l)
+            if (( N == 0 )); then
+              LIST=""
+            elif (( N == 1 )); then
+              LIST=$(printf '%s' "$DROPPED_SECTIONS")
+            elif (( N == 2 )); then
+              LIST=$(printf '%s\n' "$DROPPED_SECTIONS" | paste -sd '|' - | sed 's/|/ and /')
+            else
+              LIST=$(printf '%s\n' "$DROPPED_SECTIONS" | awk '
+                { a[NR]=$0 }
+                END {
+                  for (i=1;i<NR;i++) printf "%s, ", a[i]
+                  printf "and %s", a[NR]
+                }
+              ')
+            fi
+
+            if [[ -n "$LIST" ]]; then
+              MARKER=$(printf '\n\n*...and %d more changes across %s.*' "$DROPPED" "$LIST")
+            else
+              MARKER=$(printf '\n\n*...and %d more changes.*' "$DROPPED")
+            fi
+
+            KEPT="${KEPT%$'\n'}"
+            BODY="${KEPT}${MARKER}"
+          else
+            BODY="$CLEAN"
+          fi
+
+          MESSAGE="${PREFIX}${BODY}${SUFFIX}"
+
+          jq -n --arg content "$MESSAGE" '{"content": $content, "flags": 4}' | \
+            curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d @-

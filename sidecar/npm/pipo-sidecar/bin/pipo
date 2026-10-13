@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+
+const { spawnSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const PLATFORMS = {
+  "darwin-arm64": "@pipo/sidecar-darwin-arm64",
+  "darwin-x64": "@pipo/sidecar-darwin-x64",
+  "linux-x64": "@pipo/sidecar-linux-x64",
+  "linux-arm64": "@pipo/sidecar-linux-arm64",
+  "win32-x64": "@pipo/sidecar-win32-x64",
+};
+
+const key = `${os.platform()}-${os.arch()}`;
+const pkg = PLATFORMS[key];
+
+if (!pkg) {
+  console.error(`Unsupported platform: ${key}`);
+  process.exit(1);
+}
+
+let binPath;
+try {
+  const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
+  if (os.platform() === "darwin") {
+    // Prefer the .app bundle's inner binary — running it associates the process
+    // with the bundle so UNUserNotification works. Fall back to a bare binary.
+    const appBin = path.join(pkgDir, "bin", "pipo.app", "Contents", "MacOS", "pipo");
+    binPath = fs.existsSync(appBin) ? appBin : path.join(pkgDir, "bin", "pipo");
+  } else {
+    const ext = os.platform() === "win32" ? ".exe" : "";
+    binPath = path.join(pkgDir, "bin", `pipo${ext}`);
+  }
+} catch {
+  console.error(
+    `Platform package ${pkg} is not installed. Try reinstalling @pipo/sidecar.`
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(binPath, process.argv.slice(2), { stdio: "inherit" });
+process.exit(result.status ?? 1);

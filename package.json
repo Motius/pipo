@@ -1,0 +1,102 @@
+{
+  "name": "@pipo/brain",
+  "version": "0.15.0",
+  "description": "Pipo \u2014 Your Company Workflow Brain. An always-on autonomous AI daemon.",
+  "module": "src/daemon/index.ts",
+  "type": "module",
+  "bin": {
+    "pipo": "bin/pipo.ts"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Motius/pipo.git"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "keywords": [
+    "pipo",
+    "ai",
+    "daemon",
+    "assistant",
+    "cli"
+  ],
+  "files": [
+    "bin/",
+    "src/",
+    "roles/",
+    "ui/dist/",
+    "ui/public/",
+    "scripts/ensure-bun.cjs",
+    "scripts/copy-models.ts",
+    "scripts/build-shared-runtime.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "bun run src/daemon/index.ts",
+    "dev": "bun --hot run src/daemon/index.ts",
+    "copy:models": "bun run scripts/copy-models.ts",
+    "prebuild:ui": "bun run copy:models",
+    "build:ui": "bun build ui/index.html ui/pebble.html --outdir ui/dist",
+    "test": "bun test --preload ./src/test-preload.ts",
+    "check:no-ee": "bun run scripts/check-no-ee-imports.ts",
+    "check:migrations": "bun run scripts/check-migrations.ts",
+    "lint:templates": "bun run scripts/lint-webapp-templates.ts",
+    "sync:pieces": "bun run scripts/sync-pieces-catalog.ts",
+    "check:pieces": "bun run scripts/sync-pieces-catalog.ts --check",
+    "check:package": "bun run scripts/check-package-files.ts",
+    "build:workflows": "bun run scripts/build-workflows.ts",
+    "audit:piece-outputs": "bun run scripts/audit-piece-outputs.ts",
+    "db:init": "bun run src/vault/schema.ts",
+    "setup": "bun run scripts/setup-config.ts",
+    "eval:workflows": "bun run scripts/evaluate-workflow-quality.ts",
+    "test:llm": "bun run src/llm/test.ts",
+    "examples": "bun run examples/llm-integration.ts",
+    "setup:google": "bun run src/scripts/google-setup.ts",
+    "postinstall": "node scripts/ensure-bun.cjs && (bun run copy:models 2>/dev/null || true)",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true",
+    "prepublishOnly": "bun run copy:models && bun run build:ui && bun run build:workflows"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.1",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-css": "^6.3.1",
+    "@codemirror/lang-html": "^6.4.11",
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/language": "^6.12.2",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "@codemirror/view": "^6.40.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@xyflow/react": "^12.10.1",
+    "discord.js": "^14.25.1",
+    "edge-tts-universal": "^1.4.0",
+    "fuse.js": "^7.3.0",
+    "jose": "^6.2.0",
+    "lucide-react": "^1.9.0",
+    "nanoid": "^5.1.11",
+    "onnxruntime-web": "^1.20.1",
+    "openwakeword-wasm-browser": "^0.1.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "socket.io": "^4.8.3",
+    "tailwindcss": "^4.2.1",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "^20.14.0",
+    "@types/bun": "latest",
+    "happy-dom": "^20.14.0",
+    "socket.io-client": "^4.8.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

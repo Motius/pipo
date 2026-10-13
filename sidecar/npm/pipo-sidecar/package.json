@@ -1,0 +1,21 @@
+{
+  "name": "@pipo/sidecar",
+  "version": "0.1.0",
+  "description": "pipo sidecar client -- connects to the brain and executes RPC requests locally",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Motius/pipo.git",
+    "directory": "sidecar/npm/pipo-sidecar"
+  },
+  "bin": {
+    "pipo": "bin/pipo"
+  },
+  "files": ["bin"],
+  "optionalDependencies": {
+    "@pipo/sidecar-darwin-arm64": "0.1.0",
+    "@pipo/sidecar-darwin-x64": "0.1.0",
+    "@pipo/sidecar-linux-x64": "0.1.0",
+    "@pipo/sidecar-linux-arm64": "0.1.0",
+    "@pipo/sidecar-win32-x64": "0.1.0"
+  }
+}

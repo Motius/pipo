@@ -1,0 +1,222 @@
+# P.I.P.O. Configuration Example
+# Copy to ~/.pipo/config.yaml and customize
+
+daemon:
+  # 1-65535. Quoting it ("8080") is fine and means the same number; anything
+  # that is not a port in range aborts startup instead of silently becoming
+  # 1846, so `pipo stop` can never go after someone else's listener.
+  port: 1846
+  data_dir: "~/.pipo"
+  db_path: "~/.pipo/pipo.db"
+  # Canonical public origin: OAuth callbacks, generated links, and the sidecar
+  # enrollment JWTs (`brain` + `jwks`). Behind a reverse proxy or for remote
+  # sidecars, set this to the externally reachable HTTPS origin — never
+  # localhost or a private/container-only hostname. No path, query, or
+  # credentials. Env override: pipo_PUBLIC_URL="https://pipo.example.com"
+  # (legacy alias: brain_domain / pipo_BRAIN_DOMAIN)
+  # public_url: "https://pipo.example.com"
+  # Bind a unix domain socket INSTEAD of a TCP port (for a reverse proxy on
+  # the same host). When set, nothing listens on TCP. See docs/SELF_HOSTING.md.
+  # listen: "unix:/run/pipo/pipo.sock"
+  # Mirror stdout/stderr into a log file. Unset = no file, which is the
+  # default: `pipo start -d` already redirects into ~/.pipo/logs/pipo.log,
+  # but under systemd or Docker there is no file at all and the only record is
+  # journald / the container runtime. Set this to get the same file in every
+  # launch mode. `~` is expanded. Lines are stripped of ANSI escapes and passed
+  # through the credential redactor before they are written.
+  # The file is a RING: once it passes log_file_max_bytes (default 1 MiB) the
+  # oldest lines are dropped from the top, so it settles at roughly that size
+  # and never grows without bound. `pipo logs -f` follows it either way -
+  # expect it to reprint the window each time the cap is enforced, since the
+  # file is replaced and `tail -F` reopens it.
+  # The ring is held IN MEMORY as well as on disk, so this is an RSS budget
+  # too. Clamped to 4 KiB..64 MiB; anything outside that (`.inf` included) is
+  # brought back into range with a warning.
+  # log_file_path: "~/.pipo/logs/pipo.log"
+  # log_file_max_bytes: 1048576
+  # Let other processes running as this user inspect the daemon. Unset or false
+  # (the default, Linux only) means the daemon calls prctl(PR_SET_DUMPABLE, 0)
+  # at startup, so its /proc entry stops handing out its environment - every API
+  # key and secret it started with - along with its open files and its memory,
+  # and strace, gdb and core dumps of it stop working without root. Set this to
+  # true when you need to debug the daemon itself. Takes effect at startup, so
+  # it needs a restart. yes/no, on/off and 1/0 are accepted; anything that is
+  # not a yes-or-no is reported and treated as false, because a typo must never
+  # switch this off quietly. macOS and Windows get nothing either way.
+  # allow_process_inspection: false
+
+# IANA timezone for cron triggers and morning/evening routines. Set this when
+# the server clock is not your local time (e.g. a UTC-hosted VPS).
+# timezone: "Europe/Rome"
+
+# HOSTED INSTALLS ONLY — written by the hosting provisioner, never by hand.
+# SYSTEM-owned and file-authoritative: the daemon re-reads it on SIGHUP /
+# POST /api/config/reload (key rotation without restart); removing the block
+# un-hosts the install. Keep the file root-owned / mode 0600 — the key is a
+# per-account credential. QUOTE both values (unquoted scalars can parse as
+# numbers/booleans and are ignored with a warning).
+# pipo_ai:
+#   base_url: "https://llm.pipo.host/v1"
+#   api_key: "sk-uj-..."
+
+# Set local: false on headless servers (no display): the brain never launches
+# a local Chromium; browser actions route to a connected sidecar's browser.
+# browser:
+#   local: false
+
+# The workflow runtime can use READY-MADE artifacts instead of building its
+# own: a dir of prebuilt engine bundles (<hash>/main.js), a ready-made pieces
+# catalog (usable without installing; your own installs shadow it), and a
+# prebuilt piece-metadata cache file. Paths may contain ${version}, expanded
+# from the pipo_VERSION env var, for machines that keep artifacts per
+# installed version. Omit any of them and pipo does that work itself.
+#
+# The daemon also prunes its OWN engine bundle cache (~/.pipo/cache/engine)
+# at startup: each change to the engine source builds a new content-addressed
+# bundle and they used to accumulate forever. The bundle in use, any bundle a
+# running engine is executing, and anything used in the last 24h are never
+# deleted. Tune with the pipo_ENGINE_CACHE_MAX_BUNDLES /
+# pipo_ENGINE_CACHE_MAX_AGE_DAYS env vars (0 disables that cap) -- only the
+# three path keys below are read from THIS file; the rest of `workflows` is
+# user-owned and comes from the dashboard.
+# workflows:
+#   engine_dir: /opt/pipo-engine/${version}
+#   pieces_dir: /opt/pipo-pieces/${version}
+#   piece_metadata_cache: /opt/pipo-cache/${version}/piece-metadata.json
+
+# Authentication — JWT-only by DEFAULT. The dashboard, API, and WebSocket
+# require a token from an enrolled device. Correct setup order:
+#   1. pipo enroll "my-desktop"     (prints the device's enrollment token)
+#   2. paste the token into the sidecar (desktop app) — it connects and the
+#      dashboard is reached through it.
+#
+# ESCAPE HATCH (first-time setup only): open the dashboard WITHOUT auth.
+# Anyone who can reach this machine can then use your pipo. The daemon
+# logs a loud warning while this is on — remove it as soon as enrollment
+# is done.
+# auth:
+#   insecure_open_access: true
+
+# Anonymous usage metrics (opt-out, enabled by default).
+# Sends a tiny anonymous ping at startup and every hour so the project can
+# count unique installs and retention. No personal data, config, or content —
+# just a hashed machine id, app version, install method, and OS.
+# See docs/TELEMETRY.md for exactly what is collected.
+# Disable here, or via pipo_TELEMETRY=0, or DO_NOT_TRACK=1.
+telemetry:
+  enabled: true
+
+# ── LLM configuration ──
+# There is NO LLM config in this file. Providers, credentials, the single-LLM
+# default, and per-tier routing are all configured from the settings dashboard
+# (http://localhost:1846, Settings > LLM) and stored in the database +
+# encrypted keychain. Any `llm:` block added here is ignored on load and
+# stripped on save. Env vars (pipo_OPENAI_KEY, etc.) are no longer read for
+# LLM config either.
+
+personality:
+  core_traits:
+    - "loyal"
+    - "efficient"
+    - "proactive"
+    - "respectful"
+    - "adaptive"
+
+# Tool relevance filtering. Shortens the tool list sent to small/local models
+# to save schema tokens. OFF by default and unbenchmarked -- see
+# docs/tool-relevance-filtering.md before switching it on.
+#
+# Kill switch: pipo_TOOL_FILTER=off forces it off whatever is written here.
+# tools:
+#   relevance_filter:
+#     enabled: false
+#     # Parameter ceiling, in billions, for the ollama auto-eligibility rule.
+#     max_params_b: 20
+#     # Explicit "provider:model" refs to treat as eligible. This is the only
+#     # route for LM Studio / llama.cpp / vLLM, which all arrive as
+#     # `openai_compatible` and carry no signal the classifier can use.
+#     models: []
+
+authority:
+  # Default authority level (0-5)
+  # 0: No permission (ask for everything)
+  # 1: Read-only operations
+  # 2: Safe modifications
+  # 3: Standard operations (default)
+  # 4: System changes
+  # 5: Full control
+  default_level: 3
+
+# System cron triggers. Each fires `cron.<name>` on the shared event bus.
+# Phase 2 will hook the goal system + commitment executor onto these so the
+# 15-minute heartbeat poll can be removed. Defaults shown below.
+# cron:
+#   morning: "0 7 * * *"   # 7am local
+#   evening: "0 20 * * *"  # 8pm local
+#   hourly:  "37 * * * *"  # every hour at :37
+
+# Pebble overlay global hotkeys (#563). Registered by the sidecar, on the
+# machine with the keyboard. The defaults below are the shipped ones and are
+# the same on macOS, Windows and Linux; uncomment to change them.
+#
+# Set either to "", "none" or "off" to register no global hotkey at all. A
+# BARE key (`summon_hotkey:`) is YAML null, which means "use the default" --
+# not "off".
+#
+# Both defaults are free in all three platforms' own SYSTEM shortcuts, which is
+# why they were chosen. They are not free of APPLICATION bindings, and the cost
+# of that lands on Windows and Linux rather than on macOS:
+#
+#   On Windows and Linux a hotkey is grabbed EXCLUSIVELY, so while pipo runs
+#   the focused app never sees it. Ctrl+Shift+K stops opening Firefox's Web
+#   Console and stops deleting a line in VS Code; Ctrl+Shift+Space stops showing
+#   VS Code's parameter hints and stops inserting a non-breaking space in Word.
+#   If you use any of those, change the binding here.
+#
+#   On macOS those same apps use Cmd (Firefox's console is Cmd+Opt+K, VS Code's
+#   delete-line is Cmd+Shift+K, Word's non-breaking space is Option+Space), so
+#   nothing is taken. Note though that the macOS monitor is a passive observer
+#   and CANNOT swallow a keystroke, so if YOU pick a combination that is already
+#   taken there, both actions fire and nothing reports it.
+#
+# NOTE on Windows: disabling palette_hotkey ("" , "none" or "off") also turns
+# off the Ctrl+middle-click palette gesture, which is gated on the same value.
+#
+# Each needs at least one modifier unless the key is an F-key (a bare "a" would
+# summon the pebble, and open the mic, every time you typed it), the two may not
+# be the same key, and the value is capped at 128 bytes. On macOS only F13 and
+# above are genuinely unbound -- bare F1-F12 drive brightness and Mission
+# Control there.
+#
+# One section applies to EVERY connected sidecar; there are no per-machine
+# bindings yet. Changing this needs a daemon restart (`pipo restart`), which
+# also blinks the pebble once as it re-registers.
+#
+# Grammar and the full key list: docs/PEBBLE_HOTKEYS.md
+# pebble:
+#   summon_hotkey: "ctrl+shift+space"   # show the pebble / start listening
+#   palette_hotkey: "ctrl+shift+k"      # open the room picker at the cursor
+
+# Text-to-Speech (voice output)
+tts:
+  enabled: false
+  provider: "edge"            # "edge" (free) or "elevenlabs" (API key required)
+  voice: "en-US-AriaNeural"  # Microsoft Edge TTS voice
+  rate: "+0%"                 # Speaking rate: "-20%" (slow) to "+30%" (fast)
+  volume: "+0%"               # Volume adjustment
+  # ElevenLabs (uncomment to use)
+  # elevenlabs:
+  #   api_key: "sk_..."
+  #   voice_id: ""             # Leave empty for default voice, or set a specific voice ID
+  #   model: "eleven_flash_v2_5"  # "eleven_flash_v2_5" (fast) or "eleven_multilingual_v2" (quality)
+  #   stability: 0.5
+  #   similarity_boost: 0.75
+
+# Speech-to-Text (voice input)
+# stt:
+#   provider: "openai"         # openai, groq, or local
+#   openai:
+#     api_key: "sk-..."
+
+# Active role (must match a filename in roles/ without extension)
+active_role: "personal-assistant"

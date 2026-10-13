@@ -1,0 +1,1413 @@
+package main
+
+import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ── CDP over an inherited pipe ────────────────────────────────────────
+//
+// Instead of opening a localhost debugging *port* (which any local process /
+// page could connect to), the sidecar launches the browser with
+// `--remote-debugging-pipe` and speaks the Chrome DevTools Protocol over a pair
+// of inherited file descriptors: the browser reads commands on fd 3 and writes
+// responses/events on fd 4. Messages are NUL-delimited JSON. Because the
+// connection is browser-level (not bound to one page), we attach to a page
+// target up front and tag page-scoped commands with its flat-mode sessionId.
+//
+// The OS-specific plumbing that wires fd 3/4 lives in startBrowserPipe
+// (browser_pipe_unix.go / browser_pipe_windows.go); everything below is shared.
+
+// browserProc is a launched browser whose CDP pipe we own.
+type browserProc struct {
+	write io.WriteCloser // commands we write  -> browser fd 3
+	read  io.ReadCloser  // responses we read  <- browser fd 4
+	kill  func()         // terminate the browser process
+}
+
+// cdpClient manages a Chrome DevTools Protocol connection over the pipe.
+type cdpClient struct {
+	mu        sync.Mutex // serializes writes to the pipe
+	proc      *browserProc
+	sessionID string // flat-mode session for the attached page target
+	headless  bool   // visibility mode the browser was launched in
+
+	msgID   atomic.Int64
+	pending map[int64]chan cdpReply
+	pendMu  sync.Mutex
+	closed  atomic.Bool
+
+	// Element centers from the last snapshot, keyed by 1-based element id.
+	// Click/hover resolve ids against THIS, not a fresh selector query, so a
+	// click lands where the snapshot said the element was.
+	//
+	// Everything under elemMu is filled by ONE writer, takePageSnapshot, and
+	// replaced wholesale. The three fields beside the map are what make a
+	// coordinate answerable (#591) and usable (#592) rather than merely
+	// present:
+	//
+	//   elemIdentity  the document the coordinates describe, so a reader can
+	//                 refuse an id minted under a document the browser has
+	//                 since left. takePageSnapshot also refuses to fill the map
+	//                 at all when the browser named no document -- a map nobody
+	//                 can use is worse than no map, because the model can see
+	//                 the snapshot that produced it.
+	//
+	//                 EVERY reader checks it. browser_element_point does its
+	//                 own check inline (#591, browser_element_point.go); the
+	//                 three ACTION readers -- browser_click and browser_type
+	//                 here, browser_hover in browser_input.go -- go through
+	//                 refuseStaleElement (#592, browser_snapshot.go), which is
+	//                 also what hands them the isolated world below.
+	//
+	//                 That matters for a second reason: every early return in
+	//                 takePageSnapshot happens BEFORE this critical section, so
+	//                 a re-snapshot that FAILS leaves the previous fill intact
+	//                 and fully self-consistent. Before #592 that left live,
+	//                 clickable, stale coordinates; now the identity no longer
+	//                 matches the page, so every reader refuses.
+	//   elemGen       bumped on every fill, and on every DROP (#603 added three
+	//                 geometry-moving tools to the one snapshot-failure path).
+	//                 It closes a window an identity
+	//                 check cannot see: a snapshot of the SAME document
+	//                 refilling the map while a reader is mid-answer leaves the
+	//                 loaderId unchanged, so a reader that copied a coordinate
+	//                 out and then did more work would answer with the previous
+	//                 snapshot's number. It does NOT close the window after a
+	//                 reply is sent and before the click runs -- nothing
+	//                 sidecar-side can, and the daemon's own local path has the
+	//                 same property.
+	//   elemFrames    the ids that came from a same-origin SUBFRAME, and a
+	//                 digest of every frame's loaderId. A child document can
+	//                 navigate itself while the main frame's loaderId holds
+	//                 (measured), which leaves an in-frame coordinate pointing
+	//                 into a destroyed document. Checked only for subframe ids
+	//                 on purpose: an unrelated ad iframe reloading must not
+	//                 refuse a click on a main-document element.
+	elemMu         sync.Mutex
+	elemCoords     map[int][2]float64
+	elemIdentity   pageIdentity
+	elemGen        uint64
+	elemFrames     map[int]bool
+	elemFrameStamp string
+
+	// The isolated world the snapshot's element REFS live in, retired with its
+	// document (#592).
+	//
+	// The refs used to be stashed on the page's own `window.__pipo_elements`,
+	// which the PAGE can write: a page that overwrote it had approved text typed
+	// into an element of its own choosing, while the snapshot, the approval card
+	// and the narration all still named the reviewed one. An isolated world has
+	// its own global object, so the array has no name the page can reach.
+	//
+	// Keyed on the loaderId because Page.createIsolatedWorld mints a fresh world
+	// and a fresh V8 context on every call however the name is reused, and
+	// nothing disposes them -- so without this a context would leak per
+	// snapshot. A world dies with its document, which is exactly the lifetime
+	// wanted.
+	//
+	// A dead context is a REFUSAL, never a re-mint-and-retry: re-minting inside
+	// one action would silently re-target whatever document is there now, which
+	// is the bug. Only a fresh snapshot may mint a world.
+	worldMu       sync.Mutex
+	worldLoaderID string
+	worldContext  float64
+
+	// The same two things for the ACCESSIBILITY surface (#602).
+	//
+	// Separate from the fields above, not shared with them, for a reason that
+	// bites immediately if they are merged: `elementWorldFor` hands the DOM
+	// action paths a world they expect to hold `__pipo_elements`. A world
+	// minted for an AX call holds no refs, and overwriting `worldContext` with
+	// it would make every `browser_type` refuse with "cannot be addressed any
+	// more" until the next DOM snapshot.
+	//
+	// Note that browser_ax_click DOES retire the DOM snapshot's ids, since
+	// #603 -- it scrolls, so their coordinates have moved -- but it says so
+	// through the ordinary "run browser_snapshot first" path rather than by
+	// breaking the world out from under a ref.
+	//
+	// axIdentity is the document `browser_ax_snapshot` last read, axIDs are the
+	// ids it actually emitted, and axGen counts the fills. Before this,
+	// browser_ax_click and browser_ax_set_value were the only action paths in
+	// the sidecar with no document binding at all -- and with no local-content
+	// refusal either, which made a `file:` or `chrome://settings` page
+	// clickable through them.
+	//
+	// THE ID SET IS NOT OPTIONAL, which is what measuring corrected: a
+	// backendNodeId is RENDERER-PROCESS-LOCAL and restarts at 1 on every
+	// cross-site navigation, so ids minted in different documents collide --
+	// measured, two fresh renderers both numbered their inputs 1, 2, 3, and
+	// `DOM.resolveNode` of a previous site's id resolved cleanly to a
+	// DIFFERENT element on the new page. A document comparison alone therefore
+	// does not make an id mean what it meant: snapshot A, navigate, snapshot B,
+	// act on A's id, and every identity term agrees while the id resolves
+	// against B. The DOM path has this right already -- there each id carries
+	// its own document, because it comes out of the per-element map.
+	//
+	// Membership also closes a widening nothing else bounds: without it, any
+	// backendNodeId in the document was actionable after any AX snapshot,
+	// including the nodes `buildAXElements` filtered out (ignored, unnamed and
+	// not interactive, no backing DOM node) and the tail it dropped at the
+	// reply budget -- elements the model was never shown and the card never
+	// named.
+	axMu       sync.Mutex
+	axIdentity pageIdentity
+	axIDs      map[int64]bool
+	axGen      uint64
+
+	// The AX path's own isolated world, under its own mutex so a mint cannot
+	// park a concurrent snapshot's bookkeeping behind a browser round trip --
+	// the reason the DOM path keeps `elemMu` and `worldMu` apart.
+	axWorldMu     sync.Mutex
+	axWorldLoader string
+	axWorldCtx    float64
+
+	// One-shot waiters for CDP events (e.g. Page.loadEventFired).
+	eventMu      sync.Mutex
+	eventWaiters map[string][]chan struct{}
+
+	// The last request the in-browser guard failed (browser_fetch_guard.go),
+	// so a navigation that died as ERR_BLOCKED_BY_CLIENT can say what happened
+	// instead of leaving Chrome's error page to be snapshotted.
+	blockedMu         sync.Mutex
+	lastBlocked       *blockedRequest
+	blockedLoggedAt   time.Time
+	blockedSuppressed int
+}
+
+// waitForEvent returns a channel that closes when the named CDP event next
+// fires. Register BEFORE the action that triggers the event.
+func (c *cdpClient) waitForEvent(method string) <-chan struct{} {
+	ch := make(chan struct{})
+	c.eventMu.Lock()
+	if c.eventWaiters == nil {
+		c.eventWaiters = make(map[string][]chan struct{})
+	}
+	c.eventWaiters[method] = append(c.eventWaiters[method], ch)
+	c.eventMu.Unlock()
+	return ch
+}
+
+func (c *cdpClient) fireEvent(method string) {
+	c.eventMu.Lock()
+	waiters := c.eventWaiters[method]
+	delete(c.eventWaiters, method)
+	c.eventMu.Unlock()
+	for _, ch := range waiters {
+		close(ch)
+	}
+}
+
+type cdpReply struct {
+	result json.RawMessage
+	errMsg json.RawMessage
+}
+
+var activeCDP struct {
+	mu      sync.Mutex
+	client  *cdpClient
+	healthy bool
+}
+
+// existingCDP returns the live browser connection, or nil when there is none.
+//
+// The no-launch accessor, and the whole read-authority story of
+// browser_element_point (#591) rests on it. Every other browser handler calls
+// getCDPForParams, which LAUNCHES a Chromium -- headed by default -- on the
+// first browser call. A handler that exists to preview an action must not be
+// the thing that starts a browser: it runs on the tool_call event, before the
+// action it previews has been approved, and #585's review found the narration
+// it replaces doing exactly that through browser_evaluate.
+//
+// It deliberately takes no `headless` parameter, and that is a refusal rather
+// than an omission. getCDP tears the running browser down and relaunches it
+// when an explicit `headless` disagrees with it (see below), so honouring the
+// flag here would give a read-only call the power to kill a browser mid-session.
+// Ignoring it means that power is not reachable from this path at all.
+//
+// The two conditions are getCDP's own: the pointer under activeCDP.mu, and a
+// client that has not closed. Nothing here mutates activeCDP.
+func existingCDP() *cdpClient {
+	activeCDP.mu.Lock()
+	defer activeCDP.mu.Unlock()
+	if c := activeCDP.client; c != nil && !c.closed.Load() {
+		return c
+	}
+	return nil
+}
+
+// getCDP returns the live browser CDP client, launching the browser lazily on
+// first use. A running browser is reused; but when the caller *explicitly*
+// requests the other visibility mode (explicit==true and headless differs), the
+// current browser is torn down and relaunched so the option takes effect. When
+// headless is not specified (explicit==false) the running browser is kept as-is
+// to avoid thrashing on every call.
+func getCDP(cfg *SidecarConfig, headless, explicit bool) (*cdpClient, error) {
+	activeCDP.mu.Lock()
+	defer activeCDP.mu.Unlock()
+
+	if c := activeCDP.client; c != nil && !c.closed.Load() {
+		if explicit && c.headless != headless {
+			activeCDP.client = nil
+			c.shutdown()
+		} else {
+			return c, nil
+		}
+	}
+
+	client, err := launchCDP(cfg, headless)
+	if err != nil {
+		return nil, err
+	}
+	activeCDP.client = client
+	return client, nil
+}
+
+// browserProfileName derives a per-browser user-data dir name from the
+// executable, e.g. chrome.exe -> "pipo-chrome-profile",
+// msedge.exe -> "pipo-msedge-profile".
+func browserProfileName(exe string) string {
+	base := strings.ToLower(filepath.Base(exe))
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	base = strings.ReplaceAll(base, " ", "-")
+	if base == "" {
+		base = "chromium"
+	}
+	return "pipo-" + base + "-profile"
+}
+
+// chromiumLaunchArgs builds the command-line flags for the automation browser.
+func chromiumLaunchArgs(profileDir string, headless bool) []string {
+	args := []string{
+		"--remote-debugging-pipe",
+		"--user-data-dir=" + profileDir,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-features=Translate",
+	}
+	if headless {
+		args = append(args, "--headless=new", "--hide-scrollbars")
+	}
+	args = append(args, "about:blank")
+	return args
+}
+
+// profileDirWriteGrace bounds how long a browser that IS using the profile may
+// take to put something in it. A browser answering CDP has long since created
+// its profile, so this is insurance against a filesystem lag, not a real wait:
+// the honest case returns on the first look. It exists because the cost of a
+// false negative here is refusing a browser that works.
+var profileDirWriteGrace = 2 * time.Second
+
+// profileDirUsed reports whether the browser actually wrote into the profile
+// directory it was pointed at. Empty (or absent) after the grace period means
+// it went somewhere else -- almost certainly the user's own profile.
+func profileDirUsed(profileDir string) (bool, error) {
+	deadline := time.Now().Add(profileDirWriteGrace)
+	for {
+		entries, err := os.ReadDir(profileDir)
+		if err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+		if len(entries) > 0 {
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// browserCloseGrace bounds the polite Browser.close attempted before tearing
+// down a browser that failed the profile check. Short: it is a courtesy to a
+// browser we are about to kill anyway.
+const browserCloseGrace = 3 * time.Second
+
+// browserReadyTimeout bounds how long a freshly-spawned browser may take to
+// start answering CDP at all. Generous on purpose: it is a ceiling for a cold
+// start on a throttled CI runner, not a latency budget -- waitForBrowserReady
+// returns as soon as the browser replies.
+const browserReadyTimeout = 30 * time.Second
+
+// launchCDP finds a Chromium-based browser, starts it with the CDP pipe, and
+// attaches to a page target.
+func launchCDP(cfg *SidecarConfig, headless bool) (*cdpClient, error) {
+	exe, err := findChromiumExecutable(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	profileDir := cfg.Browser.ProfileDir
+	if profileDir == "" {
+		// Per-browser profile dir: a profile created by Chrome can't be reused by
+		// Edge/Brave (Chromium refuses a profile from a different brand with a
+		// "can't use this profile" alert), so key it on the executable.
+		profileDir = filepath.Join(os.TempDir(), browserProfileName(exe))
+	}
+
+	proc, err := startBrowserPipe(exe, chromiumLaunchArgs(profileDir, headless))
+	if err != nil {
+		return nil, fmt.Errorf("launch browser %q: %w", exe, err)
+	}
+
+	mode := "headed"
+	if headless {
+		mode = "headless"
+	}
+	log.Printf("[browser] launched %s (%s) with CDP pipe", filepath.Base(exe), mode)
+
+	c := &cdpClient{
+		proc:     proc,
+		headless: headless,
+		pending:  make(map[int64]chan cdpReply),
+	}
+	go c.readLoop(proc.read)
+
+	// Wait for the process to actually be answering CDP before asking it for
+	// anything, so a slow start reads as "still booting" rather than as a
+	// timed-out Target.getTargets.
+	if err := c.waitForBrowserReady(browserReadyTimeout); err != nil {
+		c.shutdown()
+		return nil, fmt.Errorf("launch browser %q: %w", exe, err)
+	}
+
+	// The browser is answering CDP -- but is it OUR browser, in the throwaway
+	// profile, or the user's own logged-in one?
+	//
+	// Everything downstream assumes the former: the LLM navigates, clicks and
+	// fills forms in whatever session this pipe reaches. A Chromium build that
+	// ignored --user-data-dir would put all of that inside the user's real
+	// profile, with their cookies and their logins, and nothing else in this
+	// code path would notice. That is a privacy failure rather than an
+	// availability one, so it is worth a stat call to turn it into the latter.
+	//
+	// The test is deliberately filename-agnostic: any build that honoured the
+	// flag has written SOMETHING here by the time it serves CDP (Chromium
+	// creates the user-data-dir in its main delegate and the initial profile
+	// synchronously, both before the DevTools pipe handler starts serving).
+	// Requiring a specific file would risk failing a browser that works --
+	// Local State in particular is written on a delayed commit and can be
+	// absent for seconds on a cold profile.
+	//
+	// What this does NOT prove: the directory is deterministic per executable
+	// and reused, and browser.profile_dir accepts any path, so a pre-populated
+	// directory passes trivially. It catches a browser that ignored the flag on
+	// a cold profile, which is the case that matters; read it as that and not
+	// as "verified safe".
+	if used, err := profileDirUsed(profileDir); err != nil || !used {
+		// Hand it a chance to close itself before killing it. On this path the
+		// browser is, by hypothesis, the user's OWN: SIGKILLing the process
+		// group records a crash, so their next launch offers to restore pages
+		// and any in-flight profile write is lost. Best-effort and short --
+		// shutdown still runs regardless.
+		if _, cerr := c.sendOnTimeout("", "Browser.close", nil, browserCloseGrace); cerr != nil {
+			log.Printf("[browser] Browser.close before teardown failed (killing instead): %v", cerr)
+		}
+		c.shutdown()
+		if err != nil {
+			return nil, fmt.Errorf("launch browser %q: could not verify it used the automation profile %s: %w", exe, profileDir, err)
+		}
+		// Two different causes, and the advice differs. A browser that ignores
+		// the switch is the browser's fault; a profile dir it could not create
+		// or write is ours (or the environment's) and swapping browsers fixes
+		// nothing -- Chromium silently falls back to the real profile in that
+		// case, which is exactly what this guard caught.
+		return nil, fmt.Errorf("launch browser %q: it is not using the automation profile %s, "+
+			"so it is driving some other profile (probably yours) -- refusing to automate it. "+
+			"Check that directory can be created and written by the user running the sidecar "+
+			"(browser.profile_dir), and that browser.executable_path points at a stock Chromium "+
+			"build (Chrome, Chromium, Edge, Brave, Vivaldi)", exe, profileDir)
+	}
+
+	// Arm the in-browser local-file guard BEFORE anything can navigate (#526),
+	// and fail closed: a browser whose Fetch interception could not be installed
+	// is one CDP call away from opening a local file, so it is not driven at
+	// all. The browser is still sitting on the about:blank it launched with.
+	//
+	// AFTER the profile check above, not before, and not "as early as possible":
+	// the interception is browser-wide, so arming it on a browser that turned out
+	// to be the user's OWN (one that ignored --user-data-dir) would pause and
+	// fail their own file: loads for as long as we held the pipe.
+	if err := c.installFetchGuard(); err != nil {
+		c.shutdown()
+		return nil, fmt.Errorf("launch browser %q: could not install the browser's local-file guard, "+
+			"so the browser will not be driven: %w", exe, err)
+	}
+
+	if err := c.attachToPage(); err != nil {
+		c.shutdown()
+		return nil, fmt.Errorf("attach to page: %w", err)
+	}
+
+	// Enable Page events so navigate can wait for Page.loadEventFired.
+	// Non-fatal: navigation falls back to a fixed settle delay without it.
+	if _, err := c.send("Page.enable", nil); err != nil {
+		log.Printf("[browser] Page.enable failed (navigation uses fixed delay): %v", err)
+	}
+
+	// Make the page behave as though its window had focus (#592).
+	//
+	// A SECURITY control, not a convenience. Chromium DEFERS a page's `focus`
+	// event while the document itself is unfocused -- the normal state for an
+	// automated browser -- so a page's own focus listener fires late: after
+	// browser_type has focused the reviewed element and verified that focus,
+	// and during the Input.insertText that finally gives the document focus.
+	// Measured on the daemon's identical path: without this, a page that steals
+	// focus in its listener received the approved text while the pre-insert
+	// check saw nothing wrong; with it, the steal is visible at once and the
+	// type refuses before a character is sent.
+	//
+	// Best-effort, because it is one layer of three: the pre-insert check and
+	// the post-insert check (which turns a slip into an honest refusal rather
+	// than silent success) do not depend on it. Keep in step with
+	// src/actions/browser/session.ts.
+	if _, err := c.send("Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}); err != nil {
+		log.Printf("[browser] focus emulation unavailable; a focus steal will be reported "+
+			"after the fact rather than refused: %v", err)
+	}
+
+	// A freshly launched browser sits on the about:blank it was given, but the
+	// automation profile is a persistent directory: a restored session can put
+	// the attached tab on something else -- a local file, chrome://settings, a
+	// leftover page. The daemon blanks a tab it adopted in that state rather
+	// than reading it (#521); do the same, so the guards are a backstop here and
+	// not the thing the caller trips over on their first snapshot. Best-effort:
+	// if it fails, the read guards refuse to read the tab anyway.
+	if url, err := c.mainFrameURL(); err == nil && url != "" && !isDrivableURL(url) {
+		log.Printf("[browser] attached tab was showing %s; blanking it", truncateURL(url, 120))
+		raw, err := c.send("Page.navigate", map[string]any{"url": "about:blank"})
+		if err != nil {
+			log.Printf("[browser] could not blank the adopted tab: %v", err)
+		} else {
+			// Page.navigate reports a failure in errorText, not as an error. Worth
+			// a line: a tab that stayed put is one every read will refuse.
+			var nav struct {
+				ErrorText string `json:"errorText"`
+			}
+			if json.Unmarshal(raw, &nav) == nil && nav.ErrorText != "" {
+				log.Printf("[browser] blanking the adopted tab failed: %s (reads of it will be refused)",
+					nav.ErrorText)
+			}
+		}
+	}
+
+	return c, nil
+}
+
+// attachToPage finds (or creates) a page target and stores its flat session id.
+func (c *cdpClient) attachToPage() error {
+	targetID := ""
+	// The about:blank window the browser opens at launch may not register as a
+	// target for a beat; poll briefly before falling back to creating one.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		raw, err := c.sendOn("", "Target.getTargets", nil)
+		if err != nil {
+			return err
+		}
+		var res struct {
+			TargetInfos []struct {
+				TargetID string `json:"targetId"`
+				Type     string `json:"type"`
+				URL      string `json:"url"`
+			} `json:"targetInfos"`
+		}
+		json.Unmarshal(raw, &res)
+		// Prefer a tab showing something the model may be sent to (#526, as the
+		// daemon's connect() does). A tab left on a file: or chrome:// page by a
+		// restored session is adopted only if it is the only one there is, and
+		// launchCDP blanks it before anything reads it.
+		fallback := ""
+		for _, t := range res.TargetInfos {
+			if t.Type != "page" {
+				continue
+			}
+			if isDrivableURL(t.URL) {
+				targetID = t.TargetID
+				break
+			}
+			if fallback == "" {
+				fallback = t.TargetID
+			}
+		}
+		if targetID == "" {
+			targetID = fallback
+		}
+		if targetID != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if targetID == "" {
+		raw, err := c.sendOn("", "Target.createTarget", map[string]any{"url": "about:blank"})
+		if err != nil {
+			return err
+		}
+		var res struct {
+			TargetID string `json:"targetId"`
+		}
+		json.Unmarshal(raw, &res)
+		targetID = res.TargetID
+	}
+	if targetID == "" {
+		return fmt.Errorf("no page target available")
+	}
+
+	raw, err := c.sendOn("", "Target.attachToTarget", map[string]any{
+		"targetId": targetID,
+		"flatten":  true,
+	})
+	if err != nil {
+		return err
+	}
+	var att struct {
+		SessionID string `json:"sessionId"`
+	}
+	json.Unmarshal(raw, &att)
+	if att.SessionID == "" {
+		return fmt.Errorf("attach returned no sessionId")
+	}
+	c.sessionID = att.SessionID
+	return nil
+}
+
+// readLoop consumes NUL-delimited CDP messages and routes replies by id.
+func (c *cdpClient) readLoop(r io.Reader) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		data, err := br.ReadBytes(0)
+		if len(data) > 1 {
+			if n := len(data); data[n-1] == 0 {
+				data = data[:n-1]
+			}
+			var msg struct {
+				ID        int64           `json:"id"`
+				Method    string          `json:"method"`
+				SessionID string          `json:"sessionId"`
+				Params    json.RawMessage `json:"params"`
+				Result    json.RawMessage `json:"result"`
+				Error     json.RawMessage `json:"error"`
+			}
+			if json.Unmarshal(data, &msg) == nil {
+				if msg.ID != 0 {
+					c.pendMu.Lock()
+					ch, ok := c.pending[msg.ID]
+					if ok {
+						delete(c.pending, msg.ID)
+					}
+					c.pendMu.Unlock()
+					if ok {
+						ch <- cdpReply{result: msg.Result, errMsg: msg.Error}
+					}
+				} else if msg.Method != "" {
+					// A paused request is answered on its OWN goroutine: the
+					// answer is a CDP round-trip whose reply only this loop can
+					// deliver, so answering here would deadlock the pipe while
+					// the browser waits (browser_fetch_guard.go).
+					if msg.Method == "Fetch.requestPaused" {
+						go c.handlePausedRequest(msg.SessionID, msg.Params)
+					}
+					// Protocol event — wake anyone waiting on it.
+					c.fireEvent(msg.Method)
+				}
+			}
+		}
+		if err != nil {
+			c.fail()
+			return
+		}
+	}
+}
+
+// send issues a page-scoped command (tagged with the attached sessionId).
+func (c *cdpClient) send(method string, params map[string]any) (json.RawMessage, error) {
+	return c.sendOn(c.sessionID, method, params)
+}
+
+// cdpDefaultTimeout bounds a single CDP round-trip once the browser is known
+// to be answering. The launch handshake uses a shorter, retried budget instead
+// -- see waitForBrowserReady.
+const cdpDefaultTimeout = 30 * time.Second
+
+// errCDPTimeout marks a command that got no reply inside its budget. It is the
+// one failure worth retrying: the browser may simply not be listening yet. A
+// transport error means the pipe is gone and no retry can help, so callers that
+// poll must tell the two apart.
+var errCDPTimeout = errors.New("CDP timeout")
+
+// sendOn issues a command on a specific session ("" = browser-level).
+func (c *cdpClient) sendOn(sessionID, method string, params map[string]any) (json.RawMessage, error) {
+	return c.sendOnTimeout(sessionID, method, params, cdpDefaultTimeout)
+}
+
+// sendOnTimeout is sendOn with an explicit reply deadline.
+func (c *cdpClient) sendOnTimeout(sessionID, method string, params map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	if c.closed.Load() {
+		return nil, fmt.Errorf("browser connection closed")
+	}
+
+	id := c.msgID.Add(1)
+	ch := make(chan cdpReply, 1)
+	c.pendMu.Lock()
+	c.pending[id] = ch
+	c.pendMu.Unlock()
+
+	msg := map[string]any{"id": id, "method": method}
+	if params != nil {
+		msg["params"] = params
+	}
+	if sessionID != "" {
+		msg["sessionId"] = sessionID
+	}
+	data, _ := json.Marshal(msg)
+	data = append(data, 0) // NUL terminator
+
+	c.mu.Lock()
+	_, err := c.proc.write.Write(data)
+	c.mu.Unlock()
+	if err != nil {
+		c.pendMu.Lock()
+		delete(c.pending, id)
+		c.pendMu.Unlock()
+		return nil, err
+	}
+
+	select {
+	case reply := <-ch:
+		if reply.errMsg != nil {
+			return nil, fmt.Errorf("CDP %s: %s", method, string(reply.errMsg))
+		}
+		return reply.result, nil
+	case <-time.After(timeout):
+		c.pendMu.Lock()
+		delete(c.pending, id)
+		c.pendMu.Unlock()
+		return nil, fmt.Errorf("%w for %s", errCDPTimeout, method)
+	}
+}
+
+// evalJSON evaluates a page expression that returns a JSON string and
+// unmarshals it. A page exception is returned as an error rather than
+// swallowed into an empty result -- a handler that reports success on a
+// script that threw is how the agent ends up trusting data it never got.
+func (c *cdpClient) evalJSON(expression string) (map[string]any, error) {
+	raw, err := c.send("Runtime.evaluate", map[string]any{
+		"expression":    expression,
+		"returnByValue": true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+		ExceptionDetails *struct {
+			Text      string `json:"text"`
+			Exception struct {
+				Description string `json:"description"`
+			} `json:"exception"`
+		} `json:"exceptionDetails"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, fmt.Errorf("unexpected Runtime.evaluate reply: %w", err)
+	}
+	if res.ExceptionDetails != nil {
+		detail := res.ExceptionDetails.Exception.Description
+		if detail == "" {
+			detail = res.ExceptionDetails.Text
+		}
+		return nil, fmt.Errorf("page script threw: %s", detail)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal([]byte(res.Result.Value), &out); err != nil {
+		return nil, fmt.Errorf("page script did not return a JSON object: %w", err)
+	}
+	return out, nil
+}
+
+// waitForBrowserReady blocks until the freshly-spawned browser answers a
+// browser-level CDP command, or the deadline passes.
+//
+// A cold Chromium on a loaded machine can take many seconds before it reads the
+// CDP pipe at all. Firing the first real command straight at it spends the full
+// 30s round-trip budget on a browser that simply had not started yet, then fails
+// the whole launch -- the "attach to page: CDP timeout for Target.getTargets"
+// flake seen on CI runners. Polling with a short per-attempt budget instead
+// turns that into a wait: each probe that finds nobody home is retried rather
+// than consuming the entire allowance.
+func (c *cdpClient) waitForBrowserReady(budget time.Duration) error {
+	const probeTimeout = 2 * time.Second
+
+	stop := time.Now().Add(budget)
+	var lastErr error
+	for {
+		// Belt and braces. In practice this cannot fire mid-launch: the only
+		// paths that set closed (readLoop's fail(), closeActiveCDP) take
+		// activeCDP.mu first, and getCDP holds it for the whole launch. A dead
+		// browser reaches us as the write error handled just below.
+		if c.closed.Load() {
+			return errors.New("browser connection closed before it became ready")
+		}
+
+		_, err := c.sendOnTimeout("", "Browser.getVersion", nil, probeTimeout)
+		if err == nil {
+			return nil
+		}
+		// Only a timeout means "not up yet". Anything else is a transport
+		// failure -- the browser died at startup and the pipe is broken -- and
+		// retrying it would trade an instant, accurate error for a 30s stall.
+		if !errors.Is(err, errCDPTimeout) {
+			return fmt.Errorf("browser died during startup: %w", err)
+		}
+		lastErr = err
+
+		if time.Now().After(stop) {
+			return fmt.Errorf("browser did not answer CDP within %s: %w", budget, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// shutdown tears down the connection and the browser process. Idempotent. Does
+// NOT touch activeCDP, so it is safe to call while holding activeCDP.mu.
+func (c *cdpClient) shutdown() {
+	if c.closed.Swap(true) {
+		return
+	}
+	if c.proc != nil {
+		c.proc.write.Close()
+		c.proc.read.Close()
+		if c.proc.kill != nil {
+			c.proc.kill()
+		}
+	}
+}
+
+// fail is invoked when the pipe dies: it clears the cached client (so the next
+// browser tool call relaunches) and shuts the connection down.
+func (c *cdpClient) fail() {
+	activeCDP.mu.Lock()
+	if activeCDP.client == c {
+		activeCDP.client = nil
+	}
+	activeCDP.mu.Unlock()
+	c.shutdown()
+}
+
+// closeActiveCDP closes the current browser (if any) and clears the cache so the
+// next browser tool call starts fresh — e.g. to switch visibility modes.
+func closeActiveCDP() {
+	activeCDP.mu.Lock()
+	c := activeCDP.client
+	activeCDP.client = nil
+	activeCDP.mu.Unlock()
+	if c != nil {
+		c.shutdown()
+	}
+}
+
+// headlessParam reads the optional headless flag from RPC params. explicit
+// reports whether the caller actually supplied it (vs. defaulting). Default
+// false -> the browser opens headed so the user can see and interact with it.
+func headlessParam(params map[string]any) (value bool, explicit bool) {
+	v, ok := params["headless"]
+	if !ok {
+		return false, false
+	}
+	b, _ := v.(bool)
+	return b, true
+}
+
+// getCDPForParams launches/reuses the browser honoring the call's headless flag.
+func getCDPForParams(cfg *SidecarConfig, params map[string]any) (*cdpClient, error) {
+	headless, explicit := headlessParam(params)
+	return getCDP(cfg, headless, explicit)
+}
+
+// ── Browser Handlers ─────────────────────────────────────────────────
+
+func makeBrowserNavigateHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		rawURL, _ := params["url"].(string)
+		if rawURL == "" {
+			return nil, fmt.Errorf("missing required parameter: url")
+		}
+
+		// The scheme allowlist (#526), before the browser is launched: a URL
+		// that will be refused should not spawn a Chromium. Page.navigate is a
+		// browser-initiated navigation, so Chrome applies none of the checks it
+		// applies to a page's own attempts -- handed a file: URL it opens the
+		// file and the snapshot below hands it to the model. `target` is the
+		// normalised URL, so Chrome parses the scheme and authority that were
+		// checked (browser_url_policy.go).
+		target, err := checkNavigationURL(rawURL)
+		if err != nil {
+			return nil, err
+		}
+
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		// Register the waiter BEFORE navigating so the event can't be missed
+		loaded := cdp.waitForEvent("Page.loadEventFired")
+		navigatedAt := time.Now()
+
+		result, err := cdp.send("Page.navigate", map[string]any{"url": target})
+		if err != nil {
+			return nil, fmt.Errorf("navigate failed: %w", err)
+		}
+
+		// Page.navigate reports network-level failures (DNS, blocked, ERR_*)
+		// in errorText, NOT as a protocol error. Returning success while
+		// ignoring it is how the agent ends up claiming it opened a page it
+		// never reached.
+		var nav struct {
+			ErrorText string `json:"errorText"`
+		}
+		_ = json.Unmarshal(result, &nav)
+		if nav.ErrorText != "" {
+			// The guard failed this navigation -- a redirect into file:, say.
+			// Say so, instead of reporting Chrome's generic "blocked" error and
+			// snapshotting its error page.
+			if blocked := cdp.describeBlockedNavigation(target, nav.ErrorText, navigatedAt); blocked != "" {
+				return nil, fmt.Errorf("%s", blocked)
+			}
+			// truncateURL, not the raw string: `target` can be a multi-megabyte
+			// data: URL, and sanitizeURLInput leaves interior control bytes
+			// alone -- neither belongs in a log line or a model-facing error.
+			asked := ""
+			if target != rawURL {
+				asked = fmt.Sprintf(" (asked for %s)", truncateURL(rawURL, 120))
+			}
+			return nil, fmt.Errorf("navigation to %s%s failed: %s", truncateURL(target, 120), asked, nav.ErrorText)
+		}
+
+		select {
+		case <-loaded:
+		case <-time.After(30 * time.Second):
+			// Page may still be usable (SPAs, slow loads) — same fallback as
+			// the daemon's local navigate.
+			log.Printf("[browser] page load timeout for %s, continuing anyway", truncateURL(target, 120))
+		}
+
+		// Let JS settle (matches the daemon's post-load delay)
+		time.Sleep(800 * time.Millisecond)
+
+		formatted, id, err := takeFormattedSnapshot(cdp)
+		if err != nil {
+			return nil, err
+		}
+		// The identity of the page we LANDED on, which is not `target`: this is
+		// the whole reason a redirect cannot mis-select a site playbook (#583).
+		return browserPageResult(formatted, id, params), nil
+	}
+}
+
+func makeBrowserSnapshotHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		formatted, id, err := takeFormattedSnapshot(cdp)
+		if err != nil {
+			return nil, err
+		}
+		return browserPageResult(formatted, id, params), nil
+	}
+}
+
+func makeBrowserClickHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		elemID, ok := params["element_id"].(float64)
+		if !ok {
+			return nil, fmt.Errorf("missing required parameter: element_id")
+		}
+		button, _ := params["button"].(string)
+		if button != "right" {
+			button = "left"
+		}
+		double, _ := params["double"].(bool)
+
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		id := int(elemID)
+		// The coordinates are only this click's honest input while the document
+		// they were measured in is still the one on screen (#592) and the page
+		// has not scrolled under them (#603) -- hence `usesCoordinates`.
+		el, _, refusal, err := refuseStaleElement(cdp, id, true)
+		if err != nil {
+			return nil, err
+		}
+		if refusal != "" {
+			return &RPCResult{Result: refusal}, nil
+		}
+
+		if err := dispatchClick(cdp, el.x, el.y, button, double); err != nil {
+			return nil, fmt.Errorf("click failed: %w", err)
+		}
+
+		// Wait for navigation/changes (matches the daemon's local click)
+		time.Sleep(1 * time.Second)
+
+		kind := "Clicked"
+		if double {
+			kind = "Double-clicked"
+		} else if button == "right" {
+			kind = "Right-clicked"
+		}
+		return &RPCResult{Result: fmt.Sprintf("%s element [%d]", kind, id)}, nil
+	}
+}
+
+func makeBrowserTypeHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		text, _ := params["text"].(string)
+		if text == "" {
+			return nil, fmt.Errorf("missing required parameter: text")
+		}
+		elemID, hasElem := params["element_id"].(float64)
+		if !hasElem {
+			return nil, fmt.Errorf("missing required parameter: element_id")
+		}
+		submit, _ := params["submit"].(bool)
+		appendMode, _ := params["append"].(bool)
+
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		id := int(elemID)
+		// NOT a coordinate user: the typing reaches the element through the ref
+		// the snapshot stashed, so a scroll since then does not make this call
+		// wrong -- and typing itself scrolls the caret into view (#603).
+		el, contextID, refusal, err := refuseStaleElement(cdp, id, false)
+		if err != nil {
+			return nil, err
+		}
+		if refusal != "" {
+			return &RPCResult{Result: refusal}, nil
+		}
+		_ = el // the identity comes from the ref below, not from a coordinate
+
+		// Focus via the DOM refs the snapshot stored IN THE ISOLATED WORLD, and
+		// VERIFY where focus actually landed before touching the value — same
+		// script as the daemon's local type (session.ts), change both together.
+		//
+		// The verification is what closes #592, and the isolated world alone
+		// does not: worlds have their own globals and prototypes but share the
+		// DOM *and its events*, so a page's own `focus` listener still fires
+		// when this calls el.focus() and can move focus wherever it likes.
+		// Measured: the script returned 'ok', Input.insertText landed in the
+		// page's chosen input, and el.value = '' had meanwhile emptied the
+		// reviewed one. Hence isConnected (a detached node cannot take focus and
+		// the text would follow whatever still had it), activeElement in the
+		// element's OWN document (for anything framed, the top document's
+		// activeElement is the iframe), and all of it BEFORE the clear so a
+		// refused focus cannot empty the reviewed field either.
+		//
+		// EXACT equality, not el.contains(active). An earlier version allowed a
+		// descendant "since focusing a contenteditable can land on a child",
+		// which is measured FALSE: activeElement is the focusable ELEMENT, not
+		// the caret's node, and it equals el for a plain input, a select, an
+		// anchor, a contenteditable, and a contenteditable WITH element
+		// children. The allowance bought nothing and was an attack -- a page
+		// that appends its own input inside the reviewed element and focuses it
+		// from that element's own focus listener took the approved text while
+		// the type reported success. A shadow root that has taken focus is
+		// refused for the same reason (activeElement is the HOST when focus is
+		// inside its shadow tree), and a frame is never typed "into" at all: an
+		// iframe can enter the snapshot on [data-testid] or a role, and focusing
+		// it sends the text into a document the snapshot never described.
+		appendJS := "false"
+		if appendMode {
+			appendJS = "true"
+		}
+		script := fmt.Sprintf(`(() => {
+        const el = globalThis.__pipo_elements && globalThis.__pipo_elements[%d];
+        if (!el) return 'not_found';
+        if (!el.isConnected) return 'gone';
+        const tag = el.tagName;
+        if (tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED') return 'not_typable';
+        el.focus();
+        const ownerDoc = el.ownerDocument || document;
+        if (ownerDoc.activeElement !== el) return 'not_focused';
+        if (el.shadowRoot && el.shadowRoot.activeElement) return 'not_focused';
+        const append = %s;
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+          if (append) {
+            try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
+          } else {
+            el.value = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        } else if (el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
+          const doc = el.ownerDocument || document;
+          const win = doc.defaultView || window;
+          const range = doc.createRange();
+          range.selectNodeContents(el);
+          const sel = win.getSelection();
+          sel.removeAllRanges();
+          if (append) {
+            range.collapse(false);
+            sel.addRange(range);
+          } else {
+            sel.addRange(range);
+            doc.execCommand('delete', false, null);
+          }
+        }
+        return 'ok';
+      })()`, id-1, appendJS)
+
+		focusResult, err := cdp.send("Runtime.evaluate", map[string]any{
+			"expression":    script,
+			"returnByValue": true,
+			"contextId":     contextID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("type into element failed: %w", err)
+		}
+		var focusParsed struct {
+			Result struct {
+				Value string `json:"value"`
+			} `json:"result"`
+		}
+		json.Unmarshal(focusResult, &focusParsed)
+
+		// Anything but 'ok' REFUSES. The coordinate-click fallback that used to
+		// sit here is gone, and removing it is the fix rather than a casualty of
+		// it (#592) -- the daemon's local type does the same, change both
+		// together.
+		//
+		// Ask when 'not_found' was reachable before: overwhelmingly when a
+		// navigation had replaced the document and wiped the page-global the
+		// refs lived in, so the fallback then coordinate-clicked and typed
+		// inside a document nobody had reviewed. That IS the sibling bug, not a
+		// recovery from it. With the document guard above, a navigation refuses
+		// before this script runs; and 'gone' -- a re-render replacing the node
+		// -- used to succeed silently and deliver the approved text to whatever
+		// still held focus (measured), so refusing beats that rather than
+		// regressing from it. A coordinate fallback after 'gone' would re-open
+		// exactly that leak.
+		switch focusParsed.Result.Value {
+		case "ok":
+			time.Sleep(200 * time.Millisecond)
+		case "gone":
+			return &RPCResult{Result: fmt.Sprintf(
+				"Error: Element [%d] has been removed from the page, so nothing was typed. "+
+					"Run browser_snapshot first.", id)}, nil
+		case "not_typable":
+			return &RPCResult{Result: fmt.Sprintf(
+				"Error: Element [%d] is a frame, not a field, so nothing was typed. "+
+					"Run browser_snapshot and name an element inside it instead.", id)}, nil
+		case "not_focused":
+			return &RPCResult{Result: fmt.Sprintf(
+				"Error: Element [%d] did not take focus -- the page moved focus elsewhere -- so nothing was typed. "+
+					"Run browser_snapshot and check the page.", id)}, nil
+		default:
+			return &RPCResult{Result: fmt.Sprintf(
+				"Error: Element [%d] is no longer addressable, so nothing was typed. "+
+					"Run browser_snapshot first.", id)}, nil
+		}
+
+		// RE-VERIFY focus immediately before the insert, and again after it.
+		//
+		// The check inside the focus script is necessary but NOT sufficient:
+		// Chromium defers a page's focus event while the document is unfocused,
+		// so a listener can fire after el.focus() returned and during the
+		// insert. Focus emulation (set up in launchCDP) makes that prompt, and these
+		// two make the answer sound rather than merely nearer --
+		// Input.insertText goes to whatever holds focus at that instant, so if
+		// the reviewed element held it immediately before AND after, the text
+		// went there. Keep in step with the daemon's local type.
+		if !cdp.focusStillOnElement(id, contextID) {
+			return &RPCResult{Result: fmt.Sprintf(
+				"Error: Element [%d] lost focus before anything was typed -- the page moved focus "+
+					"elsewhere -- so nothing was typed. Run browser_snapshot and check the page.", id)}, nil
+		}
+
+		// Insert text (paste-like — same as the daemon's Input.insertText).
+		// Reached only with focus verified on the reviewed element, in the
+		// reviewed document, immediately beforehand.
+		if _, err := cdp.send("Input.insertText", map[string]any{"text": text}); err != nil {
+			return nil, fmt.Errorf("type failed: %w", err)
+		}
+
+		if !cdp.focusStillOnElement(id, contextID) {
+			// The text has already gone somewhere and nothing can un-type it, so
+			// the one thing that must not happen is reporting success: a silent
+			// wrong delivery is exactly what #592 is about.
+			return &RPCResult{Result: fmt.Sprintf(
+				"Error: Element [%d] lost focus while the text was being typed, so the text may have "+
+					"gone to another element. Run browser_snapshot and check the page before retrying.", id)}, nil
+		}
+
+		verb := "Typed"
+		if appendMode {
+			verb = "Appended"
+		}
+		result := fmt.Sprintf("%s %q into element [%d]", verb, text, id)
+
+		if submit {
+			time.Sleep(100 * time.Millisecond)
+			if err := pressEnter(cdp); err != nil {
+				return nil, fmt.Errorf("submit failed: %w", err)
+			}
+			time.Sleep(2 * time.Second)
+			result += " and pressed Enter"
+		}
+
+		return &RPCResult{Result: result}, nil
+	}
+}
+
+// pressEnter matches the daemon's Enter sequence (rawKeyDown + char + keyUp).
+func pressEnter(cdp *cdpClient) error {
+	for _, evType := range []string{"rawKeyDown", "char", "keyUp"} {
+		if _, err := cdp.send("Input.dispatchKeyEvent", map[string]any{
+			"type": evType, "key": "Enter", "code": "Enter",
+			"windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func makeBrowserScreenshotHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		// A screenshot of a file: page is the file, in pixels (#526).
+		checked, err := cdp.assertNotLocalContent()
+		if err != nil {
+			return nil, err
+		}
+
+		result, err := cdp.send("Page.captureScreenshot", map[string]any{
+			"format":  "png",
+			"quality": 80,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("screenshot failed: %w", err)
+		}
+
+		// The pixels must come from the document that was approved, not from one
+		// that committed while the capture was in flight.
+		if err := cdp.assertSamePage(checked); err != nil {
+			return nil, err
+		}
+
+		var ss struct {
+			Data string `json:"data"`
+		}
+		json.Unmarshal(result, &ss)
+
+		decoded, err := base64.StdEncoding.DecodeString(ss.Data)
+		if err != nil {
+			return nil, fmt.Errorf("decode screenshot: %w", err)
+		}
+
+		return &RPCResult{
+			Result:     map[string]any{"captured": true},
+			BinaryRaw:  decoded,
+			BinaryMime: "image/png",
+		}, nil
+	}
+}
+
+func makeBrowserScrollHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		direction := "down"
+		if d, _ := params["direction"].(string); d == "up" {
+			direction = "up"
+		}
+		amount, hasAmount := params["amount"].(float64)
+
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		// amount is PIXELS, defaulting to one viewport height — the same
+		// contract as the daemon's local scroll (the old sidecar treated
+		// amount as "screens", silently scrolling 100x less than asked).
+		scrollAmount := amount
+		if !hasAmount || scrollAmount == 0 {
+			scrollAmount = 600
+			if raw, err := cdp.send("Runtime.evaluate", map[string]any{
+				"expression":    "window.innerHeight",
+				"returnByValue": true,
+			}); err == nil {
+				var parsed struct {
+					Result struct {
+						Value float64 `json:"value"`
+					} `json:"result"`
+				}
+				if json.Unmarshal(raw, &parsed) == nil && parsed.Result.Value > 0 {
+					scrollAmount = parsed.Result.Value
+				}
+			}
+		}
+
+		pixels := int(scrollAmount)
+		if direction == "up" {
+			pixels = -pixels
+		}
+
+		if _, err := cdp.send("Runtime.evaluate", map[string]any{
+			"expression": fmt.Sprintf("window.scrollBy(0, %d)", pixels),
+		}); err != nil {
+			return nil, fmt.Errorf("scroll failed: %w", err)
+		}
+
+		// EVERY COORDINATE THE SNAPSHOT HANDED OUT NOW DESCRIBES WHERE AN
+		// ELEMENT USED TO BE (#603).
+		//
+		// Scrolling moves every element and changes nothing the frame tree
+		// reports, so no document check could see it: the map stayed live and
+		// clickable, and a click after a scroll dispatched a trusted mouse
+		// event at the previous viewport's geometry -- reachable with no page
+		// involvement at all, just two tool calls.
+		//
+		// Dropped here as well as covered by the use-time sentinel, because the
+		// two reach different readers. The sentinel compares each element's
+		// LIVE position and so covers every geometry change for the paths that
+		// ask it (click, hover), including the ones no tool announces. This
+		// drop reaches the readers that deliberately do NOT run it:
+		// browser_element_point, which answers a pebble coordinate under a
+		// 700 ms budget. It covers THIS scroll only -- a paging key and
+		// browser_ax_click's scrollIntoViewIfNeeded drop the map themselves for
+		// the same reason, and a page scrolling itself reaches neither, so the
+		// pebble can still be a scroll behind on a page that moves on a timer.
+		//
+		// The model is already told to re-snapshot after scrolling, by this
+		// tool's own description and by all 100 webapp templates.
+		cdp.forgetSnapshotElements()
+
+		// Wait for lazy-loaded content (matches the daemon)
+		time.Sleep(500 * time.Millisecond)
+
+		return &RPCResult{Result: fmt.Sprintf("Scrolled %s by %dpx. %s",
+			direction, int(scrollAmount), retiredIDsNotice)}, nil
+	}
+}
+
+func makeBrowserEvaluateHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		expression, _ := params["expression"].(string)
+		if expression == "" {
+			return nil, fmt.Errorf("missing required parameter: expression")
+		}
+
+		cdp, err := getCDPForParams(cfg, params)
+		if err != nil {
+			return nil, err
+		}
+
+		// Script in a file: page can read the file and hand it back (#526).
+		checked, err := cdp.assertNotLocalContent()
+		if err != nil {
+			return nil, err
+		}
+
+		result, err := cdp.send("Runtime.evaluate", map[string]any{
+			"expression":    expression,
+			"returnByValue": true,
+			"awaitPromise":  true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("evaluate failed: %w", err)
+		}
+
+		// The script ran in whatever document was current WHEN IT RAN: if that is
+		// no longer the one that was approved, its result is not returned.
+		if err := cdp.assertSamePage(checked); err != nil {
+			return nil, err
+		}
+
+		// Unwrap to the same shape the daemon's evaluate tool returns:
+		// "(no return value)", the raw string, or pretty-printed JSON.
+		var parsed struct {
+			Result struct {
+				Value json.RawMessage `json:"value"`
+			} `json:"result"`
+			ExceptionDetails json.RawMessage `json:"exceptionDetails"`
+		}
+		if err := json.Unmarshal(result, &parsed); err != nil {
+			return nil, fmt.Errorf("evaluate: parse reply: %w", err)
+		}
+		if parsed.ExceptionDetails != nil {
+			// Capped like every other page-controlled reply (#597): the page
+			// writes this message, and an uncapped one gets the whole reply
+			// dropped at the brain's 2 MB cap instead of reaching the model.
+			return nil, fmt.Errorf("JS error: %s",
+				truncateMarked(string(parsed.ExceptionDetails), maxPageControlledReply))
+		}
+		if parsed.Result.Value == nil || string(parsed.Result.Value) == "null" {
+			return &RPCResult{Result: "(no return value)"}, nil
+		}
+		// The VALUE is the page's too, and was just as unbounded as its title
+		// (#597): one `document.body.innerHTML` gets this reply dropped whole at
+		// the brain's 2 MB cap, so the model sees neither the value nor a
+		// reason. EVERY branch is capped, starting with the string one -- it is
+		// the overwhelmingly common return (`innerText`, `innerHTML`, a
+		// `JSON.stringify` inside the expression), so capping only the other two
+		// would have left the issue open on the path that is actually used.
+		//
+		// truncateMarked, not truncateRendered: an evaluate result is
+		// legitimately multi-line and must not be flattened.
+		var asString string
+		if json.Unmarshal(parsed.Result.Value, &asString) == nil {
+			return &RPCResult{Result: truncateMarked(asString, maxPageControlledReply)}, nil
+		}
+		var pretty any
+		if json.Unmarshal(parsed.Result.Value, &pretty) == nil {
+			if out, err := json.MarshalIndent(pretty, "", "  "); err == nil {
+				return &RPCResult{Result: truncateMarked(string(out), maxPageControlledReply)}, nil
+			}
+		}
+		return &RPCResult{Result: truncateMarked(string(parsed.Result.Value), maxPageControlledReply)}, nil
+	}
+}
+
+func makeBrowserCloseHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		closeActiveCDP()
+		return &RPCResult{Result: map[string]any{"closed": true}}, nil
+	}
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
