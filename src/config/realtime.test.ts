@@ -207,13 +207,13 @@ describe('resolveRealtimeVoice', () => {
 
   test('http dev proxy derives ws:// (not wss://)', () => {
     const config = makeConfig();
-    config.pipo_ai = { base_url: 'http://dev-llm.pipo.dev:4000', api_key: 'sk-uj-abc' };
+    config.pipo_ai = { base_url: 'http://dev-llm.pipo-ke.com:4000', api_key: 'sk-uj-abc' };
     config.voice!.realtime = { enabled: true };
     const res = resolveRealtimeVoice(config);
     expect(res.ok).toBe(true);
     if (res.ok) {
-      expect(res.resolved.url).toBe('ws://dev-llm.pipo.dev:4000/v1/realtime');
-      expect(res.resolved.modelsUrl).toBe('http://dev-llm.pipo.dev:4000/v1/models');
+      expect(res.resolved.url).toBe('ws://dev-llm.pipo-ke.com:4000/v1/realtime');
+      expect(res.resolved.modelsUrl).toBe('http://dev-llm.pipo-ke.com:4000/v1/models');
     }
   });
 

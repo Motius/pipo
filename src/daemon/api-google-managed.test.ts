@@ -19,7 +19,7 @@ type Handler = (req: Request) => Response | Promise<Response>;
  * registered URI on the control plane so that moving hosts never breaks it. A
  * user who reached that flow would get a redirect_uri_mismatch error page.
  */
-const CONNECT_URL = 'https://app.pipo.dev/account';
+const CONNECT_URL = 'https://app.pipo-ke.com/account';
 
 /**
  * A REAL managed block: no client_id, no client_secret. Fixtures that carried
@@ -27,7 +27,7 @@ const CONNECT_URL = 'https://app.pipo.dev/account';
  * instead of the hosted one — the exact confusion this mode exists to end.
  */
 const MANAGED = {
-  refresh_url: 'https://app.pipo.dev/api/integrations/google/refresh',
+  refresh_url: 'https://app.pipo-ke.com/api/integrations/google/refresh',
   instance_id: 'inst-1',
   // The doorbell key and the refresh key: different derivations, so a mix-up of
   // the two cannot pass a test that uses this fixture.

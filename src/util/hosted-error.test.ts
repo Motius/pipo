@@ -99,7 +99,7 @@ describe('hostedProxyError: provider-policy outcomes', () => {
 
     const policy = hostedProxyError('pipo AI API', 401, 'key is blocked', null, {
       reason: 'content_policy',
-      contact: 'https://pipo.dev/appeal',
+      contact: 'https://pipo-ke.com/appeal',
     });
     expect(policy.message).toContain('restricted on this account for a usage-policy violation');
 

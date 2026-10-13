@@ -77,10 +77,10 @@ Billing page:
 
 ```yaml
 pipo_billing:
-  url: https://app.pipo.dev/api/billing/instance   # signed POST, https
+  url: https://app.pipo-ke.com/api/billing/instance   # signed POST, https
   instance_id: <uuid>
   secret: <64 hex>                                      # per-instance, derived
-  page_url: https://app.pipo.dev/billing           # opened by a person
+  page_url: https://app.pipo-ke.com/billing           # opened by a person
 ```
 
 - **All four or none** (`daemon/hosted-billing.ts`); a partial block reads as
