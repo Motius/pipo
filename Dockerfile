@@ -378,7 +378,8 @@ COPY --from=workflows /out/engine/ ./engine-cache/
 # Note: `bun link` can't be used here — it symlinks through /root/.bun/ which
 # is inaccessible to the non-root pipo user. Direct symlink works because
 # Bun resolves import.meta.dir through symlinks to the real path (/app/bin).
-RUN ln -s /app/bin/pipo.ts /usr/local/bin/pipo
+RUN chmod 0755 /app/bin/pipo.ts && \
+    ln -s /app/bin/pipo.ts /usr/local/bin/pipo
 
 # Create non-root user and data directory
 RUN groupadd -r pipo && useradd -r -g pipo -d /data -s /bin/bash pipo && \

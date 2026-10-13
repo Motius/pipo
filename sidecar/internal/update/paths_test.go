@@ -29,7 +29,7 @@ func TestExeInstallDir(t *testing.T) {
 	if got, err := exeInstallDir(filepath.Join(dir, "pipo.EXE"), "pipo.exe", true); err != nil || got != dir {
 		t.Errorf("case-folded name: %q, %v", got, err)
 	}
-	if _, err := exeInstallDir(filepath.Join(dir, "pipo"), "pipo", false); err == nil {
+	if _, err := exeInstallDir(filepath.Join(dir, "Pipo"), "pipo", false); err == nil {
 		t.Error("case-sensitive layout accepted a different case")
 	}
 	if _, err := exeInstallDir(filepath.Join(dir, "sidecar-dev"), "pipo", false); err == nil {
