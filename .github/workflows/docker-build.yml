@@ -74,7 +74,7 @@ permissions:
 
 jobs:
   docker-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Run-scoped rather than a bare `pipo:ci`. On a GitHub-hosted runner
       # each job gets a fresh VM so it makes no difference, but `concurrency` is

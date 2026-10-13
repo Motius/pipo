@@ -41,7 +41,7 @@ jobs:
   # imports sidecar/internal/* (brand, webviewui, autostart, webview2), so a
   # change anywhere in the sidecar tree can break its build.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sidecar: ${{ steps.filter.outputs.sidecar }}
       daemon-cli: ${{ steps.filter.outputs.daemon-cli }}
@@ -90,7 +90,7 @@ jobs:
               - '.github/workflows/test.yml'
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-setup
@@ -183,7 +183,16 @@ jobs:
   sidecar-build:
     needs: changes
     if: needs.changes.outputs.sidecar == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # NOT ubuntu-latest, and this is deliberate across every workflow here.
+    # GitHub migrates the `ubuntu-latest` label to Ubuntu 26 from 2026-10-19
+    # (actions/runner-images#14748), and this job is the one most exposed to
+    # it: the step below installs libwebkit2gtk-4.1-dev and libgtk-3-dev, which
+    # are the GTK3-era bindings. Ubuntu 26 ships the GTK4/webkit2gtk-5.0
+    # generation, where the 4.1 packages and their pkg-config files are gone
+    # and the 4.1->4.0 alias stops being a rename of anything. Pinning holds
+    # the runner until Ubuntu 26 has actually been validated here; when it is,
+    # move deliberately rather than by a label's silent redefinition.
     env:
       # One literal for the `-skip`/`-run` pair below. They partition the module
       # between an unretried step and a retried one, and sharing a single regex
@@ -692,7 +701,7 @@ jobs:
   plist-lint:
     needs: changes
     if: needs.changes.outputs.sidecar == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Parse every plist

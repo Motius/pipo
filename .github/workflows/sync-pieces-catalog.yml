@@ -93,7 +93,7 @@ env:
 
 jobs:
   inspect:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -134,7 +134,7 @@ jobs:
 
   generate:
     needs: inspect
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A healthy run finishes in a few minutes. The ceiling guards the
     # pathological case where npm throttles every request with a long
     # Retry-After: better to kill the job than burn hours of runner time
@@ -222,7 +222,7 @@ jobs:
 
   publish:
     needs: generate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write

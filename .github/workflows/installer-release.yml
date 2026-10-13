@@ -56,7 +56,7 @@ env:
 jobs:
   # ─── Resolve version + idempotency gate ────────────────────────
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
       should_release: ${{ steps.v.outputs.should_release }}
@@ -103,7 +103,7 @@ jobs:
   build-windows:
     needs: resolve
     if: needs.resolve.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
@@ -184,7 +184,7 @@ jobs:
   sign-windows:
     needs: [resolve, build-windows]
     if: needs.resolve.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # OIDC, for google-github-actions/auth: signing federates into Google
     # Cloud KMS with no stored credential. Only this job gets a token — the
     # workflow default stays contents: read.
@@ -428,7 +428,7 @@ jobs:
   publish:
     needs: [resolve, sign-windows, build-macos]
     if: needs.resolve.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
