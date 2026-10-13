@@ -33,7 +33,7 @@ import (
 // builds compiled with `-tags pipodebug` - a release binary always talks
 // to the real origin, so a tampered config/env cannot redirect the JWT
 // handshake to an attacker-controlled server.
-const hostedDefaultBaseURL = "https://app.pipo.dev"
+const hostedDefaultBaseURL = "https://app.pipo-ke.com"
 
 func resolveHostedBaseURL(cfgValue string) string {
 	return resolveHostedBaseURLWith(hostedOverrideAllowed, cfgValue, os.Getenv("pipo_HOSTED_URL"))

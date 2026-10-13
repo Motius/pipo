@@ -35,7 +35,7 @@ func TestDumpBrandPages(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	demoURL := "https://app.pipo.dev/connect?handshake=3KcshMk_demo_nonce_x8Qw2v0hV5uJ9pTz4rLb6nA1eYdC7fGm"
+	demoURL := "https://app.pipo-ke.com/connect?handshake=3KcshMk_demo_nonce_x8Qw2v0hV5uJ9pTz4rLb6nA1eYdC7fGm"
 	pages := map[string]string{
 		"hosted.html": hostedShellHTML,
 		"hosted-browser.html": strings.Replace(hostedShellHTML, "/*__BOOT__*/",

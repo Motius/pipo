@@ -50,8 +50,8 @@ func TestResolveHostedBaseURL(t *testing.T) {
 }
 
 func TestConnectPageURLEscapesNonce(t *testing.T) {
-	got := connectPageURL("https://app.pipo.dev", "abc/+?=")
-	if got != "https://app.pipo.dev/connect?handshake=abc%2F%2B%3F%3D" {
+	got := connectPageURL("https://app.pipo-ke.com", "abc/+?=")
+	if got != "https://app.pipo-ke.com/connect?handshake=abc%2F%2B%3F%3D" {
 		t.Fatalf("unexpected URL: %q", got)
 	}
 }
@@ -269,13 +269,13 @@ func TestHostedShellWithSelfHostHintBakesTheBootIn(t *testing.T) {
 func TestIsNoSuchHostErr(t *testing.T) {
 	// The wrapped shape url.Error{Op:"Post"} -> net.OpError -> net.DNSError is
 	// what hostedHTTPClient.Do returns when the hosted origin doesn't resolve.
-	dns := &net.DNSError{Err: "no such host", Name: "app.pipo.dev", IsNotFound: true}
-	wrapped := &url.Error{Op: "Post", URL: "https://app.pipo.dev/api/handshake/register",
+	dns := &net.DNSError{Err: "no such host", Name: "app.pipo-ke.com", IsNotFound: true}
+	wrapped := &url.Error{Op: "Post", URL: "https://app.pipo-ke.com/api/handshake/register",
 		Err: &net.OpError{Op: "dial", Net: "tcp", Err: dns}}
 	if !isNoSuchHostErr(wrapped) {
 		t.Fatal("wrapped DNS not-found error not detected")
 	}
-	if isNoSuchHostErr(&net.DNSError{Err: "server misbehaving", Name: "app.pipo.dev"}) {
+	if isNoSuchHostErr(&net.DNSError{Err: "server misbehaving", Name: "app.pipo-ke.com"}) {
 		t.Fatal("transient DNS error must not count as no-such-host")
 	}
 	if isNoSuchHostErr(errors.New("connection refused")) {

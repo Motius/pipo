@@ -54,10 +54,10 @@ describe('Config Loader', () => {
       TEST_CONFIG_PATH,
       [
         'pipo_billing:',
-        '  url: https://app.pipo.dev/api/billing/instance',
+        '  url: https://app.pipo-ke.com/api/billing/instance',
         '  instance_id: 11111111-2222-3333-4444-555555555555',
         `  secret: ${'e'.repeat(64)}`,
-        '  page_url: https://app.pipo.dev/billing',
+        '  page_url: https://app.pipo-ke.com/billing',
         '',
       ].join('\n'),
     );
@@ -65,10 +65,10 @@ describe('Config Loader', () => {
     // Unquoted, exactly as the control plane renders it: every value must
     // still arrive as a string.
     expect(loaded.pipo_billing).toEqual({
-      url: 'https://app.pipo.dev/api/billing/instance',
+      url: 'https://app.pipo-ke.com/api/billing/instance',
       instance_id: '11111111-2222-3333-4444-555555555555',
       secret: 'e'.repeat(64),
-      page_url: 'https://app.pipo.dev/billing',
+      page_url: 'https://app.pipo-ke.com/billing',
     });
   });
 

@@ -47,7 +47,7 @@ const enroll = (name: unknown = 'laptop') =>
   });
 
 /** A complete hosted block -- haspipoAi needs both fields. */
-const HOSTED = { pipo_ai: { base_url: 'https://llm.pipo.dev', api_key: 'sk-uj-abcdefghijklmnop' } };
+const HOSTED = { pipo_ai: { base_url: 'https://llm.pipo-ke.com', api_key: 'sk-uj-abcdefghijklmnop' } };
 
 describe('POST /api/sidecars/enroll', () => {
   it('refuses on a hosted install, and never reaches the manager', async () => {
@@ -92,7 +92,7 @@ describe('POST /api/sidecars/enroll', () => {
     // and treating it as hosted would lock a self-hoster out of their only way
     // to add a device.
     const { post, calls } = handlerFor({
-      pipo_ai: { base_url: 'https://llm.pipo.dev' },
+      pipo_ai: { base_url: 'https://llm.pipo-ke.com' },
     } as Partial<pipoConfig>);
     const res = await post(enroll());
 
