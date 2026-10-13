@@ -95,7 +95,7 @@ type Provider = {
 const PROVIDERS: Provider[] = [
   // Hosted brain. `soon: true` is the self-hosted default; the wizard flips
   // it off when GET /api/config/llm reports hosted_llm (see provList below).
-  { id: "pipo", name: "pipo AI", abbr: "JA", kind: "included", soon: true, noConfig: true },
+  { id: "pipo", name: "pipo AI", abbr: "PI", kind: "included", soon: true, noConfig: true },
   { id: "anthropic", name: "Anthropic", abbr: "A", kind: "API key", needsKey: true, optionalBaseUrl: true, keyLabel: "API key", urlLabel: "Custom endpoint URL", urlPh: "https://gateway.example.com", models: ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"], hint: "Enable the custom endpoint option to use ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN-style authentication." },
   { id: "openai", name: "OpenAI", abbr: "O", kind: "API key", needsKey: true, models: ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5-mini", "o4-mini"] },
   { id: "groq", name: "Groq", abbr: "G", kind: "API key", needsKey: true, models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.6-27b"], hint: "Loads the current model catalog from Groq so decommissioned models are never suggested." },

@@ -32,7 +32,11 @@ extern void goHandleURLOpen(char* url);
 }
 @end
 
-static pipoURLHandler* pipoURLHandler = nil;
+// The instance, not the class. A C identifier and an Objective-C class name
+// share one namespace here: naming both `pipoURLHandler` is a compile error
+// ("redefinition of 'pipoURLHandler' as different kind of symbol"), so the
+// variable carries the class name as a prefix, like pipoInstallURLHandler below.
+static pipoURLHandler* pipoURLHandlerInstance = nil;
 
 // Installed via the main queue. Ordering, made explicit so nobody re-derives
 // it: on a launched-BY-URL cold start, AppKit delivers the queued launch
@@ -49,12 +53,12 @@ static pipoURLHandler* pipoURLHandler = nil;
 // the Carbon header.
 static void pipoInstallURLHandler(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (pipoURLHandler != nil) {
+        if (pipoURLHandlerInstance != nil) {
             return;
         }
-        pipoURLHandler = [[pipoURLHandler alloc] init];
+        pipoURLHandlerInstance = [[pipoURLHandler alloc] init];
         [[NSAppleEventManager sharedAppleEventManager]
-            setEventHandler:pipoURLHandler
+            setEventHandler:pipoURLHandlerInstance
             andSelector:@selector(handleGetURL:withReply:)
             forEventClass:'GURL'
             andEventID:'GURL'];
