@@ -787,7 +787,7 @@ src/workflows/
       pieces/
         framework/              Upstream `createPiece`, `createAction`, `Property`
         common/                 Upstream helpers (http, auth)
-        pipo/                 Our pieces (ask, tool, notify, context, agent,
+        pipo/                   Our pieces (ask, tool, notify, context, agent,
                                 trigger, regex, test, validate)
       server/engine/            Upstream engine source (we build this into a CJS
                                 bundle and spawn it as a child process)
@@ -833,16 +833,16 @@ src/workflows/
       files.ts                  /v1/step-files binary uploads/downloads
       flows.ts                  /v1/engine/populated-flows (resolves a runtime
                                 version + execution context for the engine)
-      pipo-agent.ts           /v1/pipo/agent  -> agent-delegator
-      pipo-context.ts         /v1/pipo/context -> vault/awareness/commitments
-      pipo-events.ts          /v1/pipo/events -> event buffer poll
-      pipo-llm.ts             /v1/pipo/llm    -> LLMManager.chat
-      pipo-notify.ts          /v1/pipo/notify -> ChannelService + desktop
-      pipo-pieces.ts          /v1/pipo/pieces/authorize -> governed-piece admission
+      pipo-agent.ts             /v1/pipo/agent  -> agent-delegator
+      pipo-context.ts           /v1/pipo/context -> vault/awareness/commitments
+      pipo-events.ts            /v1/pipo/events -> event buffer poll
+      pipo-llm.ts               /v1/pipo/llm    -> LLMManager.chat
+      pipo-notify.ts            /v1/pipo/notify -> ChannelService + desktop
+      pipo-pieces.ts            /v1/pipo/pieces/authorize -> governed-piece admission
       effect-context.ts         (helper, no route) reads a request's step name
                                 and execution path headers
-      pipo-tools.ts           /v1/pipo/tools  -> ToolRegistry.invoke
-      pipo-workflows.ts       /v1/pipo/workflows -> workflow runner
+      pipo-tools.ts             /v1/pipo/tools  -> ToolRegistry.invoke
+      pipo-workflows.ts         /v1/pipo/workflows -> workflow runner
       logs.ts                   /v1/logs/:runId zstd execution-state backup
       store.ts                  /v1/store-entries (engine's KV store)
       waitpoints.ts             `/v1/waitpoints` (the public resume route,

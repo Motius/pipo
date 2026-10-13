@@ -576,6 +576,13 @@ export function migrateWorkflowEncryptionKeyToDataDir(): boolean {
 }
 
 /**
+ * The env variable the daemon's workflow key may be handed in through. Named
+ * once so the diagnostic that tells a user which variable to set spells it the
+ * same way the code reads it.
+ */
+const WORKFLOW_ENCRYPTION_KEY_ENV = "pipo_WORKFLOW_ENCRYPTION_KEY";
+
+/**
  * Resolve the encryption key. Cached after first call. If callers want to
  * inject a key (tests, key-rotation tooling), use `setEncryptionKey`.
  */
@@ -590,7 +597,7 @@ function getKey(): Buffer {
       );
     }
     // A legacy `1` flag cannot vouch for or against an env key; only a check can.
-    if (matchesParentWorkflowKey(env) === false) throw parentKeyMismatch("pipo_WORKFLOW_ENCRYPTION_KEY here");
+    if (matchesParentWorkflowKey(env) === false) throw parentKeyMismatch(`${WORKFLOW_ENCRYPTION_KEY_ENV} here`);
     cachedKey = Buffer.from(env, "hex");
     return cachedKey;
   }
@@ -647,10 +654,18 @@ function parentKeyMismatch(found: string | null, file?: string): Error {
     : legacy
       ? `${found} cannot be checked against it (the flag is an older release's \`1\`, which records no key)`
       : `${found} is a different key`;
+  // `what` opens a sentence, so its first letter is upper-cased -- except when
+  // that letter belongs to an identifier. The one `found` that IS the variable
+  // name (getKey's env branch) would otherwise be reported as
+  // "Pipo_WORKFLOW_ENCRYPTION_KEY here", telling the user to set an env var
+  // that does not exist.
+  const lead = what.startsWith(WORKFLOW_ENCRYPTION_KEY_ENV)
+    ? what
+    : `${what[0]!.toUpperCase()}${what.slice(1)}`;
   return new Error(
     `Refusing the workflow encryption key: this pipo descends from a command the assistant ran, and the `
     + `pipo that ran it kept its workflow key in pipo_WORKFLOW_ENCRYPTION_KEY (${MODEL_EXEC_ENV_KEY_FLAG} is `
-    + `set). ${what[0]!.toUpperCase()}${what.slice(1)}`
+    + `set). ${lead}`
     + (found === null ? ": a key made here could not be that key. " : ", so credentials saved with it would not decrypt under that key. ")
     + `Start this pipo from your own terminal with pipo_WORKFLOW_ENCRYPTION_KEY set to that key, or, if this `
     + `instance is meant to have its own key, unset ${MODEL_EXEC_ENV_KEY_FLAG} deliberately.`,
