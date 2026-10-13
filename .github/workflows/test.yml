@@ -108,7 +108,11 @@ jobs:
       # it would merge green and the first test would be a real tag. Runs the
       # block verbatim against hostile tags and checks the workflow structure
       # that keeps the raw tag out of every other job's shell.
-      - run: .github/scripts/release-exec.test.sh
+      - name: Run release test script
+  run: |
+    chmod +x .github/scripts/release-exec.test.sh
+    .github/scripts/release-exec.test.sh
+
       # #646: every job's token scope is written down, the publish path holds
       # nothing by default, and every action it runs is pinned to a commit.
       - run: .github/scripts/workflow-hardening.test.sh
