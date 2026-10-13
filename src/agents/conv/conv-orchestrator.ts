@@ -1,0 +1,754 @@
+/**
+ * Conversation-tier orchestrator.
+ *
+ * The router-first architecture activates when `llm.tiers.conversation` is
+ * configured. This orchestrator handles user turns by:
+ *
+ *   1. Building a TIGHT system prompt for the conversation LLM (persona +
+ *      user identity + recent dialogue + delegation catalog + in-flight
+ *      tasks + last task results). NO knowledge graph dump, NO 4k role
+ *      prompt - that's what task tiers see.
+ *   2. Calling the conversation tier with the CONV_TOOLS surface (delegate,
+ *      check_task, cancel_task, resume_task).
+ *   3. When conv emits a delegate tool call, dispatching it to the task
+ *      tier via TaskDispatcher and feeding the envelope back as a tool
+ *      result.
+ *   4. Looping until conv produces final text for the user.
+ *
+ * Status pills / streaming filler / UI affordances are surfaced by the caller
+ * via the optional `onTaskEvent` hook (the daemon's WS service uses this).
+ */
+
+import type { LLMManager } from '../../llm/manager.ts';
+import type { TurnToolScope } from '../../actions/tools/tool-scope.ts';
+import type { LLMMessage, LLMResponse, LLMToolCall } from '../../llm/provider.ts';
+import { progressAcknowledgement } from '../progress.ts';
+import { CONV_TOOLS, CONV_TOOL_NAMES } from './conv-tools.ts';
+import { recoverSerializedConvTools, visibleStreamText } from './conv-tool-recovery.ts';
+import { TaskDispatcher } from './task-dispatcher.ts';
+import { TaskRegistry } from './task-registry.ts';
+import { isTaskTemplate, isTaskTier, TASK_TEMPLATES, TASK_TIERS } from './task-envelope.ts';
+import type { TaskRecord, TaskRequest, TaskResultEnvelope } from './task-envelope.ts';
+
+const MAX_CONV_ITERATIONS = 8;
+
+/**
+ * What the ROUTER is told when the chat is bound to one site-builder project.
+ *
+ * Deliberately a fixed string with no project data interpolated. The full
+ * site block (project id, name, branch, file listing) goes to the task tier,
+ * which has the tools; every field in it is written by the model or by a
+ * pulled repository (sites/prompt-context.ts), and putting it in front of the
+ * router would widen the injection surface of the one component whose job is
+ * to decide what runs, in exchange for nothing -- the router has no file
+ * tools and delegates either way.
+ *
+ * What it does need is the routing fact: in this composer, "fix the header"
+ * is project work and must be delegated rather than answered from the
+ * dialogue.
+ */
+export const SITE_CHAT_ROUTING_NOTE =
+  'This conversation is bound to a single Site Builder project. Anything about '
+  + 'its files, pages, dependencies, build, preview or repository is real state '
+  + 'you cannot see: delegate it (tier=medium, template=general) so the task tier '
+  + 'can use the project tools. The composer is still a general chat box, so '
+  + 'ordinary requests unrelated to the project are handled exactly as elsewhere.';
+
+export type ConvSystemContext = {
+  /** User persona (name, timezone, role, etc.) - short identity block. */
+  userIdentity?: string;
+  /**
+   * Full user profile block (wizard answers + interview facts). Rendered as
+   * its own cache-marked system message, so it MUST be byte-stable across
+   * turns - keep anything volatile (local time, task state) in userIdentity
+   * or ambientFacts instead.
+   */
+  userProfile?: string;
+  /** Last N dialogue turns from the persistent conversation - verbatim. */
+  recentDialogue?: LLMMessage[];
+  /** Optional extra grounding the conv LLM should always see (e.g., active commitments count). */
+  ambientFacts?: string;
+};
+
+/**
+ * The facts about THIS TURN that must reach the task tier, as opposed to the
+ * prompt material in `ConvSystemContext` (#571).
+ *
+ * A separate, REQUIRED parameter rather than a field on `ConvSystemContext`,
+ * and that distinction is the whole point. `ConvSystemContext` is consumed in
+ * exactly two places, both prompt construction, and the conv LLM cannot reach
+ * a registry tool at all -- its surface is the four synthetic router tools in
+ * `conv-tools.ts`. A scope placed on that type could only ever affect prose,
+ * while `handleToolCall`, the hop that actually dispatches, would still be
+ * unscoped. `git grep TurnToolScope` would then show the conv path covered
+ * with dispatch still open on hosted, which is the exact shape of the bug
+ * #571 exists to fix, one layer down.
+ *
+ * Required, so the compiler catches a call site that forgets it.
+ */
+export type ConvTurn = {
+  /**
+   * The user's verbatim message for this turn.
+   *
+   * Was a mutable field on the orchestrator (`currentUserMessage`), written
+   * at the top of `streamTurn` and read inside `handleToolCall` an entire
+   * LLM stream later. One ConvOrchestrator serves every chat and every
+   * channel in the process, so two concurrent turns -- a Sites-page turn and
+   * a telegram message -- raced: whichever wrote last supplied
+   * `original_message` for both, which then became the other task tier's
+   * user prompt AND the text the relevance filter selected on. Passed per
+   * turn, it cannot.
+   */
+  userMessage: string;
+  /**
+   * Tools this KIND of turn does not have -- today, a chat bound to one
+   * site-builder project. Carried through to the task tier, which is where
+   * the tool registry is.
+   */
+  scope: TurnToolScope | null;
+  /**
+   * WHICH CHAT this turn is, for matching a paused task to the chat that
+   * created it: `site:<projectId>` for a project chat, undefined for the main
+   * chat. Distinct from `scope`, which is one shared policy object and so
+   * cannot tell two projects' chats apart. See TaskRecord.contextKey.
+   */
+  contextKey?: string;
+  /**
+   * Extra system context for the TASK tier, whatever the caller has.
+   *
+   * Named for its original and main use -- the site-builder block for a
+   * project-scoped chat -- but it is NOT only that, and treating it as a
+   * "this is a project chat" signal is a mistake: the main dashboard chat
+   * passes the multi-project list here and the pebble passes its panel
+   * context, both with no scope. `scope` is the signal for a project chat;
+   * this is just text.
+   *
+   * Handed to the task tier, not rendered into the conv prompt. Two reasons:
+   * it is ~2KB of per-turn text that would sit outside the conv tier's
+   * deliberately tight, cache-stable prompt, and in the site case it
+   * interpolates repo-written file names framed as untrusted data
+   * (sites/prompt-context.ts) -- text the router has no tools to act on and
+   * no reason to read. What the router gets for a project chat is one fixed
+   * sentence with no project data in it (`SITE_CHAT_ROUTING_NOTE`).
+   */
+  siteContext?: string;
+};
+
+export type ConvTaskEvent =
+  | { type: 'task_started'; record: TaskRecord }
+  | { type: 'task_completed'; record: TaskRecord; envelope: TaskResultEnvelope }
+  | { type: 'task_failed'; record: TaskRecord; envelope: TaskResultEnvelope }
+  | { type: 'task_cancelled'; record: TaskRecord; envelope: TaskResultEnvelope };
+
+export type ConvProcessResult = {
+  text: string;
+  tasksRun: string[];   // task ids that fired during this turn
+};
+
+/**
+ * Events emitted by streamTurn() as the conversation progresses. Lets the
+ * caller (agent-service) surface intermediate text - in particular the
+ * acknowledgment the conv LLM emits alongside a delegate tool call - to the
+ * user immediately, instead of waiting for the slow task tier to finish.
+ */
+export type ConvStreamEvent =
+  | { type: 'text'; text: string; newSegment?: boolean; segmentEnd?: boolean }
+  | { type: 'task'; event: ConvTaskEvent }
+  | { type: 'done'; tasksRun: string[] };
+
+export class ConvOrchestrator {
+  constructor(
+    private readonly llm: LLMManager,
+    private readonly registry: TaskRegistry,
+    private readonly dispatcher: TaskDispatcher,
+    private readonly persona: string,
+  ) {}
+
+  /**
+   * Process one user turn. Returns the conversation LLM's final user-facing
+   * text plus the ids of any tasks that fired during the turn. Caller is
+   * responsible for persisting the user/assistant messages to the vault.
+   */
+  async processTurn(
+    userMessage: string,
+    context: ConvSystemContext,
+    turn: Omit<ConvTurn, 'userMessage'>,
+    onTaskEvent?: (event: ConvTaskEvent) => void,
+  ): Promise<ConvProcessResult> {
+    let fullText = '';
+    const tasksRun: string[] = [];
+    for await (const event of this.streamTurn(userMessage, context, turn)) {
+      if (event.type === 'text') {
+        // Skip segmentEnd-only events: they carry a TTS signal, not content.
+        if (!event.text) continue;
+        const separator = event.newSegment && fullText && !fullText.endsWith('\n') ? '\n' : '';
+        fullText += separator + event.text;
+      } else if (event.type === 'task') {
+        onTaskEvent?.(event.event);
+      } else if (event.type === 'done') {
+        tasksRun.push(...event.tasksRun);
+      }
+    }
+    return { text: fullText, tasksRun };
+  }
+
+  /**
+   * Streaming variant of processTurn. Yields each piece of assistant text
+   * as it becomes available (acknowledgment alongside a delegate call,
+   * then later the verbalization of the result). Task lifecycle events fire
+   * via the `onTaskEvent` callback in REAL TIME (not buffered), so the UI
+   * can update status pills as `task_started` -> running ms -> `task_completed`
+   * rather than getting both events together at task end.
+   */
+  async *streamTurn(
+    userMessage: string,
+    context: ConvSystemContext,
+    // Required: see ConvTurn. A turn that reaches the task tier without it
+    // is a turn running unscoped, and the compiler is the only thing that
+    // catches a caller which forgets (#571).
+    turnContext: Omit<ConvTurn, 'userMessage'>,
+    onTaskEvent?: (event: ConvTaskEvent) => void,
+  ): AsyncGenerator<ConvStreamEvent> {
+    // System messages split at the prompt-cache boundary: the static
+    // persona/instructions prefix and the user profile block are byte-stable
+    // across turns (both marked `cache: true`; the provider places the single
+    // breakpoint on the LAST marked block, so persona + profile cache as one
+    // prefix), while task state and user identity change every turn and
+    // follow unmarked. Note: at ~1500 tokens the static block may sit below
+    // some models' minimum cacheable prefix and silently not cache -
+    // harmless (no premium is charged); the provider's last-message
+    // breakpoint still caches system + dialogue as one growing prefix.
+    // Everything this turn must carry to the task tier, assembled once and
+    // passed by argument. Never a field: one ConvOrchestrator serves every
+    // chat and channel in the process, so a field is a cross-chat race
+    // waiting for two concurrent turns -- which is what `currentUserMessage`
+    // was before #571 removed it.
+    const turn: ConvTurn = { ...turnContext, userMessage };
+
+    const dynamicPrompt = this.buildDynamicSystemPrompt(context, turn);
+    const messages: LLMMessage[] = [
+      { role: 'system', content: this.buildStaticSystemPrompt(), cache: true },
+      ...(context.userProfile ? [{ role: 'system', content: context.userProfile, cache: true } satisfies LLMMessage] : []),
+      ...(dynamicPrompt ? [{ role: 'system', content: dynamicPrompt } satisfies LLMMessage] : []),
+      ...(context.recentDialogue ?? []),
+      { role: 'user', content: userMessage },
+    ];
+
+    const tasksRun: string[] = [];
+    let hasVisibleText = false;
+    let acknowledgedWork = false;
+
+    for (let iteration = 0; iteration < MAX_CONV_ITERATIONS; iteration++) {
+      let responseText = '';
+      const responseToolCalls: LLMToolCall[] = [];
+      let response: LLMResponse | null = null;
+      let firstTextChunk = true;
+      // Visible text already yielded for this iteration, after serialized-tool
+      // removal. Successive strips of a growing buffer only ever extend this,
+      // so the delta is what's new.
+      let emittedVisible = '';
+
+      // Stream the conversation layer itself instead of waiting for a full
+      // chat response. Natural acknowledgments now reach the user as soon as
+      // the model writes them, before a delegated task begins.
+      for await (const event of this.llm.streamTier('conversation', 'conv_orchestrator', messages, {
+        tools: CONV_TOOLS,
+        tool_choice: 'auto',
+      })) {
+        if (event.type === 'text') {
+          responseText += event.text;
+          // Never expose a text-serialized tool call to the chat UI or TTS.
+          // Only the tail that could still become one is withheld — anywhere in
+          // the response, not just at the start — so ordinary prose keeps
+          // streaming at token latency.
+          const visible = visibleStreamText(responseText);
+          if (visible.length <= emittedVisible.length) continue;
+          const delta = visible.slice(emittedVisible.length);
+          emittedVisible = visible;
+          yield {
+            type: 'text',
+            text: delta,
+            newSegment: firstTextChunk && hasVisibleText,
+          };
+          firstTextChunk = false;
+          hasVisibleText = true;
+        } else if (event.type === 'tool_call') {
+          responseToolCalls.push(event.tool_call);
+        } else if (event.type === 'done') {
+          response = event.response;
+        } else if (event.type === 'error') {
+          throw Object.assign(new Error(event.error), { code: event.code });
+        }
+      }
+
+      response ??= {
+        content: responseText,
+        tool_calls: responseToolCalls,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        model: 'unknown',
+        finish_reason: responseToolCalls.length > 0 ? 'tool_use' : 'stop',
+      };
+      response = {
+        ...response,
+        content: responseText || response.content || '',
+        tool_calls: responseToolCalls.length > 0 ? responseToolCalls : response.tool_calls,
+      };
+      const recovered = recoverSerializedConvTools(
+        response.content,
+        response.tool_calls ?? [],
+        `recovered_conv_${iteration}`,
+      );
+      response = { ...response, content: recovered.text, tool_calls: recovered.toolCalls };
+
+      // Flush anything the hold-back buffer was still holding when the stream
+      // ended — e.g. a trailing "/deleg" that never became a call, or content
+      // a provider only reports on its `done` event.
+      //
+      // `emittedVisible` is always a prefix of the recovered content (stripping
+      // a growing buffer only ever extends the visible text — see the
+      // monotonicity test in conv-tool-recovery.test.ts), so the tail is the
+      // part the user hasn't seen.
+      if (response.content.length > emittedVisible.length) {
+        yield {
+          type: 'text',
+          text: response.content.slice(emittedVisible.length),
+          newSegment: firstTextChunk && hasVisibleText,
+        };
+        emittedVisible = response.content;
+        firstTextChunk = false;
+        hasVisibleText = true;
+      }
+
+      // Conv LLM emitted text only (no tool calls) -> final user-facing reply.
+      if (!response.tool_calls || response.tool_calls.length === 0) {
+        yield { type: 'done', tasksRun };
+        return;
+      }
+
+      // Some tool-calling models return null content even when explicitly
+      // prompted to acknowledge the user. Supply one concise activity update
+      // so the delegated task never creates minutes of silent "thinking".
+      if (!response.content.trim() && !acknowledgedWork) {
+        const acknowledgment = progressAcknowledgement(response.tool_calls);
+        response.content = acknowledgment;
+        yield { type: 'text', text: acknowledgment, newSegment: hasVisibleText, segmentEnd: true };
+        hasVisibleText = true;
+      } else if (response.content.trim()) {
+        // The model wrote its own acknowledgment. Tell downstream TTS that it
+        // is complete so the sentence is spoken before the delegated task runs
+        // instead of waiting for the task's answer to arrive.
+        yield { type: 'text', text: '', segmentEnd: true };
+      }
+      if (response.content.trim()) acknowledgedWork = true;
+
+      messages.push({
+        role: 'assistant',
+        content: response.content ?? '',
+        tool_calls: response.tool_calls,
+      });
+
+      // Task events go DIRECTLY to the onTaskEvent callback in real time so
+      // the UI can update status pills incrementally (started -> elapsed ->
+      // completed). Each event is snapshotted at the moment it fires so
+      // later record mutations don't mutate historical event payloads.
+      const captureEvent = (event: ConvTaskEvent) => {
+        if (!onTaskEvent) return;
+        // Shallow snapshot of the record so status/updatedAt at this moment
+        // are preserved when the listener reads them later. The request
+        // object is immutable in practice; preserved by reference.
+        const snapshot = { ...event.record };
+        onTaskEvent({ ...event, record: snapshot } as ConvTaskEvent);
+      };
+
+      for (const call of response.tool_calls) {
+        // The turn's scope and site block travel as ARGUMENTS, read from the
+        // context this call was made under. Nothing about them comes from
+        // `call.arguments`, which is model output.
+        const result = await this.handleToolCall(call, turn, captureEvent);
+        if (result.taskId) tasksRun.push(result.taskId);
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify(result.envelope),
+        });
+      }
+    }
+
+    // Hit the iteration cap - bail with whatever the last response said,
+    // or a generic fallback.
+    yield {
+      type: 'text',
+      text: 'I got stuck routing your request. Could you rephrase or try again?',
+      // Separators are opt-in now, so this must be marked or it runs straight
+      // into whatever acknowledgment the loop already emitted.
+      newSegment: true,
+      segmentEnd: true,
+    };
+    yield { type: 'done', tasksRun };
+  }
+
+  /**
+   * Whether a task record belongs to the same chat context as this turn.
+   *
+   * Compares the stored chat key as an opaque string, like
+   * `TaskDispatcher.resume`. Two consequences worth stating: a record carrying
+   * a key this build no longer produces matches no live turn and is treated as
+   * someone else's (rather than resolving to "no scope" and looking like a
+   * main-chat task), and because the key carries the PROJECT, two different
+   * site projects' chats are different contexts -- which comparing the one
+   * shared scope object could not express.
+   */
+  private sameContext(record: TaskRecord, turn: ConvTurn): boolean {
+    return (record.contextKey ?? null) === (turn.contextKey ?? null);
+  }
+
+  private async handleToolCall(
+    call: LLMToolCall,
+    turn: ConvTurn,
+    onTaskEvent?: (event: ConvTaskEvent) => void,
+  ): Promise<{ envelope: unknown; taskId?: string }> {
+    switch (call.name) {
+      case CONV_TOOL_NAMES.delegate: {
+        const args = call.arguments as Partial<TaskRequest>;
+        if (!args.tier || !args.template || !args.intent) {
+          return { envelope: { error: 'delegate requires tier, template, and intent' } };
+        }
+        // `args` is model output cast to a type; the cast does not validate.
+        // Both of these are narrow unions, and an invented template reaches
+        // `TEMPLATE_PROMPTS[template]` and puts the literal string "undefined"
+        // into the task tier's system prompt, where it is also persisted and
+        // rendered back into the router's prompt on later turns. Reject rather
+        // than coerce, so the router sees its own mistake.
+        if (!isTaskTier(args.tier)) {
+          return { envelope: { error: `delegate: unknown tier "${String(args.tier)}"; use ${TASK_TIERS.join(', ')}` } };
+        }
+        if (!isTaskTemplate(args.template)) {
+          return { envelope: { error: `delegate: unknown template "${String(args.template)}"; use ${TASK_TEMPLATES.join(', ')}` } };
+        }
+        const request: TaskRequest = {
+          tier: args.tier,
+          template: args.template,
+          intent: args.intent,
+          // The user's verbatim message so the task tier sees what the user
+          // actually said, not the conv LLM's paraphrase. Read from the TURN,
+          // not from a field written an LLM stream earlier: one
+          // ConvOrchestrator serves every chat, and that field raced.
+          original_message: turn.userMessage || undefined,
+        };
+
+        // Dispatch produces a result envelope. We notify the caller as the
+        // task moves through its lifecycle via the registry subscription.
+        const unsub = this.registry.subscribe(rec => {
+          if (rec.status === 'running' && rec.id) {
+            onTaskEvent?.({ type: 'task_started', record: rec });
+          }
+        });
+        try {
+          const envelope = await this.dispatcher.dispatch(request, turn);
+          const rec = this.registry.get(envelope.task_id);
+          if (rec) {
+            if (envelope.status === 'completed') {
+              onTaskEvent?.({ type: 'task_completed', record: rec, envelope });
+            } else if (envelope.status === 'failed') {
+              onTaskEvent?.({ type: 'task_failed', record: rec, envelope });
+            } else if (envelope.status === 'cancelled') {
+              onTaskEvent?.({ type: 'task_cancelled', record: rec, envelope });
+            }
+          }
+          // Only report an id the registry actually knows. A dispatch can be
+          // refused before a record exists (a scoped turn with no verbatim
+          // user message), and its placeholder id must not end up in
+          // `tasksRun` as though a task had run.
+          return rec ? { envelope, taskId: envelope.task_id } : { envelope };
+        } finally {
+          unsub();
+        }
+      }
+
+      case CONV_TOOL_NAMES.check_task: {
+        const id = (call.arguments as { task_id?: string }).task_id;
+        if (!id) return { envelope: { error: 'check_task requires task_id' } };
+        const rec = this.registry.get(id);
+        if (!rec) return { envelope: { error: `task ${id} not found` } };
+        // Same rule as `resume_task`: the id is model-chosen against a
+        // process-global registry shared by every chat and channel, and the
+        // reply carries the task's intent and result summary. A site task's
+        // summary can hold project file content read through a framed tool, so
+        // "not found" is the right answer for another chat's task rather than a
+        // status line (#571). Indistinguishable from a genuinely unknown id, on
+        // purpose.
+        if (!this.sameContext(rec, turn)) return { envelope: { error: `task ${id} not found` } };
+        return {
+          envelope: {
+            task_id: rec.id,
+            status: rec.status,
+            elapsed_ms: Date.now() - rec.startedAt,
+            summary: rec.result?.summary ?? null,
+          },
+        };
+      }
+
+      case CONV_TOOL_NAMES.cancel_task: {
+        const id = (call.arguments as { task_id?: string }).task_id;
+        if (!id) return { envelope: { error: 'cancel_task requires task_id' } };
+        // One chat's router must not be able to abort another chat's work.
+        const target = this.registry.get(id);
+        if (target && !this.sameContext(target, turn)) {
+          return { envelope: { error: `task ${id} not found` } };
+        }
+        const ok = this.registry.abort(id);
+        return { envelope: { task_id: id, cancelled: ok } };
+      }
+
+      case CONV_TOOL_NAMES.resume_task: {
+        const args = call.arguments as { task_id?: string; input?: string };
+        if (!args.task_id || !args.input) {
+          return { envelope: { error: 'resume_task requires task_id and input' } };
+        }
+        const targetId = args.task_id;
+        // Subscribe to registry transitions so the UI sees `task_started`
+        // when the resume re-enters the running state (mirrors delegate's
+        // intermediate-event behavior). Filter by task_id so we only fire
+        // for OUR task even if other tasks transition concurrently.
+        const unsub = this.registry.subscribe((rec) => {
+          if (rec.id === targetId && rec.status === 'running') {
+            onTaskEvent?.({ type: 'task_started', record: rec });
+          }
+        });
+        try {
+          // The resuming turn's scope goes in too; the dispatcher unions it
+          // with the one recorded on the task, so resuming a site task from
+          // the main chat (or the reverse) cannot widen either.
+          const envelope = await this.dispatcher.resume(targetId, args.input, turn);
+          const rec = this.registry.get(envelope.task_id);
+          if (rec) {
+            if (envelope.status === 'completed') {
+              onTaskEvent?.({ type: 'task_completed', record: rec, envelope });
+            } else if (envelope.status === 'failed') {
+              onTaskEvent?.({ type: 'task_failed', record: rec, envelope });
+            } else if (envelope.status === 'cancelled') {
+              onTaskEvent?.({ type: 'task_cancelled', record: rec, envelope });
+            }
+            // needs_input again - the task paused with a SECOND question. The
+            // conv LLM will see this envelope and ask again. The registry
+            // transition already fired through the subscription above (the
+            // task went running -> needs_input).
+          }
+          return { envelope, taskId: envelope.task_id };
+        } finally {
+          unsub();
+        }
+      }
+
+      default:
+        return { envelope: { error: `unknown tool: ${call.name}` } };
+    }
+  }
+
+  /**
+   * Build the STATIC half of the conversation tier's tight system prompt:
+   * persona + role + delegation catalog + style. Byte-stable across turns
+   * (depends only on `this.persona`), so callers mark it as a prompt-cache
+   * boundary. Goal: keep static + dynamic together under ~1500 tokens.
+   */
+  private buildStaticSystemPrompt(): string {
+    const parts: string[] = [];
+
+    parts.push('# Persona');
+    parts.push(this.persona);
+    parts.push('');
+
+    parts.push('# Your Role');
+    parts.push(
+      'You are the conversation layer. You own dialogue tone and routing decisions. ' +
+      'You do NOT do real work yourself. For anything beyond small talk, you call the ' +
+      '`delegate` tool to send the work to a task tier that has access to all of pipo\'s ' +
+      'real tools (workflows, browser, file ops, vault, calendar, commitments, goals, etc.).',
+    );
+    parts.push('');
+
+    parts.push('# CRITICAL: You have NO direct knowledge of pipo state');
+    parts.push(
+      'You do not know what workflows exist, what files are in the vault, what commitments ' +
+      'are scheduled, what goals are active, what was built earlier, what the user\'s ' +
+      'calendar looks like, or any other live state. The chat history shows what was ' +
+      'discussed, NOT what is true. To answer any question about real state, you MUST ' +
+      'delegate so the task tier can look it up with tools.',
+    );
+    parts.push('');
+    parts.push('Examples of questions you MUST delegate (not answer from your own knowledge):');
+    parts.push('- "What workflows do I have?"');
+    parts.push('- "What pieces are in the workflow we just made?"');
+    parts.push('- "What did you just create?" / "Show me the steps"');
+    parts.push('- "What\'s on my calendar today?"');
+    parts.push('- "Read me the latest research notes"');
+    parts.push('- Anything asking for SPECIFICS about real state, even if the result envelope summary mentioned it briefly');
+    parts.push('');
+    parts.push(
+      'It IS fine to ask the user for clarifying info when something is genuinely ' +
+      'ambiguous (e.g., which person they mean by "Sarah"). Just don\'t use ' +
+      'clarification as a way to dodge delegating something the tools could answer.',
+    );
+    parts.push('');
+
+    parts.push('# Delegation Catalog');
+    parts.push('Use the `delegate` tool when:');
+    parts.push('- The user asks you to FIND or LOOK UP something - tier=medium, template=research');
+    parts.push('- The user asks about real pipo state (existing workflows, files, vault, calendar) - tier=medium, template=general');
+    // Authoring a workflow is not the same errand as reading one. Without its
+    // own row, "automate my mornings" matches the state row and the
+    // tool-execution catch-all below (both medium), or the PLAN row -- whose
+    // template makes the task agent write a prose plan instead of calling
+    // manage_workflow at all. Placed before every row it would otherwise lose
+    // to. "composing it again" rather than "editing": manage_workflow has no
+    // edit action, so changing what a flow does means composing a new one.
+    parts.push('- The user asks to BUILD a workflow, or to change what one does by composing it again ("automate X", "make a workflow that ...") - tier=high, template=general');
+    parts.push('- The user asks you to WRITE or REFACTOR code - tier=medium, template=code');
+    parts.push('- The user asks for a PLAN, schedule, or decomposition - tier=high, template=plan');
+    parts.push('- The user asks to DRAFT prose (email, doc, summary) - tier=medium, template=write');
+    parts.push('- The user asks for complex multi-step reasoning - tier=high, template=general');
+    parts.push('- Anything needing real tool execution or live state lookup - tier=medium, template=general');
+    parts.push('');
+    parts.push("Do NOT delegate when:");
+    parts.push('- The user is making small talk (greeting, thanks, mood)');
+    parts.push('- The user is clarifying or cancelling an in-flight task (use check_task / cancel_task)');
+    parts.push('- The user asks who you are / what you can do / how pipo works (general capabilities, not specifics)');
+    parts.push('');
+
+    parts.push('# Handling paused tasks');
+    parts.push(
+      'When the `delegate` tool returns an envelope with `status: "needs_input"`, ' +
+      'the task tier paused because it needs more info from the user. The envelope ' +
+      'has a `needs_input.question` field with the specific question. You should:',
+      '1. Ask the user that exact question (verbalize it naturally; don\'t change the meaning).',
+      '2. When the user replies, call `resume_task` with the task_id and the user\'s reply ' +
+      '   as `input`. Do NOT delegate again - resume reuses the work the task tier already did.',
+      '3. The resume returns a new envelope - completed, failed, or another needs_input (if ' +
+      '   the task needs another round of clarification).',
+      '',
+    );
+
+    parts.push('# Style');
+    parts.push(
+      'Speak naturally and concisely.',
+      '',
+      'IMPORTANT - acknowledgment while delegating:',
+      'When you call the `delegate` tool, you MUST also output a short, ' +
+      'context-aware acknowledgment sentence in the same response (alongside ' +
+      'the tool call). The user sees this immediately while the task runs ' +
+      'in the background, so it should be specific to what they asked - not ' +
+      'a generic "working on it". Examples:',
+      '- For research: "Pulling up the top CRMs for solo founders now - one moment."',
+      '- For code: "Let me read the file first and figure out where to make the change."',
+      '- For planning: "I\'ll sketch out the workflow steps - back shortly with a plan."',
+      '',
+      'IMPORTANT - verbalizing task results:',
+      'When a task completes you receive a result envelope with a `summary`. ' +
+      'Your verbalization MUST be faithful to that summary - report what the ' +
+      'task tier actually did/found, not what you think the answer should be. ' +
+      'Do NOT substitute your own knowledge. Do NOT invent details that aren\'t ' +
+      'in the summary. If the summary mentions pipo features (workflows, ' +
+      'commitments, goals), say so - do not suggest generic alternatives like ' +
+      '"you could write a Python script" when the task already used a pipo ' +
+      'tool. If the task failed or returned poor output, tell the user briefly ' +
+      'and offer to retry rather than papering over it with your own guess.',
+    );
+
+    return parts.join('\n');
+  }
+
+  /**
+   * Build the DYNAMIC half of the conversation tier's system prompt: user
+   * identity, in-flight task state, recent results, ambient facts. Changes
+   * every turn, so it must be rendered AFTER the static half and never be
+   * marked as a cache boundary.
+   */
+  private buildDynamicSystemPrompt(context: ConvSystemContext, turn: ConvTurn): string {
+    const parts: string[] = [];
+
+    if (context.userIdentity) {
+      parts.push('# User');
+      parts.push(context.userIdentity);
+      parts.push('');
+    }
+
+    // Tasks from ANOTHER chat context are left out entirely (#571).
+    //
+    // The TaskRegistry is a single process-global instance shared by every
+    // chat and channel, and both blocks below render `request.intent` and the
+    // FULL `result.summary` into the dynamic system prompt of every conv turn.
+    // A site task's summary can contain project file content that was read
+    // through the framed `site_read_file` and then passed through the low-tier
+    // summarizer, which does not preserve the untrusted framing -- so it
+    // landed, unframed, in the telegram chat's router prompt, and in another
+    // PROJECT's chat too. Now that records carry the chat that created them,
+    // matching it is the cheap half of the fix. (The framing half is noted in
+    // actions/tools/tool-scope.ts and is not this change.)
+    // One rule, one definition: the same predicate `check_task`,
+    // `cancel_task` and `resume_task` use.
+    const mine = (t: TaskRecord) => this.sameContext(t, turn);
+
+    // In-flight tasks
+    const inFlight = this.registry.inFlight().filter(mine);
+    if (inFlight.length > 0) {
+      parts.push('# In-flight Tasks');
+      for (const t of inFlight) {
+        const elapsed = Math.round((Date.now() - t.startedAt) / 1000);
+        parts.push(`- ${t.id} (${t.status}, ${elapsed}s, ${t.request.template}): ${t.request.intent}`);
+      }
+      parts.push('');
+    }
+
+    // Last task results - shown in full so the conv LLM has the IDs/names
+    // it needs to verbalize follow-ups. Even with the full summary, ANY
+    // request for specifics not already in the summary MUST be delegated
+    // (see "CRITICAL: You have NO direct knowledge" in the static half).
+    // Predicate BEFORE the limit: five of MY results, not the five newest
+    // across every chat with the other chats' then dropped.
+    const recent = this.registry.recentResults(5, mine);
+    if (recent.length > 0) {
+      parts.push('# Recent Task Results');
+      for (const t of recent) {
+        if (!t.result) continue;
+        parts.push(`## Task ${t.id} - ${t.request.template} (${t.status})`);
+        parts.push(`User asked: ${t.request.intent}`);
+        parts.push(`Result:`);
+        parts.push(t.result.summary);
+        parts.push('');
+      }
+    }
+
+    if (context.ambientFacts) {
+      parts.push('# Ambient State');
+      parts.push(context.ambientFacts);
+      parts.push('');
+    }
+
+    // Keyed on the SCOPE alone, and never on `siteContext`.
+    //
+    // `scope` is what means "this chat is bound to one project": it is set
+    // from `projectId` alone, even when the site service could not resolve the
+    // project and so produced no site block (#570), so it is both necessary
+    // and sufficient. `siteContext` is not -- it is whatever extra system
+    // context the caller has, and two production callers pass something that
+    // is not a project block at all: the MAIN dashboard chat passes the
+    // multi-project list (ws-service.ts) and the pebble passes its panel
+    // context (daemon/index.ts), both with no scope. Keying on it as well told
+    // every main-chat and every pebble turn on a hosted install that it was
+    // bound to a single Site Builder project, and the note names a routing
+    // decision, so it was a false instruction that also steered routing.
+    //
+    // Note for anyone later "fixing" routing by moving this into the user
+    // message: `windowedParts` (tool-relevance/selection.ts) skips system
+    // messages, so this sentence is invisible to the relevance filter. In a
+    // user message it would not be, and its site vocabulary would start
+    // matching trigger groups on every turn of the chat.
+    if (turn.scope) {
+      parts.push('# This Chat');
+      parts.push(SITE_CHAT_ROUTING_NOTE);
+      parts.push('');
+    }
+
+    return parts.join('\n');
+  }
+}

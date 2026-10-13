@@ -1,0 +1,949 @@
+/**
+ * Sub-Agent Runner — Generic LLM+Tool Loop
+ *
+ * Runs any AgentInstance through the LLM+tool execution loop.
+ * Mirrors orchestrator.processMessage() but parameterized on agent
+ * instead of hardcoded to primary. Supports progress callbacks for
+ * real-time streaming to clients.
+ *
+ * A tool call the gate says needs approval has two honest answers. Without a
+ * governed dispatch there is nobody to hold the approval, so the call is
+ * denied and audited as needing approval. With one, the dispatch decides:
+ * it can run the tool under an approval it already holds, report a denial
+ * or a failure, or pause. A pause ends this run before any effect, and the
+ * caller keeps the message log so a later run can resume exactly where it
+ * stopped. A caller can also checkpoint after every completed turn and
+ * resume from there when nothing was pending.
+ */
+
+import type { AgentInstance } from './agent.ts';
+import type { LLMManager } from '../llm/manager.ts';
+import type { ContentBlock, LLMMessage, LLMResponse, LLMToolCall, LLMTool } from '../llm/provider.ts';
+import { guardImageSize } from '../llm/provider.ts';
+import { ToolRegistry, isToolResult, type ToolDefinition } from '../actions/tools/registry.ts';
+import { checkpointExecution } from '../actions/execution-scope.ts';
+import type { TierMap } from '../llm/tiers.ts';
+import type { LLMProviderEntry } from '../config/types.ts';
+import { decideTools } from '../actions/tools/tool-relevance/filter.ts';
+import { DISCOVER_TOOLS, ToolExposureLedger } from '../actions/tools/tool-relevance/ledger.ts';
+import {
+  admissionAuditName, interceptDiscovery, interceptOffList, DISCOVER_TOOLS_LLM, type DiscoveryContext,
+} from '../actions/tools/tool-relevance/discover.ts';
+import { getToolFilterPolicy } from '../actions/tools/tool-relevance/policy.ts';
+import { isInvariantTrigger } from '../actions/tools/tool-relevance/authority-classes.ts';
+import { toolDefToLLMTool, BUILTIN_TOOLS } from '../actions/tools/builtin.ts';
+import { withTemplateDeliveryScope } from '../actions/tools/template-delivery-scope.ts';
+import type { ActionCategory } from '../roles/authority.ts';
+import type { AuthorityEngine, AuthorityProfile } from '../authority/engine.ts';
+import type { AuditTrail } from '../authority/audit.ts';
+import type { EmergencyController } from '../authority/emergency.ts';
+import { freezeToolArguments, getActionForTool, resolveToolGate, substituteAboveLevel } from '../authority/tool-action-map.ts';
+import { combineDecisions } from '../authority/engine.ts';
+import { markUntrustedToolResult, markUntrustedToolBlocks, markUntrustedToolFailure, isTaintSourceTool, splitToolReturn } from '../roles/untrusted.ts';
+import { ActionOutcomeError } from '../actions/action-outcome.ts';
+import { mergeProfiles, taintProfile, type TaintGating } from '../authority/taint-gating.ts';
+
+const MAX_TOOL_ITERATIONS = 100; // Lower than primary's 200 — sub-agents should be focused
+const MAX_TOOL_RESULT_CHARS = 6000;
+
+/**
+ * Why the loop ended. `completed` is the happy path (LLM stopped requesting
+ * tools). `max_iterations` means we exhausted the iteration cap with the
+ * model still asking for tools -- callers should treat the answer as
+ * partial. `error` is set when an exception escaped the loop. `paused`
+ * means a governed tool call is waiting on an approval; nothing ran for it
+ * and `paused` on the result says what is waiting. Surfacing this lets
+ * workflow callers (pipo-agent.delegate) map directly to the piece's
+ * status field instead of inferring from `success` + `response`.
+ */
+export type SubAgentTerminationReason = 'completed' | 'max_iterations' | 'error' | 'paused';
+
+/** A durable approval the caller will wait on before the paused tool can run. */
+export type SubAgentApprovalRef = { effectId: string; approvalId: string; waitpointId: string };
+
+/** The identity the gate judged a call with; the dispatch judges it with the same one. */
+export type SubAgentPrincipal = {
+  agentId: string;
+  agentRoleId: string;
+  agentAuthorityLevel: number;
+  /** The parent's restrictions merged with this run's taint at the time of the call. */
+  profile: AuthorityProfile | null;
+};
+
+export type GovernedToolCall = {
+  toolCall: LLMToolCall;
+  /** Position of this call in the whole run, first call is 1; stable across a resume. */
+  sequence: number;
+  actionCategory: ActionCategory;
+  toolCategory: string;
+  principal: SubAgentPrincipal;
+  /** Why the gate required approval. */
+  reason: string;
+};
+
+export type GovernedToolResult =
+  | { kind: 'executed'; result: string }
+  /** The dispatch ran the tool, or found its record, and it failed. */
+  | { kind: 'failed'; result: string }
+  | { kind: 'denied'; reason: string }
+  | { kind: 'paused'; approval: SubAgentApprovalRef };
+
+/**
+ * Dispatch for a tool call the gate says needs approval. It owns the
+ * approval: it may run the tool under one it already holds, report that the
+ * user declined or that the run failed, or pause the run at a durable
+ * waitpoint. It is asked again for the same call on resume and must then
+ * answer from what was decided.
+ */
+export type GovernedToolDispatch = (call: GovernedToolCall) => Promise<GovernedToolResult>;
+
+/** An error the dispatch raised, as opposed to the model or the loop. */
+export class GovernedDispatchError extends Error {
+  override readonly name = 'GovernedDispatchError';
+  constructor(message: string, readonly raised: unknown) { super(message); }
+}
+
+export type SubAgentPause = GovernedToolCall & {
+  approval: SubAgentApprovalRef;
+  /** Tool calls from the same assistant turn that were not reached. */
+  remaining: LLMToolCall[];
+  /** The loop iteration the pause happened in; resume continues after it. */
+  iteration: number;
+  /**
+   * The tool names the model was OFFERED when it chose this batch. On resume
+   * `remaining` is checked against this, not against a set recomputed from
+   * the checkpoint: the recomputed one already reflects the model's own text
+   * and any `discover_tools` admission from the same batch, so a shell the
+   * model picked while it was hidden would read as offered and run. The
+   * live loop refuses that batch; the resume must too.
+   *
+   * Absent on a checkpoint written before this field existed. That is read
+   * as "nothing was offered", so every remaining call goes through the
+   * off-list check and a trigger is refused -- those calls were never
+   * checked at all when they were queued.
+   */
+  offered?: string[];
+};
+
+/** The state a caller keeps between turns, and everything a paused run needs to continue later. */
+export type SubAgentCheckpoint = {
+  messages: LLMMessage[];
+  toolsUsed: string[];
+  tokensUsed: { input: number; output: number };
+  sequence: number;
+  /** The next loop iteration to run when nothing is pending. */
+  iteration: number;
+  /** Outside content the run had read; restored so a resumed agent stays gated. */
+  taint: string[];
+  /** Tool call ids whose result was a failure, denial or refusal. */
+  failedToolCalls: string[];
+};
+
+export type SubAgentResume = SubAgentCheckpoint & {
+  /** Present when the run paused on a governed call; absent to continue after a completed turn. */
+  pending?: SubAgentPause;
+};
+
+export type SubAgentResult = {
+  success: boolean;
+  response: string;
+  toolsUsed: string[];
+  tokensUsed: { input: number; output: number };
+  terminationReason: SubAgentTerminationReason;
+  /**
+   * Full message log of the sub-agent's run -- system prompt, the user task,
+   * every intermediate `assistant` message (with `tool_calls` when the LLM
+   * requested any), every `tool` result message, and the final assistant
+   * answer. Callers that need a tool-call trace (the workflow piece's
+   * `pipo-agent.delegate`) walk this array instead of `agent.getMessages()`,
+   * which only sees the simple user/assistant turns. Returned even on error.
+   */
+  messages: LLMMessage[];
+  /** Tool calls dispatched so far in this run, including a paused one. Absent from results built elsewhere. */
+  sequence?: number;
+  /** Tool call ids whose result was a failure, denial or refusal, so a trace need not guess from text. */
+  failedToolCalls?: string[];
+  /** Outside content the run read. */
+  taint?: string[];
+  /** Set when `terminationReason` is `paused`. */
+  paused?: SubAgentPause;
+  /** Set on `error` when the governed dispatch raised it, not the model or the loop. */
+  dispatchError?: boolean;
+  /** The enclosing execution was cancelled between turns; nothing more started. */
+  canceled?: boolean;
+};
+
+export type ProgressCallback = (event: {
+  type: 'text' | 'tool_call' | 'done';
+  agentName: string;
+  agentId: string;
+  data: unknown;
+}) => void;
+
+export type RunSubAgentOptions = {
+  agent: AgentInstance;
+  task: string;
+  context: string;
+  llmManager: LLMManager;
+  toolRegistry: ToolRegistry;
+  /**
+   * Provider entries from the post-DB-merge `llm` config, for the tool
+   * filter's model-class gate. Absent means the classifier reads a
+   * provider's KIND from its NAME, which is right for the canonical
+   * entries and fails closed (ineligible, so unfiltered) for custom-named
+   * ones -- so a custom-named ollama instance simply never filters here.
+   */
+  toolFilterProviders?: Record<string, LLMProviderEntry | undefined>;
+  onProgress?: ProgressCallback;
+  maxIterations?: number;
+  // Authority engine components (optional — if not provided, no gate applied)
+  authorityEngine?: AuthorityEngine;
+  auditTrail?: AuditTrail;
+  emergencyController?: EmergencyController;
+  temporaryGrants?: Map<string, ActionCategory[]>;
+  /** The parent's effective profile (static + taint); tighten-only. */
+  profile?: AuthorityProfile | null;
+  /** Taint gating for what the sub-agent itself reads during its run. */
+  taintGating?: TaintGating | null;
+  /** Holds approvals for governed tool calls. Absent: such calls are denied. */
+  governedTools?: GovernedToolDispatch;
+  /** Called after every completed tool turn with the state a later run could continue from. */
+  onTurn?: (state: SubAgentCheckpoint) => void;
+  /** Continue a run from its saved state instead of starting one. */
+  resume?: SubAgentResume;
+};
+
+/**
+ * Build a system prompt for a sub-agent from its role definition.
+ */
+/**
+ * Sub-agent system prompt, split at the prompt-cache boundary. The static
+ * half depends only on the role, so across a sub-agent's loop iterations
+ * (and across runs of the same role within the cache TTL) the provider can
+ * serve tools + static prompt from cache. The per-task `context` rides on
+ * the dynamic half.
+ */
+function buildSubAgentPromptParts(agent: AgentInstance, context: string): { static: string; dynamic: string } {
+  const role = agent.agent.role;
+
+  const staticParts = [
+    `You are ${role.name}.`,
+    '',
+    role.description,
+    '',
+    '## Your Responsibilities',
+    ...role.responsibilities.map(r => `- ${r}`),
+    '',
+    '## Rules',
+    '- Focus on completing the specific task assigned to you.',
+    '- Use your tools to accomplish the task — don\'t just describe what you would do.',
+    '- Be thorough but efficient. Don\'t do unnecessary work.',
+    '- Return a clear, structured result when done.',
+  ];
+
+  return {
+    static: staticParts.join('\n'),
+    dynamic: context ? ['## Context', context].join('\n') : '',
+  };
+}
+
+/**
+ * Get LLM-formatted tools from a scoped ToolRegistry, with the relevance
+ * filter applied.
+ *
+ * This site matters more than it looks. The scoped registry for the DEFAULT
+ * delegation target, `research-analyst`, is `[browser, terminal, file-ops]`
+ * -- all ten browser tools plus `run_command`, `read_file`, `write_file` and
+ * `list_directory`. That is precisely the "drop the browser group, keep the
+ * shell" shape #475 was rejected for, so the coupling invariant is more
+ * load-bearing here than on the main agent, not less.
+ *
+ * Note the other direction too: some scoped registries have no framed
+ * perception tool at all (`software-engineer` is terminal + file-ops). The
+ * invariant is quantified over what the call site registered, so retaining
+ * the shell there is that agent's status quo rather than a regression -- and
+ * the filter must never add a tool the registry does not contain.
+ */
+/**
+ * The tier map, if this manager has one.
+ *
+ * The filter must never be able to break a call site. Embedded and test
+ * callers pass a minimal LLM manager stub with only `chatTier` on it, and an
+ * unguarded `llmManager.getTierMap()` turns "no optimisation" into "the
+ * sub-agent throws before its first turn". An absent map means no tier
+ * resolves, which the eligibility gate reads as ineligible -- unfiltered,
+ * which is the correct fallback.
+ */
+function tierMapOf(manager: LLMManager): TierMap {
+  const fn = (manager as Partial<LLMManager>).getTierMap;
+  if (typeof fn !== 'function') return {};
+  try {
+    return fn.call(manager) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function getLLMTools(
+  registry: ToolRegistry,
+  messages: readonly LLMMessage[],
+  ledger: ToolExposureLedger,
+  tiers: TierMap,
+  providers: Record<string, LLMProviderEntry | undefined> | undefined,
+): { llm: LLMTool[] | undefined; exposed: ReadonlySet<string>; engaged: boolean } {
+  if (registry.count() === 0) return { llm: undefined, exposed: new Set(), engaged: false };
+  const all = registry.list();
+  const decision = decideTools({
+    all,
+    messages,
+    ledger,
+    // The sub-agent loop always runs on the medium tier (see chatTier below).
+    tier: 'medium',
+    tiers,
+    providers,
+  });
+  // DISCOVER_TOOLS_LLM rather than the converted definition:
+  // toolDefToLLMTool drops `items` from an array parameter.
+  const llm = decision.tools.map((t) =>
+    (t.name === DISCOVER_TOOLS ? DISCOVER_TOOLS_LLM : toolDefToLLMTool(t)));
+  return { llm, exposed: decision.exposed, engaged: decision.engaged };
+}
+
+type AuthorityContext = {
+  agent: AgentInstance;
+  engine: AuthorityEngine;
+  auditTrail?: AuditTrail;
+  emergencyController?: EmergencyController;
+  temporaryGrants?: Map<string, ActionCategory[]>;
+  profile?: AuthorityProfile | null;
+  taintGating?: TaintGating | null;
+  /** Outside content the sub-agent read so far in this run. */
+  taint: Set<string>;
+  governedTools?: GovernedToolDispatch;
+};
+
+/** The enclosing execution scope refused to let another action start. */
+class SubAgentCanceled extends Error {
+  constructor(readonly raised: unknown) { super(raised instanceof Error ? raised.message : String(raised)); this.name = 'SubAgentCanceled'; }
+}
+
+/**
+ * `blocks` is set for a multi-modal result (#709) and is what the model is sent;
+ * `text` is then its log line. Everything else is text only.
+ */
+type ToolDispatch =
+  | { text: string; failed?: boolean; blocks?: ContentBlock[] }
+  | { paused: Omit<SubAgentPause, 'remaining' | 'iteration'> };
+
+/**
+ * What an image block becomes once the model has answered the turn that showed
+ * it (#709). Same rule as the primary agent's history (`releaseImagePayloads` in
+ * agents/agent.ts): a screenshot is up to 5 MB of base64 and is needed for
+ * exactly one provider call.
+ */
+const RELEASED_IMAGE_TEXT = '[image from an earlier step - no longer available; take a new screenshot if you need to see the screen again]';
+
+/**
+ * What an image the model has NOT been shown yet becomes in a checkpoint or a
+ * returned result. Those are durable rows (`onTurn`, the delegation repo), so
+ * they never carry base64; and a run that pauses mid-batch -- a screenshot, then
+ * a governed click -- resumes from them, so the model must not be told it saw a
+ * picture it never received.
+ */
+const UNSHOWN_IMAGE_TEXT = '[a screenshot was taken here but could not be kept across a pause; take a new one if you need to see the screen]';
+
+/** Every image still in `messages` has been shown: release it, keeping the block shape. */
+function releaseShownImages(messages: LLMMessage[]): LLMMessage[] {
+  return messages.map((m) => (typeof m.content === 'string' || !m.content.some((b) => b.type === 'image')
+    ? m
+    : { ...m, content: m.content.map((b): ContentBlock => (b.type === 'image' ? { type: 'text', text: RELEASED_IMAGE_TEXT } : b)) }));
+}
+
+/**
+ * The transcript as it is written down or handed back: text only, in the
+ * string shape every consumer of a checkpoint or `SubAgentResult.messages`
+ * reads (`extractToolCallsTrace` in workflows/adapters/m7-agent-delegator.ts
+ * indexes only string tool results, so a block array there read as a call
+ * whose response never landed). Any image still present is one the model has
+ * not seen, because `releaseShownImages` runs after every provider call.
+ */
+function durableMessages(messages: LLMMessage[]): LLMMessage[] {
+  return messages.map((m) => (typeof m.content === 'string'
+    ? m
+    : { ...m, content: m.content.map((b) => (b.type === 'text' ? b.text : UNSHOWN_IMAGE_TEXT)).join('\n') }));
+}
+
+const denialText = (name: string, reason: string) =>
+  `[APPROVAL DENIED] ${name}: ${reason} Do not retry the action; report that it was not performed.`;
+
+/**
+ * The outside half of a tool return, capped. Any repo-authored trailer the tool
+ * handed over out of band comes back separately so the caller can place it after
+ * the closing delimiter -- see `splitToolReturn` in roles/untrusted.ts.
+ *
+ * The cap bounds the outside half only; a trailer is repo-authored and bounded
+ * by its template.
+ */
+function boundedResult(raw: unknown): { text: string; trailer: string } {
+  const { outside, trailer } = splitToolReturn(raw);
+  let result = outside;
+  if (result.length > MAX_TOOL_RESULT_CHARS) {
+    result = result.slice(0, MAX_TOOL_RESULT_CHARS) + `\n... (truncated, was ${result.length} chars)`;
+  }
+  return { text: result, trailer };
+}
+
+/**
+ * Turn the dispatch's answer for a governed call into the tool's result.
+ *
+ * `outsideFailure` is the tool's `failureIsOutsideContent` declaration, passed
+ * in because this function has no registry (#608). It was DEFENCE IN DEPTH when
+ * #608 wired it -- the only flagged tool was on the primary registry alone --
+ * and it is LOAD-BEARING since #629: `desktop_type`, `desktop_press_keys` and
+ * `desktop_screenshot` declare the flag and live in `BUILTIN_TOOLS`, which is
+ * exactly what `createScopedToolRegistry` builds from, so a sub-agent allowed
+ * the `desktop` tools reaches this branch with a flagged tool. The parameter
+ * #608 paid for is what stops that being the original #608 bug verbatim.
+ */
+function governedText(ctx: AuthorityContext, toolCall: LLMToolCall, toolCategory: string, governed: Exclude<GovernedToolResult, { kind: 'paused' }>, outsideFailure = false): { text: string; failed?: boolean } {
+  if (governed.kind === 'denied') return { text: denialText(toolCall.name, governed.reason), failed: true };
+  if (governed.kind === 'failed') {
+    return { text: markUntrustedToolFailure(toolCall.name, toolCategory, governed.result, MAX_TOOL_RESULT_CHARS,
+      outsideFailure === true), failed: true };
+  }
+  if (isTaintSourceTool(toolCall.name, toolCategory)) ctx.taint.add(toolCall.name);
+  const governedBounded = boundedResult(governed.result);
+  return { text: markUntrustedToolResult(toolCall.name, toolCategory, governedBounded.text) + governedBounded.trailer };
+}
+
+/**
+ * Execute a single tool call via a ToolRegistry.
+ * Includes optional authority gate for sub-agents.
+ */
+async function executeTool(
+  registry: ToolRegistry,
+  toolCall: LLMToolCall,
+  sequence: number,
+  authorityCtx?: AuthorityContext,
+): Promise<ToolDispatch> {
+  // The audit row says what happened, so it is written once the outcome is
+  // known: a refusal or a pause with `executed: false`, an execution after
+  // the tool returned. Nothing is recorded as executed before it ran.
+  let audit: ((decision: 'allowed' | 'denied' | 'approval_required', executed: boolean, approvalId?: string) => void) | null = null;
+
+  // Pin what the tool would resolve at run time (a relative file path against
+  // the site chat's cwd), so the gate and a later approved run agree (#522).
+  toolCall = { ...toolCall, arguments: freezeToolArguments(registry.get(toolCall.name), toolCall.arguments) };
+
+  // Authority gate (if engine provided)
+  if (authorityCtx) {
+    const { agent, engine, auditTrail, emergencyController, temporaryGrants, taintGating, taint, governedTools } = authorityCtx;
+    // The parent's restrictions plus whatever this run has read itself: a
+    // browsing specialist that read a page cannot then write or run clean.
+    const profile = mergeProfiles(authorityCtx.profile ?? null, taintProfile(taintGating ?? null, taint));
+
+    // Emergency check
+    if (emergencyController && !emergencyController.canExecute()) {
+      return { text: `[SYSTEM ${emergencyController.getState().toUpperCase()}] Tool execution suspended.`, failed: true };
+    }
+
+    // An unknown name is not a governance decision: dispatch rejects it
+    // anyway, and gating it first turns "that tool does not exist" into
+    // "[AUTHORITY DENIED] ... level 4 is below required 5", which tells a
+    // sub-agent to give up on a capability it actually has.
+    if (!registry.has(toolCall.name)) {
+      return { text: `Error: no tool named "${toolCall.name}" is available.`, failed: true };
+    }
+
+    const tool = registry.get(toolCall.name);
+    const toolCategory = tool?.category ?? 'unknown';
+    const gate = resolveToolGate(tool, toolCall.name, toolCall.arguments);
+    const actionCategory = gate.actionCategory;
+
+    // A call the person must confirm cannot be made by a sub-agent at all.
+    if (gate.confirm === 'always') {
+      auditTrail?.log({
+        agent_id: agent.id,
+        agent_name: agent.agent.role.name,
+        tool_name: toolCall.name,
+        action_category: actionCategory,
+        authority_decision: 'denied',
+        executed: false,
+      });
+      return { text: `[AUTHORITY DENIED] ${toolCall.name} requires the user's confirmation. Sub-agents cannot request approvals directly.`, failed: true };
+    }
+
+    const check = (category: ActionCategory) => engine.checkAuthority({
+      agentId: agent.id,
+      agentAuthorityLevel: agent.agent.authority.max_authority_level,
+      agentRoleId: agent.agent.role.id,
+      toolName: toolCall.name,
+      toolCategory,
+      actionCategory: category,
+      temporaryGrants: temporaryGrants ?? new Map(),
+      profile: profile ?? null,
+    });
+    // The same substitution the orchestrator makes: a gated call whose worst
+    // case is above this agent's level, when the agent clears the tool's
+    // floor, asks for approval instead of being refused (a write to a shell rc
+    // at level 3, #522). Only a pure level shortfall qualifies. Where nobody
+    // can hold an approval (no governedTools) it is still refused below.
+    const decision = substituteAboveLevel(combineDecisions(gate.categories.map(check)), gate, check);
+
+    audit = (authorityDecision, executed, approvalId) => auditTrail?.log({
+      agent_id: agent.id,
+      agent_name: agent.agent.role.name,
+      tool_name: toolCall.name,
+      action_category: actionCategory,
+      authority_decision: authorityDecision,
+      approval_id: approvalId ?? null,
+      executed,
+    });
+
+    if (!decision.allowed) {
+      audit('denied', false);
+      return { text: `[AUTHORITY DENIED] ${toolCall.name}: ${decision.reason}`, failed: true };
+    }
+
+    if (decision.requiresApproval) {
+      if (!governedTools) {
+        // Nobody can hold the approval, so the call is refused. The row says
+        // approval was required and nothing ran.
+        audit('approval_required', false);
+        return { text: `[AUTHORITY DENIED] ${toolCall.name} requires user approval. Sub-agents cannot request approvals directly.`, failed: true };
+      }
+      // The dispatch judges the call with the same identity the gate did,
+      // runs it under its own durable record and audits that dispatch; the
+      // row written here records only the gate's decision.
+      const principal: SubAgentPrincipal = { agentId: agent.id, agentRoleId: agent.agent.role.id,
+        agentAuthorityLevel: agent.agent.authority.max_authority_level, profile: profile ?? null };
+      let governed: GovernedToolResult;
+      try {
+        governed = await governedTools({ toolCall, sequence, actionCategory, toolCategory, principal, reason: decision.reason });
+      } catch (err) {
+        audit('approval_required', false);
+        throw new GovernedDispatchError(err instanceof Error ? err.message : String(err), err);
+      }
+      if (governed.kind === 'paused') {
+        audit('approval_required', false, governed.approval.approvalId);
+        return { paused: { toolCall, sequence, actionCategory, toolCategory, principal, reason: decision.reason, approval: governed.approval } };
+      }
+      audit(governed.kind === 'denied' ? 'denied' : 'approval_required', governed.kind === 'executed');
+      return governedText(authorityCtx, toolCall, toolCategory, governed,
+        tool?.failureIsOutsideContent === true);
+    }
+  }
+
+  try {
+    const raw = await registry.execute(toolCall.name, toolCall.arguments);
+    const category = registry.get(toolCall.name)?.category;
+    if (authorityCtx && isTaintSourceTool(toolCall.name, category)) authorityCtx.taint.add(toolCall.name);
+    audit?.('allowed', true);
+    // A picture (#709), sized and framed the way the orchestrator's direct
+    // path does it. `boundedResult` would JSON-stringify the ToolResult and
+    // cap it, so the model got a 6000-character prefix of base64 instead of
+    // an image.
+    if (isToolResult(raw)) {
+      const blocks = markUntrustedToolBlocks(toolCall.name, category, raw.content.map(guardImageSize));
+      return { text: blocks.map((b) => (b.type === 'text' ? b.text : `[${b.type}]`)).join('\n'), blocks };
+    }
+    const bounded = boundedResult(raw);
+    return { text: markUntrustedToolResult(toolCall.name, category, bounded.text) + bounded.trailer };
+  } catch (err) {
+    audit?.('allowed', false);
+    // Same reasoning as the orchestrator: a typed failure is a tool result.
+    const failing = registry.get(toolCall.name);
+    if (err instanceof ActionOutcomeError) {
+      const category = failing?.category;
+      if (authorityCtx && isTaintSourceTool(toolCall.name, category)) authorityCtx.taint.add(toolCall.name);
+      return { text: markUntrustedToolFailure(toolCall.name, category, err.message, MAX_TOOL_RESULT_CHARS,
+        failing?.failureIsOutsideContent === true), failed: true };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    // And the same for a plain Error on a tool that declares its failures as
+    // outside content (#608). No longer hypothetical, like `governedText` above:
+    // `createScopedToolRegistry` builds from `BUILTIN_TOOLS`, and since #629 the
+    // three flagged desktop tools are in it, so a sub-agent allowed the
+    // `desktop` tools reaches this line with a flagged tool. Every other tool
+    // keeps it unchanged.
+    if (failing?.failureIsOutsideContent === true) {
+      return { text: `Error executing ${toolCall.name}: `
+        + markUntrustedToolFailure(toolCall.name, failing.category, message, MAX_TOOL_RESULT_CHARS, true), failed: true };
+    }
+    return { text: `Error executing ${toolCall.name}: ${message}`, failed: true };
+  }
+}
+
+/**
+ * Run a sub-agent through the full LLM+tool execution loop.
+ *
+ * This is the core engine that powers sub-agent execution.
+ * It works exactly like the primary agent's processMessage() loop
+ * but operates on any AgentInstance with its own scoped tools.
+ */
+export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentResult> {
+  const {
+    agent,
+    task,
+    context,
+    llmManager,
+    toolRegistry,
+    toolFilterProviders,
+    onProgress,
+    maxIterations = MAX_TOOL_ITERATIONS,
+    authorityEngine,
+    auditTrail,
+    emergencyController,
+    temporaryGrants,
+    profile,
+    taintGating,
+    governedTools,
+    onTurn,
+    resume,
+  } = opts;
+
+  // Build authority context if engine provided
+  const authorityCtx: AuthorityContext | undefined = authorityEngine ? {
+    agent,
+    engine: authorityEngine,
+    auditTrail,
+    emergencyController,
+    temporaryGrants,
+    profile,
+    taintGating,
+    taint: new Set<string>(resume?.taint ?? []),
+    governedTools,
+  } : undefined;
+  const taint = authorityCtx?.taint ?? new Set<string>(resume?.taint ?? []);
+
+  const agentName = agent.agent.role.name;
+  const agentId = agent.id;
+
+  /**
+   * Run one tool dispatch inside this spawn's site-playbook delivery scope
+   * (#586).
+   *
+   * PER SPAWN, not per durable delegation: a delegation that pauses for approval
+   * comes back through a fresh `AgentInstance` with a fresh id, so the playbook
+   * can be delivered once more after the resume. That is the harmless direction
+   * (a repeat, not a loss) and it is not worth a durable key to avoid.
+   *
+   * A sub-agent is its own conversation with its own history, but it is NOT its
+   * own tool set: `createScopedToolRegistry` registers the same module-level
+   * BUILTIN_TOOLS objects the chat uses, so it shares the chat's
+   * `globalWebappTemplateDelivery` and its 30-minute memory. Unscoped, a
+   * delegated browse spent the chat model's playbook, and the chat's browse
+   * spent the sub-agent's.
+   *
+   * EVERY dispatch in this function goes through here, and there are two of
+   * them: the per-turn one below, and the resumed paused call, which calls
+   * `governedTools` directly rather than through `executeTool`. Missing the
+   * second would leave exactly the bug this closes, on the path nobody looks
+   * at -- an approved sub-agent call recording its delivery against the chat.
+   */
+  const inDeliveryScope = <T>(fn: () => Promise<T>): Promise<T> =>
+    withTemplateDeliveryScope(`sub-agent:${agentId}`, fn);
+  const toolsUsed: string[] = resume ? [...resume.toolsUsed] : [];
+  const totalUsage = resume ? { ...resume.tokensUsed } : { input: 0, output: 0 };
+  const failedToolCalls: string[] = resume ? [...resume.failedToolCalls] : [];
+  let sequence = resume?.sequence ?? 0;
+
+  // Set the task on the agent
+  agent.setTask(task);
+  agent.activate();
+
+  // A resumed run continues its saved log; a fresh one starts from the
+  // system prompt (static half cache-marked, per-task context dynamic).
+  let messages: LLMMessage[];
+  if (resume) {
+    messages = resume.messages;
+  } else {
+    const systemPrompt = buildSubAgentPromptParts(agent, context);
+    agent.addMessage('user', task);
+    messages = [
+      { role: 'system', content: systemPrompt.static, cache: true },
+      ...(systemPrompt.dynamic ? [{ role: 'system', content: systemPrompt.dynamic } satisfies LLMMessage] : []),
+      ...agent.getMessages(),
+    ];
+  }
+
+  // The sub-agent buffer IS durable -- `state()` captures it whole into the
+  // checkpoint and `resume.messages` restores it -- so the ledger can be
+  // seeded from it and admissions survive a pause.
+  const exposure = new ToolExposureLedger();
+  if (getToolFilterPolicy().enabled) {
+    exposure.seedFromMessages(resume?.messages, (n) => toolRegistry.has(n));
+    // The paused call has no result in the buffer yet, so seeding skipped
+    // it. It was dispatched as far as the governed pause, so it stays
+    // exposed like any other call. Its unreached siblings are not seeded:
+    // they go back through dispatch on resume, checked against the set the
+    // model was offered when it chose them (`SubAgentPause.offered`).
+    if (resume?.pending && toolRegistry.has(resume.pending.toolCall.name)) {
+      exposure.add(resume.pending.toolCall.name);
+    }
+  }
+  let toolSet = getLLMTools(toolRegistry, messages, exposure, tierMapOf(llmManager), toolFilterProviders);
+  let tools = toolSet.llm;
+  let finalText = '';
+  let reachedFinal = false;
+
+  const state = (iteration: number): SubAgentCheckpoint => ({
+    messages: durableMessages(messages), toolsUsed: [...toolsUsed], tokensUsed: { ...totalUsage }, sequence, iteration,
+    taint: [...taint], failedToolCalls: [...failedToolCalls],
+  });
+  const finish = (partial: Pick<SubAgentResult, 'success' | 'response' | 'terminationReason'> & Partial<SubAgentResult>): SubAgentResult => ({
+    toolsUsed: [...new Set(toolsUsed)],
+    tokensUsed: totalUsage,
+    messages: durableMessages(messages),
+    sequence,
+    failedToolCalls: [...failedToolCalls],
+    taint: [...taint],
+    ...partial,
+  });
+
+  // A cancellation is not an agent error: the caller stopped the run and
+  // must not record anything for it.
+  const fence = () => { try { checkpointExecution(); } catch (err) { throw new SubAgentCanceled(err); } };
+
+  const noteToolCall = (tc: LLMToolCall) => {
+    toolsUsed.push(tc.name);
+    if (onProgress) {
+      onProgress({ type: 'tool_call', agentName, agentId, data: { name: tc.name, arguments: tc.arguments } });
+    }
+  };
+
+  const record = (tc: LLMToolCall, dispatched: { text: string; failed?: boolean; blocks?: ContentBlock[] }) => {
+    messages.push({ role: 'tool', content: dispatched.blocks ?? dispatched.text, tool_call_id: tc.id });
+    if (dispatched.failed) failedToolCalls.push(tc.id);
+    console.log(`[SubAgent:${agentName}] Tool ${tc.name} -> ${dispatched.text.slice(0, 100)}...`);
+  };
+
+  /** Dispatch a turn's tool calls in order; a pause returns what was not reached. */
+  /** Set when an admission, or a call to a hidden tool, widened the exposed set. */
+  let exposureWidened = false;
+
+  /** Recompute the offered set after a widening, and only after one. */
+  const refreshToolsIfWidened = () => {
+    if (!exposureWidened) return;
+    exposureWidened = false;
+    toolSet = getLLMTools(toolRegistry, messages, exposure, tierMapOf(llmManager), toolFilterProviders);
+    tools = toolSet.llm;
+  };
+
+  /**
+   * `offered` is the set the model saw when it chose `calls`: the live
+   * `toolSet.exposed` on a fresh turn, the checkpointed `pending.offered` on
+   * resume. It is fixed for the whole batch, exactly like the orchestrator's
+   * loops, which hold `decided.exposed` until the batch is done.
+   */
+  const dispatchCalls = async (
+    calls: LLMToolCall[],
+    iteration: number,
+    offered: ReadonlySet<string>,
+  ): Promise<SubAgentPause | null> => {
+    for (let index = 0; index < calls.length; index++) {
+      const tc = calls[index]!;
+      fence();
+      // Filter off: nothing to intercept, and nothing is built for it.
+      const discoveryCtx: DiscoveryContext | null = !getToolFilterPolicy().enabled ? null : {
+        all: toolRegistry.list(),
+        ledger: exposure,
+        exposed: offered,
+        filterEnabled: true,
+        // The same emergency predicate `executeTool` applies below. Without
+        // it a halted system would still enumerate its catalogue here, which
+        // is the one thing this branch skips by sitting before dispatch.
+        haltedState: () =>
+          (authorityCtx?.emergencyController && !authorityCtx.emergencyController.canExecute()
+            ? authorityCtx.emergencyController.getState()
+            : null),
+        onAdmitted: (admitted, via) => {
+          try {
+            authorityCtx?.auditTrail?.log({
+              agent_id: agentId,
+              agent_name: agentName,
+              tool_name: admissionAuditName(admitted, via),
+              action_category: 'read_data',
+              authority_decision: 'allowed',
+              executed: true,
+            });
+          } catch (err) {
+            console.warn(`[SubAgent:${agentName}] could not audit a discover_tools admission:`,
+              err instanceof Error ? err.message : err);
+          }
+        },
+        onRefused: (tool) => {
+          try {
+            authorityCtx?.auditTrail?.log({
+              agent_id: agentId,
+              agent_name: agentName,
+              tool_name: tool.name,
+              action_category: getActionForTool(tool.name, tool.category),
+              authority_decision: 'denied',
+              executed: false,
+            });
+          } catch (err) {
+            console.warn(`[SubAgent:${agentName}] could not audit an off-list refusal:`,
+              err instanceof Error ? err.message : err);
+          }
+        },
+      };
+      // The escape hatch is synthetic and never in the scoped registry, so
+      // it is answered here rather than dispatched. It carries no authority
+      // and touches nothing; admission only widens what the next provider
+      // call is offered, and the coupling invariant is re-checked then.
+      const discovery = discoveryCtx && interceptDiscovery(tc.name, tc.arguments, discoveryCtx);
+      if (discovery) {
+        if (discovery.grew) exposureWidened = true;
+        noteToolCall(tc);
+        sequence += 1;
+        record(tc, { text: discovery.result });
+        continue;
+      }
+      // A tool the scoped registry holds but the model was not offered:
+      // admitted and recomputed, and not run at all if running it would
+      // strand outside content unframed. See interceptOffList.
+      const offList = discoveryCtx && interceptOffList(tc.name, discoveryCtx);
+      if (offList) exposureWidened = true;
+      if (offList?.refusal) {
+        // Not noteToolCall: it did not run, so it is not in `toolsUsed`.
+        sequence += 1;
+        record(tc, { text: offList.refusal });
+        continue;
+      }
+      noteToolCall(tc);
+      sequence += 1;
+      const dispatched = await inDeliveryScope(() => executeTool(toolRegistry, tc, sequence, authorityCtx));
+      if ('paused' in dispatched) {
+        return { ...dispatched.paused, remaining: calls.slice(index + 1), iteration, offered: [...offered] };
+      }
+      // Whatever the sub-agent actually called stays exposed for the rest of
+      // the run -- registered names only, and only while the filter is on.
+      if (getToolFilterPolicy().enabled && toolRegistry.has(tc.name)) exposure.add(tc.name);
+      record(tc, dispatched);
+    }
+    return null;
+  };
+
+  try {
+    let startIteration = resume?.iteration ?? 0;
+    if (resume?.pending) {
+      // The paused call goes back through the same dispatch, which now
+      // answers from the decision that was made; then the rest of its turn.
+      const pending = resume.pending;
+      if (!governedTools || !authorityCtx) throw new Error('Cannot resume a paused sub-agent without a governed tool dispatch');
+      fence();
+      let governed: GovernedToolResult;
+      try {
+        governed = await inDeliveryScope(() => governedTools({ toolCall: pending.toolCall, sequence: pending.sequence,
+          actionCategory: pending.actionCategory, toolCategory: pending.toolCategory, principal: pending.principal,
+          reason: pending.reason }));
+      } catch (err) {
+        throw new GovernedDispatchError(err instanceof Error ? err.message : String(err), err);
+      }
+      if (governed.kind === 'paused') return finish({ success: true, response: '', terminationReason: 'paused', paused: { ...pending, approval: governed.approval } });
+      record(pending.toolCall, governedText(authorityCtx, pending.toolCall, pending.toolCategory, governed,
+        toolRegistry.get(pending.toolCall.name)?.failureIsOutsideContent === true));
+      // A checkpoint written before `offered` existed: if this run's model is
+      // never filtered (the gate, not this turn's text, decides that), it
+      // was offered everything and nothing needs checking. Otherwise what was
+      // offered is unknown, so it is taken to be every tool that is NOT an
+      // invariant trigger: a queued trigger is refused (the framed readers
+      // that are themselves triggers count as hidden), and a queued ordinary
+      // call runs without being logged as an off-list admission it probably
+      // was not. Not "the recomputed set is full": the model's own text can
+      // make it full, which is the B1 bypass again.
+      const legacyOffered = toolSet.engaged
+        ? new Set(toolRegistry.list().filter((t) => !isInvariantTrigger(t)).map((t) => t.name))
+        : toolSet.exposed;
+      const pause = await dispatchCalls(pending.remaining, pending.iteration,
+        pending.offered ? new Set(pending.offered) : legacyOffered);
+      // A turn is durable only while the run is still alive.
+      fence();
+      if (pause) return finish({ success: true, response: '', terminationReason: 'paused', paused: pause });
+      // A discover_tools call inside `pending.remaining` widens the set
+      // here, and the loop below calls the provider immediately. Without
+      // this the admission would only land one provider call later. Masked
+      // today because `seedFromMessages` also parses admissions out of
+      // `resume.messages`, which is exactly the kind of coupling nobody
+      // remembers when they change the other side.
+      refreshToolsIfWidened();
+      startIteration = pending.iteration + 1;
+      onTurn?.(state(startIteration));
+    }
+
+    // Tool execution loop
+    for (let iteration = startIteration; iteration < maxIterations; iteration++) {
+      fence();
+      const llmResponse: LLMResponse = await llmManager.chatTier('medium', 'sub_agent', messages, { tools });
+      fence();
+      // The model has now been shown every image in the transcript (#709).
+      // Replaced, not mutated in place: the request just made held these.
+      const released = releaseShownImages(messages);
+      for (let i = 0; i < released.length; i++) messages[i] = released[i]!;
+
+      totalUsage.input += llmResponse.usage.input_tokens;
+      totalUsage.output += llmResponse.usage.output_tokens;
+
+      if (llmResponse.finish_reason === 'tool_use' && llmResponse.tool_calls.length > 0) {
+        // Add assistant message with tool calls
+        messages.push({
+          role: 'assistant',
+          content: llmResponse.content,
+          tool_calls: llmResponse.tool_calls,
+        });
+
+        // Notify about text if any
+        if (llmResponse.content && onProgress) {
+          onProgress({ type: 'text', agentName, agentId, data: llmResponse.content });
+        }
+
+        const pause = await dispatchCalls(llmResponse.tool_calls, iteration, toolSet.exposed);
+        // A turn is durable only while the run is still alive.
+        fence();
+        if (pause) return finish({ success: true, response: '', terminationReason: 'paused', paused: pause });
+        refreshToolsIfWidened();
+        onTurn?.(state(iteration + 1));
+        continue;
+      }
+
+      // No tool calls — this is the final response
+      finalText = llmResponse.content;
+      reachedFinal = true;
+
+      if (onProgress) {
+        onProgress({ type: 'text', agentName, agentId, data: finalText });
+        onProgress({ type: 'done', agentName, agentId, data: { tokensUsed: totalUsage } });
+      }
+
+      break;
+    }
+
+    // Add final response to agent's history
+    agent.addMessage('assistant', finalText);
+
+    return finish({ success: true, response: finalText, terminationReason: reachedFinal ? 'completed' : 'max_iterations' });
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[SubAgent:${agentName}] Error:`, errorMsg);
+
+    return finish({ success: false, response: `Sub-agent error: ${errorMsg}`, terminationReason: 'error',
+      ...(err instanceof GovernedDispatchError ? { dispatchError: true } : err instanceof SubAgentCanceled ? { canceled: true } : {}) });
+  } finally {
+    agent.idle();
+  }
+}
+
+/**
+ * Create a scoped ToolRegistry for a sub-agent.
+ * Only includes builtin tools whose category is in the allowed list.
+ */
+export function createScopedToolRegistry(allowedCategories: string[]): ToolRegistry {
+  const registry = new ToolRegistry();
+  for (const tool of BUILTIN_TOOLS) {
+    if (allowedCategories.includes(tool.category)) {
+      registry.register(tool);
+    }
+  }
+  return registry;
+}

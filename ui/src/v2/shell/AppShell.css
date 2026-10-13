@@ -1,0 +1,56 @@
+/* v2 shell layout — header · thread+rail · composer
+   Grid areas keep the rail full-height beside the thread+composer column. */
+
+.v2-shell {
+  display: grid;
+  grid-template-columns: 1fr var(--v2-rail-width);
+  grid-template-rows: auto 1fr auto;
+  grid-template-areas:
+    "header   rail"
+    "thread   rail"
+    "composer rail";
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--paper);
+}
+
+.v2-shell__header {
+  grid-area: header;
+  border-bottom: var(--hair);
+}
+
+.v2-shell__thread {
+  grid-area: thread;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.v2-shell__composer {
+  grid-area: composer;
+  border-top: var(--hair);
+}
+
+.v2-shell__rail {
+  grid-area: rail;
+  border-left: var(--hair);
+  background: var(--paper-2);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Shared scene treatment for the human-centered Pipo console. */
+.v2-shell {
+  background: radial-gradient(circle at 24% -12%, color-mix(in srgb, var(--listen) 7%, transparent), transparent 30%), var(--paper);
+}
+.v2-shell__thread { background: linear-gradient(180deg, color-mix(in srgb, var(--paper) 90%, transparent), var(--paper)); }
+.v2-shell__rail { box-shadow: -18px 0 48px -42px rgba(0,0,0,.7); }
+@media (max-width: 760px) {
+  .v2-shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; grid-template-areas: "header" "thread" "composer"; }
+  .v2-shell__rail { display: none; }
+}
+
+.pipo-task-return { position: absolute; z-index: 6; top: 18px; right: 24px; }
+.pipo-task-return button { border: 1px solid var(--rule); border-radius: 999px; padding: 8px 12px; background: color-mix(in srgb, var(--raise) 82%, transparent); color: var(--ink-2); font: 10px/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; cursor: pointer; backdrop-filter: blur(12px); }
+.pipo-task-return button:hover { color: var(--ink); border-color: var(--listen); }

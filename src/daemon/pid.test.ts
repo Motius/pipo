@@ -1,0 +1,577 @@
+import { test, expect, describe, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
+import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, mkdtempSync, rmSync, truncateSync, chmodSync } from 'node:fs';
+import {
+  acquireLock,
+  isLocked,
+  releaseLock,
+  readPid,
+  readLockedPort,
+  writeLockedPort,
+  getPidPath,
+  getLogPath,
+  getLogDir,
+  releaseLockIfUnheld,
+} from './pid.ts';
+
+// The lock lives at `pipo_HOME`/pipo.pid, resolved per call (see
+// pid.ts:daemonRootDir). These tests used to flock the developer's REAL
+// ~/.pipo/pipo.pid, which made them fail whenever anything else held that
+// lock — a pipo daemon running on the dev machine, or a child process leaked
+// by an earlier test file that hadn't been reaped yet. Under full-suite load
+// that showed up as "Child process failed to acquire lock". Point pipo_HOME
+// at a throwaway dir instead, the same seam backup.test.ts uses, so this file
+// owns its lock and can't collide with anything.
+let DATA_DIR: string;
+let LOCK_PATH: string;
+let prevpipoHome: string | undefined;
+
+const PID_MODULE = join(import.meta.dir, 'pid.ts');
+const READY_SIGNAL = join(tmpdir(), 'pipo-test-lock-ready');
+const HOLDER_SCRIPT = join(tmpdir(), 'pipo-test-lock-holder.ts');
+
+function cleanup(): void {
+  releaseLock();
+  try { unlinkSync(READY_SIGNAL); } catch {}
+  try { unlinkSync(HOLDER_SCRIPT); } catch {}
+}
+
+/**
+ * Spawn a child process that acquires the flock and holds it until killed.
+ * Returns once the child has confirmed it holds the lock.
+ *
+ * The child gets this file's isolated pipo_HOME explicitly, so it flocks the
+ * same throwaway path the parent asserts on rather than inheriting whatever the
+ * ambient environment points at.
+ */
+async function spawnLockHolder(): Promise<{ proc: ReturnType<typeof Bun.spawn>; pid: number }> {
+  try { unlinkSync(READY_SIGNAL); } catch {}
+
+  writeFileSync(HOLDER_SCRIPT, `
+import { acquireLock } from ${JSON.stringify(PID_MODULE)};
+import { writeFileSync } from 'node:fs';
+const ok = acquireLock(process.pid);
+writeFileSync(${JSON.stringify(READY_SIGNAL)}, ok ? String(process.pid) : 'FAIL');
+await Bun.sleep(60000);
+`);
+
+  // stderr is piped, not ignored: when the child can't take the lock its reason
+  // (pid.ts logs one) is the only thing that explains the failure, and a bare
+  // "failed to acquire lock" on a CI runner is undebuggable.
+  const proc = Bun.spawn(['bun', HOLDER_SCRIPT], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: { ...process.env, pipo_HOME: DATA_DIR },
+  });
+
+  // MUST be called only after the child has exited: reading the pipe drains it
+  // to EOF, and EOF arrives when the process ends. The holder sleeps 60s, so
+  // reading it while alive blocks for the full minute and turns a fast
+  // lock-acquisition failure into a silent test timeout.
+  const killThenStderr = async (): Promise<string> => {
+    proc.kill();
+    await proc.exited;
+    try { return (await new Response(proc.stderr as ReadableStream).text()).trim(); }
+    catch { return '<no stderr>'; }
+  };
+
+  // 15s, not 5s: the child pays for a cold `bun` start AND the one-time TinyCC
+  // compile of flock.c (pid.ts:getFlock). On a loaded 2-core runner that can
+  // take several seconds on its own, and a timeout here read as a real bug.
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    await Bun.sleep(50);
+    if (!existsSync(READY_SIGNAL)) continue;
+
+    const content = readFileSync(READY_SIGNAL, 'utf-8').trim();
+    if (content === 'FAIL') {
+      const err = await killThenStderr();
+      throw new Error(
+        `Child process failed to acquire lock at ${LOCK_PATH}` +
+        `\n  holder stderr: ${err || '<empty>'}` +
+        `\n  lock currently held by pid: ${isLocked() ?? 'nobody'}`,
+      );
+    }
+    return { proc, pid: parseInt(content, 10) };
+  }
+
+  const err = await killThenStderr();
+  throw new Error(`Timed out waiting for child to acquire lock\n  holder stderr: ${err || '<empty>'}`);
+}
+
+describe('Process Lock Manager', () => {
+  beforeAll(() => {
+    prevpipoHome = process.env.pipo_HOME;
+    DATA_DIR = mkdtempSync(join(tmpdir(), 'pipo-pid-test-'));
+    process.env.pipo_HOME = DATA_DIR;
+    LOCK_PATH = join(DATA_DIR, 'pipo.pid');
+  });
+
+  afterAll(() => {
+    cleanup();
+    if (prevpipoHome === undefined) delete process.env.pipo_HOME;
+    else process.env.pipo_HOME = prevpipoHome;
+    try { rmSync(DATA_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  beforeEach(() => cleanup());
+  afterEach(() => cleanup());
+
+  // ── acquireLock ──────────────────────────────────────────────────
+
+  describe('acquireLock', () => {
+    test('returns true and creates lock file', () => {
+      expect(acquireLock(process.pid)).toBe(true);
+      expect(existsSync(LOCK_PATH)).toBe(true);
+    });
+
+    test('writes PID to lock file', () => {
+      acquireLock(process.pid);
+      const content = readFileSync(LOCK_PATH, 'utf-8').trim();
+      expect(content).toBe(String(process.pid));
+    });
+
+    test('creates ~/.pipo dir if missing', () => {
+      // Dir almost certainly exists already, but acquireLock should not fail
+      expect(acquireLock(process.pid)).toBe(true);
+    });
+
+    test('second acquire in same process returns false', () => {
+      // First fd holds an exclusive flock; second open+flock is denied
+      expect(acquireLock(process.pid)).toBe(true);
+      expect(acquireLock(process.pid)).toBe(false);
+    });
+  });
+
+  // ── isLocked ─────────────────────────────────────────────────────
+
+  describe('isLocked', () => {
+    test('returns null when no lock file exists', () => {
+      expect(isLocked()).toBeNull();
+    });
+
+    test('returns null for stale file (file exists, no lock held)', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '99999');
+      // No flock held — probe should succeed → not locked
+      expect(isLocked()).toBeNull();
+    });
+
+    test('returns PID when lock is held by this process', () => {
+      acquireLock(process.pid);
+      // isLocked opens a second fd; flock is denied because our fd holds it
+      expect(isLocked()).toBe(process.pid);
+    });
+  });
+
+  // ── releaseLock ──────────────────────────────────────────────────
+
+  describe('releaseLock', () => {
+    test('releases lock and removes file', () => {
+      acquireLock(process.pid);
+      expect(existsSync(LOCK_PATH)).toBe(true);
+
+      releaseLock();
+      expect(existsSync(LOCK_PATH)).toBe(false);
+      expect(isLocked()).toBeNull();
+    });
+
+    test('is idempotent — safe to call without prior acquire', () => {
+      releaseLock();
+      releaseLock();
+      releaseLock();
+      // Should not throw
+    });
+
+    test('allows re-acquire after release', () => {
+      expect(acquireLock(process.pid)).toBe(true);
+      releaseLock();
+      expect(acquireLock(process.pid)).toBe(true);
+    });
+
+    test('multiple acquire/release cycles work', () => {
+      for (let i = 0; i < 5; i++) {
+        expect(acquireLock(process.pid)).toBe(true);
+        expect(isLocked()).toBe(process.pid);
+        releaseLock();
+        expect(isLocked()).toBeNull();
+      }
+    });
+  });
+
+  // ── readPid ──────────────────────────────────────────────────────
+
+  describe('readPid', () => {
+    test('returns null when no file exists', () => {
+      expect(readPid()).toBeNull();
+    });
+
+    test('returns PID from file', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '12345');
+      expect(readPid()).toBe(12345);
+    });
+
+    test('trims whitespace', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '  42\n');
+      expect(readPid()).toBe(42);
+    });
+
+    test('returns null for non-numeric content', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, 'not-a-pid');
+      expect(readPid()).toBeNull();
+    });
+
+    test('returns null for empty file', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '');
+      expect(readPid()).toBeNull();
+    });
+
+    test('returns null for zero', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '0');
+      expect(readPid()).toBeNull();
+    });
+
+    test('returns null for negative PID', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '-1');
+      expect(readPid()).toBeNull();
+    });
+  });
+
+  // ── readLockedPort / writeLockedPort ─────────────────────────────
+
+  describe('readLockedPort', () => {
+    test('returns null when no lock file exists', () => {
+      expect(readLockedPort()).toBeNull();
+    });
+
+    test('returns null for legacy PID-only lock file', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '12345');
+      expect(readLockedPort()).toBeNull();
+    });
+
+    test('returns the port from a two-line lock file', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '12345\n9000\n');
+      expect(readLockedPort()).toBe(9000);
+    });
+
+    test('returns null for out-of-range port', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '12345\n99999\n');
+      expect(readLockedPort()).toBeNull();
+    });
+
+    test('returns null for non-numeric port line', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '12345\nabc\n');
+      expect(readLockedPort()).toBeNull();
+    });
+
+    test('readPid still works for two-line format', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '12345\n9000\n');
+      expect(readPid()).toBe(12345);
+    });
+  });
+
+  describe('writeLockedPort', () => {
+    test('is a no-op when no lock is held by this process', () => {
+      // No acquireLock — lockFd is null.
+      writeLockedPort(9000);
+      expect(existsSync(LOCK_PATH)).toBe(false);
+    });
+
+    test('records port alongside PID when lock is held', () => {
+      acquireLock(process.pid);
+      writeLockedPort(9000);
+      const content = readFileSync(LOCK_PATH, 'utf-8');
+      expect(content.split(/\r?\n/)[0]).toBe(String(process.pid));
+      expect(readLockedPort()).toBe(9000);
+      expect(readPid()).toBe(process.pid);
+    });
+
+    test('refuses invalid ports, and says so', () => {
+      // Out loud, not silently. This no-op is half of #550: a quoted
+      // `daemon.port` arrived here as the STRING "8080", nothing was recorded,
+      // and `pipo stop` then fell back to 1846 and signalled an unrelated
+      // listener. The config loader coerces the port now, so reaching this is a
+      // bug upstream and has to be visible in the daemon's log.
+      const refusals: string[] = [];
+      const realError = console.error;
+      console.error = (...args: unknown[]) => { refusals.push(args.map(String).join(' ')); };
+      try {
+        acquireLock(process.pid);
+        writeLockedPort(0);
+        writeLockedPort(70000);
+        writeLockedPort(Number.NaN);
+        // The string case the coercion exists to prevent, which TypeScript
+        // alone cannot: this value comes from YAML.
+        writeLockedPort('8080' as unknown as number);
+      } finally {
+        console.error = realError;
+      }
+
+      expect(readLockedPort()).toBeNull();
+      expect(readPid()).toBe(process.pid);
+      expect(refusals).toHaveLength(4);
+      for (const line of refusals) {
+        expect(line).toContain('Refusing to record');
+        expect(line).toContain('pipo stop');
+      }
+      // Each names the value it refused, NaN as NaN rather than as "null".
+      expect(refusals[0]).toContain('record 0 as');
+      expect(refusals[1]).toContain('70000');
+      expect(refusals[2]).toContain('NaN');
+      expect(refusals[3]).toContain('"8080"');
+    });
+
+    test('overwrites an earlier recorded port', () => {
+      acquireLock(process.pid);
+      writeLockedPort(9000);
+      writeLockedPort(1846);
+      expect(readLockedPort()).toBe(1846);
+    });
+  });
+
+  // ── path getters ─────────────────────────────────────────────────
+
+  describe('path getters', () => {
+    test('getPidPath tracks pipo_HOME', () => {
+      expect(getPidPath()).toBe(join(DATA_DIR, 'pipo.pid'));
+    });
+
+    test('getPidPath falls back to ~/.pipo/pipo.pid with no pipo_HOME', () => {
+      // The path is resolved per call, so unsetting the var mid-test is enough
+      // to exercise the default branch that the isolated DATA_DIR otherwise hides.
+      delete process.env.pipo_HOME;
+      try {
+        expect(getPidPath()).toBe(join(homedir(), '.pipo', 'pipo.pid'));
+      } finally {
+        process.env.pipo_HOME = DATA_DIR;
+      }
+    });
+
+    test('getLogPath returns path and creates logs dir', () => {
+      const logPath = getLogPath();
+      expect(logPath).toBe(join(DATA_DIR, 'logs', 'pipo.log'));
+      expect(existsSync(join(DATA_DIR, 'logs'))).toBe(true);
+    });
+
+    test('getLogDir returns logs directory', () => {
+      expect(getLogDir()).toBe(join(DATA_DIR, 'logs'));
+    });
+
+    test('logs and lock resolve under the SAME root', () => {
+      // The bug this guards: logs were built from homedir() at import time
+      // while the lock honored pipo_HOME, so the daemon locked one root and
+      // logged to another.
+      expect(getLogDir().startsWith(DATA_DIR)).toBe(true);
+      expect(getPidPath().startsWith(DATA_DIR)).toBe(true);
+    });
+
+    test('getLogDir falls back to ~/.pipo/logs with no pipo_HOME', () => {
+      delete process.env.pipo_HOME;
+      try {
+        expect(getLogDir()).toBe(join(homedir(), '.pipo', 'logs'));
+      } finally {
+        process.env.pipo_HOME = DATA_DIR;
+      }
+    });
+  });
+
+  // ── releaseLockIfUnheld ──────────────────────────────────────────
+  //
+  // The guard behind `pipo stop` / `update` / `uninstall`. It must never
+  // unlink a lockfile some process still holds — doing so lets a second daemon
+  // start against the same data dir.
+
+  describe('releaseLockIfUnheld', () => {
+    test('clears a stale lockfile that nobody holds', () => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOCK_PATH, '99999');
+      expect(releaseLockIfUnheld()).toBe(true);
+      expect(existsSync(LOCK_PATH)).toBe(false);
+    });
+
+    test('refuses a held lock whose pid is unreadable', async () => {
+      const { proc } = await spawnLockHolder();
+      try {
+        // acquireLock truncates before writing the pid, so a held lock is
+        // briefly empty. Reproduce that window exactly.
+        truncateSync(LOCK_PATH, 0);
+
+        // isLocked() cannot tell this from "free" — it reads the pid and gets
+        // nothing. This is precisely why the guard must not be built on it.
+        expect(isLocked()).toBeNull();
+
+        expect(releaseLockIfUnheld()).toBe(false);
+        expect(existsSync(LOCK_PATH)).toBe(true);
+      } finally {
+        proc.kill();
+        await proc.exited;
+      }
+    }, 20_000);
+
+    // Root bypasses permission bits, so the unreadable case can't be staged.
+    test.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+      'refuses a lockfile it cannot even open',
+      async () => {
+        const { proc } = await spawnLockHolder();
+        try {
+          chmodSync(LOCK_PATH, 0o000);
+          expect(releaseLockIfUnheld()).toBe(false);
+          expect(existsSync(LOCK_PATH)).toBe(true);
+        } finally {
+          try { chmodSync(LOCK_PATH, 0o644); } catch { /* ignore */ }
+          proc.kill();
+          await proc.exited;
+        }
+      }, 20_000);
+  });
+
+  // ── cross-process locking ────────────────────────────────────────
+
+  describe('cross-process locking', () => {
+    let childProc: ReturnType<typeof Bun.spawn> | null = null;
+
+    afterEach(async () => {
+      if (childProc) {
+        childProc.kill();
+        await childProc.exited;
+        childProc = null;
+      }
+      cleanup();
+    });
+
+    test('isLocked detects lock held by another process', async () => {
+      const { proc, pid } = await spawnLockHolder();
+      childProc = proc;
+
+      const result = isLocked();
+      expect(result).toBe(pid);
+    }, { timeout: 15000 });
+
+    test('acquireLock fails when another process holds lock', async () => {
+      const { proc } = await spawnLockHolder();
+      childProc = proc;
+
+      expect(acquireLock(process.pid)).toBe(false);
+    }, { timeout: 15000 });
+
+    test('lock is released when holder is SIGKILLed', async () => {
+      const { proc } = await spawnLockHolder();
+      childProc = proc;
+
+      // Lock is held
+      expect(isLocked()).not.toBeNull();
+
+      // SIGKILL — OS closes all fds, releasing the flock
+      proc.kill(9);
+      await proc.exited;
+      childProc = null;
+
+      // Lock is now free
+      expect(isLocked()).toBeNull();
+    }, { timeout: 15000 });
+
+    test('can acquire lock after previous holder crashes', async () => {
+      const { proc } = await spawnLockHolder();
+      childProc = proc;
+
+      proc.kill(9);
+      await proc.exited;
+      childProc = null;
+
+      // New instance should succeed immediately
+      expect(acquireLock(process.pid)).toBe(true);
+      expect(readPid()).toBe(process.pid);
+    }, { timeout: 15000 });
+
+    test('lock survives SIGTERM of holder (graceful)', async () => {
+      const { proc, pid } = await spawnLockHolder();
+      childProc = proc;
+
+      // SIGTERM — child exits, OS releases flock
+      proc.kill(15);
+      await proc.exited;
+      childProc = null;
+
+      // Lock freed after process exits
+      expect(isLocked()).toBeNull();
+      expect(acquireLock(process.pid)).toBe(true);
+    }, { timeout: 15000 });
+  });
+
+  // ── native Windows guard (#252) ──────────────────────────────────
+  //
+  // On native Windows the daemon is unsupported and `flock.c` (POSIX-only)
+  // cannot be compiled. The cc() compile must be deferred so importing the
+  // module never crashes before the CLI's platform guard fires, and any
+  // flock path that *is* reached must surface a clear message rather than a
+  // low-level TinyCC `sys/file.h not found` error.
+
+  describe('native Windows guard', () => {
+    const PROBE_SCRIPT = join(tmpdir(), 'pipo-test-win32-probe.ts');
+    const PROBE_HOME = join(tmpdir(), 'pipo-test-win32-home');
+
+    afterEach(() => {
+      try { unlinkSync(PROBE_SCRIPT); } catch {}
+      try { rmSync(PROBE_HOME, { recursive: true, force: true }); } catch {}
+    });
+
+    /** Run a snippet in a child process with `process.platform` faked to win32. */
+    async function runOnFakeWin32(body: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+      writeFileSync(PROBE_SCRIPT, `
+Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+${body}
+`);
+      const proc = Bun.spawn(['bun', PROBE_SCRIPT], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // Isolate from the real ~/.pipo so the probe can't touch a live lock.
+        env: { ...process.env, HOME: PROBE_HOME, USERPROFILE: PROBE_HOME },
+      });
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const exitCode = await proc.exited;
+      return { stdout, stderr, exitCode };
+    }
+
+    // Smoke test only: on a POSIX CI host `<sys/file.h>` exists, so even the
+    // pre-fix eager compile would succeed here — this can only truly fail on
+    // real Windows. The genuine regression guard is the next test.
+    test('importing the module is side-effect-free (smoke)', async () => {
+      const { stdout, stderr, exitCode } = await runOnFakeWin32(`
+await import(${JSON.stringify(PID_MODULE)});
+console.log('IMPORT_OK');
+`);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain('IMPORT_OK');
+      expect(stderr).not.toContain('sys/file.h');
+    }, { timeout: 15000 });
+
+    // Real regression guard: pre-fix, `acquireLock` ran the eager-compiled
+    // flock against the real POSIX libc (no win32 guard existed), so stderr
+    // would NOT contain the support message — this test fails on the old code.
+    test('acquireLock surfaces a clear unsupported message, not a TinyCC error', async () => {
+      const { stderr, exitCode } = await runOnFakeWin32(`
+const { acquireLock } = await import(${JSON.stringify(PID_MODULE)});
+const ok = acquireLock(process.pid);
+console.log('ACQUIRE=' + ok);
+`);
+      expect(exitCode).toBe(0);
+      // The clear, immediate daemon-support message — not a TinyCC header error.
+      expect(stderr).toContain('not compatible with native Windows');
+      expect(stderr).toContain('WSL2 or Docker');
+      expect(stderr).not.toContain('sys/file.h');
+    }, { timeout: 15000 });
+  });
+});

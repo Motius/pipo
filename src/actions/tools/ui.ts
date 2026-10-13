@@ -1,0 +1,512 @@
+/**
+ * UI Tools - the structural-runtime agent surface.
+ *
+ * ui_snapshot / ui_act are the primary perception+action path: an
+ * interactable-first accessibility view with durable refs, and an act
+ * primitive that re-resolves the ref on a fresh capture before dispatching
+ * and then checks a postcondition instead of trusting the action fired. The
+ * legacy desktop and browser tools remain as the low-level escape hatch.
+ *
+ * Authority: ui_snapshot is `read_data`, ui_act is `control_app` - the same
+ * category as desktop_click, because that is what it dispatches to. Both are
+ * registered in src/authority/tool-action-map.ts; both are untrusted-content
+ * sources in src/roles/untrusted.ts, since what they return is element text
+ * straight off a page or an app window.
+ */
+
+import type { ToolDefinition } from './registry.ts';
+import { getSidecarManager, autoTargetForCapability } from './sidecar-route.ts';
+import { captureSurface, type CaptureKind } from '../../structural/surface.ts';
+import { verifyPostcondition, nextHealRung, type Postcondition, type HealRung } from '../../structural/verifier.ts';
+import { resolveRef } from '../../structural/resolver.ts';
+import { recordPerception } from '../../structural/telemetry.ts';
+import type { SemanticNode, SemanticSurface } from '../../structural/types.ts';
+import { uiEffectHints } from '../../authority/ui-intent';
+import { forCard } from '../../util/card-text.ts';
+
+/**
+ * Cap for the two free-text values in `ui_act`'s gate sentence (#631).
+ *
+ * 80, the sibling convention for a value in the MIDDLE of a card sentence
+ * (src/sites/builder-tools.ts states the rule): the 600-char budget is for a
+ * value placed last, where there is nothing after it to impersonate. Both
+ * values here are mid-sentence on purpose -- the warning that UI labels do not
+ * prove what an action will do has to stay after them -- so they take the short
+ * cap, which is the one that stops a value forging an ending.
+ */
+const UI_CARD_VALUE = 80;
+
+/**
+ * One value for the gate sentence: reduced, de-controlled, capped. The control
+ * characters (raw C0, DEL) used to be stripped here, locally, because `forCard`
+ * left them; #659 moved that strip into `forCard` for every caller.
+ */
+function cardPlain(value: unknown): string {
+  return forCard(value, UI_CARD_VALUE);
+}
+
+/**
+ * The same, quoted, for a value a reader needs to see the edges of.
+ *
+ * Reducing BEFORE quoting is what keeps the quotes balanced: a `"` or a `\` in
+ * the value cannot break out of them, and there is no second cut that could drop
+ * the closing one. It also makes the cap honest. `JSON.stringify` expands what it
+ * escapes, and with the controls already gone the only escapes left are `"` and
+ * `\` at two characters each, so 80 kept characters render as at most 162 -- not
+ * the near-500 a `\u001b`-dense name would have produced had they been escaped
+ * rather than dropped.
+ */
+function cardValue(value: unknown): string {
+  return JSON.stringify(cardPlain(value));
+}
+
+const ACT_RPC_TIMEOUT = { initial: 30_000, max: 60_000 };
+/** Below this the surface is mostly canvas/custom-drawn and vision wins. */
+const LOW_COVERAGE = 0.4;
+/** Pause before the last verification re-read, for async UI. */
+const SETTLE_MS = 400;
+/** How many snapshots' worth of [id]s stay addressable. */
+const MAX_REMEMBERED_SNAPSHOTS = 4;
+
+/**
+ * What a `[id]` in tool output refers to.
+ *
+ * Ids are drawn from one process-wide counter and never reused. They are NOT
+ * the provider's element ids: those are session-scoped and reassigned on
+ * every walk, so the same integer means different elements in two captures.
+ * They are also not per-(kind,target) slots, which is what this used to be -
+ * two orchestrators in one daemon (chat and the background agent) share this
+ * module, so a snapshot taken by one between the other's snapshot and its act
+ * would have silently re-pointed the other's [id] at a different element.
+ * A globally unique id cannot collide that way: an id either resolves to the
+ * exact node that was shown under it, or to nothing.
+ */
+type AddressedElement = {
+  node: SemanticNode;
+  kind: CaptureKind;
+  /** Canonical sidecar id, not the name the caller happened to use. */
+  target: string;
+  pid?: number;
+  title: string;
+  url?: string;
+  /** The document, for a browser surface; absent on desktop and pre-#640 sidecars. */
+  loaderId?: string;
+};
+
+const addressed = new Map<number, AddressedElement>();
+/** Ids per snapshot, oldest first - the eviction queue for `addressed`. */
+const snapshotIds: number[][] = [];
+let nextId = 1;
+
+/**
+ * Has the surface this element was reviewed on been replaced since?
+ *
+ * #640, and the shape of the answer is the whole point: the identity to compare
+ * depends on whether the surface HAS a document.
+ *
+ * A BROWSER surface does, and `history.pushState` is the reason the URL cannot
+ * be it. An SPA rewrites `location.href` and `document.title` on every in-app
+ * navigation without ever committing a document, so comparing those two refused
+ * a perfectly valid click on Gmail, Linear or a sheet the model was told to
+ * reuse an id across -- the pre-existing false refusal #603 named and left. #603
+ * settled the rule everywhere else in one sentence: compare the loaderId, never
+ * the URL (`confirmSameDocument`, `refuseStaleAXElement`, `assertSamePage`).
+ * With `loader_id` now on the AX snapshot reply this path can follow it, so for
+ * a browser surface the loaderId is the ONLY term -- adding url or title back as
+ * an extra condition would reinstate exactly the refusal being removed.
+ *
+ * A DESKTOP surface has no document, so url+title stays its identity, unchanged.
+ *
+ * ABSENT ON EITHER SIDE MEANS FALL BACK, never "equal". A sidecar older than
+ * #640 sends no `loader_id`, and an empty or over-long one is dropped by
+ * `surfaceFromCdp`; two absent identities compared with `===` would both be
+ * `undefined` and pass, which is a check that reads as one and is not. So the
+ * loaderId term is used only when BOTH sides have one, and otherwise the
+ * previous, stricter comparison runs. The degradation is towards the
+ * false-refusal, which costs a retry; the other direction would cost a click on
+ * the wrong document.
+ *
+ * NOT the only guard, and not load-bearing alone. The sidecar's own
+ * `refuseStaleAXElement` re-reads the frame tree and refuses an id whose
+ * document moved or whose snapshot was superseded, the caller still requires
+ * `resolveRef` to find the node in the fresh capture above its confidence floor,
+ * and the acted node's role and name must still match the reviewed ones. This is
+ * the daemon-side term of four.
+ */
+function surfaceMoved(entry: AddressedElement, now: SemanticSurface): boolean {
+  if (entry.loaderId && now.root.loaderId) return now.root.loaderId !== entry.loaderId;
+  return now.root.url !== entry.url || (now.root.title ?? '') !== entry.title;
+}
+
+/** Sidecars are addressable by id or name; remember snapshots by id only. */
+function canonicalTarget(target: string): string {
+  const s = getSidecarManager()?.listSidecars().find((x) => x.id === target || x.name === target);
+  return s?.id ?? target;
+}
+
+/** Register a capture's nodes and return the `[id]` shown for each, in order. */
+function addressSurface(surface: SemanticSurface, kind: CaptureKind, target: string, pid?: number): number[] {
+  // Resolved once, not per node: a large window is hundreds of elements and
+  // this walks the sidecar list.
+  const canonical = canonicalTarget(target);
+  const ids = surface.nodes.map((node) => {
+    const id = nextId++;
+    addressed.set(id, { node, kind, target: canonical, pid, title: surface.root.title ?? '',
+      url: surface.root.url, ...(surface.root.loaderId ? { loaderId: surface.root.loaderId } : {}) });
+    return id;
+  });
+  snapshotIds.push(ids);
+  while (snapshotIds.length > MAX_REMEMBERED_SNAPSHOTS) {
+    for (const stale of snapshotIds.shift() ?? []) addressed.delete(stale);
+  }
+  return ids;
+}
+
+/** Test seam: forget every addressed element. */
+export function resetUiSnapshots(): void {
+  addressed.clear();
+  snapshotIds.length = 0;
+  nextId = 1;
+}
+
+/** Actions the browser provider can carry out; anything else must fail loudly. */
+const BROWSER_ACTIONS = new Set(['click', 'set_value']);
+/** Actions that only read, so there is nothing to verify or diff. */
+const READ_ONLY_ACTIONS = new Set(['get_value']);
+
+function fmtNode(n: SemanticNode, id: number): string {
+  const bits: string[] = [`[${id}] ${n.role}`];
+  if (n.name) bits.push(`"${n.name}"`);
+  if (n.value) bits.push(`= "${truncate(n.value, 40)}"`);
+  const flags: string[] = [];
+  if (n.state.enabled === false) flags.push('disabled');
+  if (n.state.focused) flags.push('focused');
+  if (n.state.checked) flags.push('checked');
+  if (n.state.selected) flags.push('selected');
+  if (n.state.expanded !== undefined) flags.push(n.state.expanded ? 'expanded' : 'collapsed');
+  if (n.state.offscreen) flags.push('offscreen');
+  if (flags.length) bits.push(`(${flags.join(', ')})`);
+  if (n.actions.length) bits.push(`{${n.actions.join('/')}}`);
+  return bits.join(' ');
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + '...' : s;
+}
+
+function formatSurface(surface: SemanticSurface, ids: number[]): string {
+  const cov = Math.round(surface.coverage * 100);
+  const header =
+    surface.provider === 'cdp'
+      ? `Page: ${surface.root.title || '(untitled)'}  ${surface.root.url ?? ''}`
+      : `Window: ${surface.root.title || '(untitled)'}  [pid ${surface.root.pid ?? '?'}]`;
+
+  const lines = [header, `Coverage: ${cov}% structural`, ''];
+  if (surface.nodes.length === 0) {
+    lines.push('(no salient elements - the surface may be canvas/custom-drawn; use a screenshot)');
+  } else {
+    surface.nodes.forEach((n, i) => lines.push(fmtNode(n, ids[i]!)));
+  }
+  if (surface.coverage < LOW_COVERAGE) {
+    lines.push(
+      '',
+      'Low structural coverage - this surface is largely canvas/custom-drawn. Prefer desktop_screenshot/browser_screenshot (vision) for elements not listed above.',
+    );
+  }
+  return lines.join('\n');
+}
+
+async function dispatchAct(
+  kind: CaptureKind,
+  target: string,
+  sessionId: number,
+  action: string,
+  value?: string,
+): Promise<unknown> {
+  const manager = getSidecarManager();
+  if (!manager) throw new Error('Sidecar system not initialized');
+  const sidecar = manager.listSidecars().find((s) => s.id === target || s.name === target);
+  const id = sidecar?.id ?? target;
+
+  if (kind === 'browser') {
+    if (!BROWSER_ACTIONS.has(action)) {
+      // A read-only or unsupported action must not silently become a click.
+      throw new Error(`action "${action}" is not available for kind="browser" (supported: click, set_value); use ui_snapshot to read state`);
+    }
+    if (action === 'set_value') {
+      return manager.dispatchRPC(id, 'browser_ax_set_value', { backend_node_id: sessionId, value }, ACT_RPC_TIMEOUT);
+    }
+    return manager.dispatchRPC(id, 'browser_ax_click', { backend_node_id: sessionId }, ACT_RPC_TIMEOUT);
+  }
+  // desktop -> click_element handles all action variants
+  return manager.dispatchRPC(id, 'click_element', { element_id: sessionId, action, value }, ACT_RPC_TIMEOUT);
+}
+
+/**
+ * Build the postcondition named by `verify`. Returns a string when the request
+ * names a real check that cannot be built from what was passed, so the caller
+ * can say why instead of silently acting unverified.
+ */
+export function parsePostcondition(
+  raw: unknown,
+  acted: SemanticNode,
+  beforeTitle: string | undefined,
+  value: string | undefined,
+): Postcondition | string | null {
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw !== 'string') return null;
+  switch (raw.toLowerCase()) {
+    case 'window_appeared': return { kind: 'window_appeared' };
+    case 'element_gone': return { kind: 'element_gone', ref: acted.ref };
+    case 'element_present': return { kind: 'element_present', ref: acted.ref };
+    case 'focus_moved': return { kind: 'focus_moved', fromRef: acted.ref };
+    case 'title_changed': return { kind: 'title_changed', from: beforeTitle ?? '' };
+    case 'value_equals':
+      if (value === undefined) {
+        return 'verify="value_equals" needs the value parameter (the text you expect the element to hold afterwards)';
+      }
+      return { kind: 'value_equals', ref: acted.ref, value };
+    default:
+      return `unknown verify "${raw}" (supported: window_appeared, element_gone, element_present, focus_moved, title_changed, value_equals)`;
+  }
+}
+
+export const uiSnapshotTool: ToolDefinition = {
+  name: 'ui_snapshot',
+  description:
+    'Perceive the current app or web page as an accessibility tree: an interactable-first list of elements, each with an [id] you pass to ui_act. This is the PRIMARY way to see UI - prefer it over screenshots. Reports a structural coverage %; when coverage is low the surface is canvas/custom-drawn and you should fall back to a screenshot. Set kind="browser" for the web page, "desktop" for a native window (optionally target a pid).',
+  category: 'ui',
+  parameters: {
+    kind: { type: 'string', description: 'What to perceive: "desktop" (native window) or "browser" (web page). Default "desktop".', required: false, enum: ['desktop', 'browser'] },
+    pid: { type: 'number', description: 'Desktop only: window PID (from desktop_list_windows). Omit for the foreground window.', required: false },
+    full: { type: 'boolean', description: 'Return the full tree instead of the salience-filtered interactable view. Default false - only set when the element you need is missing from the filtered list.', required: false },
+    target: { type: 'string', description: 'Sidecar name/ID (omit to auto-select the connected one).', required: false },
+  },
+  execute: async (params) => {
+    const kind = (params.kind === 'browser' ? 'browser' : 'desktop') as CaptureKind;
+    const cap = kind === 'browser' ? 'browser' : 'desktop';
+    const target = (params.target as string | undefined)?.trim() || autoTargetForCapability(cap) || '';
+    if (!target) return `Error: no connected sidecar with the "${cap}" capability`;
+    try {
+      const pid = params.pid as number | undefined;
+      const { surface } = await captureSurface({
+        kind,
+        target,
+        pid,
+        full: params.full === true,
+      });
+      const ids = addressSurface(surface, kind, target, pid ?? surface.root.pid);
+      recordPerception({
+        provider: surface.provider,
+        action: 'snapshot',
+        coverage: surface.coverage,
+        visionRecommended: surface.coverage < LOW_COVERAGE ? 'low_coverage' : undefined,
+        detail: `${surface.nodes.length} salient nodes`,
+      });
+      return formatSurface(surface, ids);
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  },
+};
+
+export const uiActTool: ToolDefinition = {
+  name: 'ui_act',
+  description:
+    'Act on an element from a recent ui_snapshot by its [id], then VERIFY the effect. Actions: click, set_value (needs value), toggle, select, expand, collapse, focus, scroll_into_view, get_value. Optionally pass verify to confirm the outcome (window_appeared | element_gone | element_present | focus_moved | title_changed | value_equals). The action is dispatched EXACTLY ONCE and is never re-sent: if verification does not hold, the runtime re-reads the surface a couple of times and then reports the outcome as unconfirmed, with a diff of what changed. Decide from that diff whether to act again - an unconfirmed action may still have happened. Always returns what actually changed, so you do not need a separate snapshot to check.',
+  category: 'ui',
+  captureApprovalGuard: (params) => {
+    const id = params.element_id as number;
+    const entry = addressed.get(id);
+    // Compare the captured object, not its recyclable numeric ID. The
+    // approval manager also refuses bindings lost on daemon restart.
+    return () => !!entry && addressed.get(id) === entry;
+  },
+  authorityGate: (params) => {
+    if (params.action === 'get_value') return null;
+    const entry = addressed.get(params.element_id as number);
+    if (!entry) return null; // rawUiGate still demands review; execute refuses a missing ref.
+    const hints = uiEffectHints(String(params.action || 'click'), entry.node.name,
+      `${entry.title} ${entry.url ?? ''}`, String(params.value ?? ''));
+    return { actionCategory: 'control_app',
+      actionCategories: [...hints, ...(entry.kind === 'browser' ? ['access_browser' as const] : [])],
+      confirm: 'always',
+      // EVERY interpolated value is reduced, like every sibling gate (#631).
+      // The person reads this sentence on the approval card, and
+      // `deferred-executor`'s blocked branches put it in
+      // `approval_requests.execution_result`. Where each one comes from:
+      //
+      //   node.name  an accessibility element's name -- text off a web page or
+      //              an app window. Quoted as well as reduced.
+      //   target     `canonicalTarget` falls back to the raw `target` the model
+      //              wrote when no sidecar matches it, so this is not ours
+      //              either. Unquoted, hence the fallback: a target made only
+      //              of invisible characters survives the caller's `.trim()`
+      //              and would otherwise leave "on . Business effect...".
+      //   action     the MODEL's own string, and not enum-checked yet at this
+      //              point: `validateParameters` runs inside `execute`, which
+      //              is after the card is built and shown. An out-of-enum
+      //              action cannot execute, but it could run on past the
+      //              sentence here, which is the same defect as the other two.
+      //
+      // Both fallbacks come AFTER the reduction, not before it. `params.action`
+      // of a single zero-width character is truthy, so a `|| 'click'` in front
+      // would not fire and the reduction would then leave the sentence with no
+      // verb at all; the same for a target of invisibles leaving "on .".
+      //
+      // NOT reduced, on purpose: `element_id` is a number or the `addressed`
+      // lookup above returned nothing, and `hints` is a closed `ActionCategory`
+      // enum out of `uiEffectHints`. `entry.title` and `entry.url` reach that
+      // function and nothing else, so they never land in this string.
+      //
+      // The hints are computed on the raw name, its UNCAPPED reduction and a
+      // folded form (#723), so a long label cannot drop a `make_payment` or
+      // `delete_data` raise by being cut, and an invisible character cannot
+      // hide one; since #794 neither can a cross-script look-alike.
+      intent: `Review ${cardPlain(params.action) || 'click'} on ${entry.kind} element [${params.element_id}] ${cardValue(entry.node.name)} on ${cardPlain(entry.target) || '(unnamed machine)'}. Business effect unknown beyond UI hints${hints.length ? ` (${hints.join(', ')})` : ''}; inspect the current screen and arguments. UI labels do not prove what an action will do.`,
+    };
+  },
+  parameters: {
+    element_id: { type: 'number', description: 'The [id] of the target element from a recent ui_snapshot. The id carries its own window/page and sidecar, so there is nothing else to pass.', required: true },
+    action: { type: 'string', description: 'What to do to the element. Default click. Browser elements support only click and set_value.', required: false, enum: ['click', 'set_value', 'toggle', 'select', 'expand', 'collapse', 'focus', 'scroll_into_view', 'get_value'] },
+    value: { type: 'string', description: 'The text to set (required for set_value; also the expected text for verify="value_equals").', required: false },
+    verify: { type: 'string', description: 'Optional postcondition to confirm after acting; on failure the runtime re-reads the surface before reporting.', required: false, enum: ['window_appeared', 'element_gone', 'element_present', 'focus_moved', 'title_changed', 'value_equals'] },
+  },
+  execute: async (params) => {
+    const action = (params.action as string) || 'click';
+    const elementId = params.element_id as number;
+    const value = params.value as string | undefined;
+
+    // The [id] names the element, the surface it came from, and the sidecar
+    // and window it lives on. Nothing is inferred from the current
+    // foreground window or from a "most recent" snapshot that another agent
+    // in this process may have replaced.
+    const entry = addressed.get(elementId);
+    if (!entry) {
+      return addressed.size === 0
+        ? `Error: no ui_snapshot has been taken yet - take one and use an [id] from its output`
+        : `Error: [${elementId}] is not from any recent ui_snapshot - take a fresh ui_snapshot and use an [id] from that result`;
+    }
+    const { node: actedRef, kind, target, pid } = entry;
+    if (kind === 'browser' && !BROWSER_ACTIONS.has(action)) {
+      return `Error: action "${action}" is not available for kind="browser" (supported: click, set_value); use ui_snapshot to read state`;
+    }
+
+    let before: SemanticNode[] = [];
+    let beforeTitle: string | undefined;
+    try {
+      const pre = await captureSurface({ kind, target, pid, full: false });
+      before = pre.surface.nodes;
+      beforeTitle = pre.surface.root.title;
+      if (!READ_ONLY_ACTIONS.has(action) && surfaceMoved(entry, pre.surface)) {
+        return 'Error: the UI surface changed since review - nothing was done; take a fresh ui_snapshot and review the action again';
+      }
+    } catch (err) {
+      return `Error: could not re-capture the surface before acting (${err instanceof Error ? err.message : String(err)}) - nothing was done`;
+    }
+
+    // Element ids churn between captures; the durable ref is what survives.
+    const live = resolveRef(actedRef.ref, before);
+    if (!live.node) {
+      return `Error: ${actedRef.role} "${actedRef.name}" [${elementId}] is no longer on the surface (best match ${Math.round(live.confidence * 100)}%) - nothing was done; take a fresh ui_snapshot`;
+    }
+
+    const pc = parsePostcondition(params.verify, actedRef, beforeTitle, value);
+    if (!READ_ONLY_ACTIONS.has(action) && (live.node.name !== actedRef.name || live.node.role !== actedRef.role)) {
+      return 'Error: the UI control changed since review - nothing was done; take a fresh ui_snapshot and review the action again';
+    }
+    if (typeof pc === 'string') return `Error: ${pc} - nothing was done`;
+
+    let actResult: unknown;
+    try {
+      actResult = await dispatchAct(kind, target, live.node.sessionId, action, value);
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    // Read-only actions need no verification/diff.
+    if (READ_ONLY_ACTIONS.has(action)) {
+      return `${action} -> ${JSON.stringify(actResult)}`;
+    }
+
+    const how = live.method === 'sig' || live.method === 'stableId'
+      ? ''
+      : ` (re-found by ${live.method}, ${Math.round(live.confidence * 100)}%)`;
+    const lines: string[] = [`Acted: ${action}${value !== undefined ? ` "${truncate(value, 40)}"` : ''} on [${elementId}] ${actedRef.role} "${actedRef.name}"${how}`];
+
+    // Re-read for verification + diff, climbing the self-heal ladder. Every
+    // rung re-observes; none re-dispatches. See verifier.ts for why.
+    const attempted: HealRung[] = [];
+    let satisfied = !pc;
+    let after: SemanticNode[] = [];
+    let afterTitle: string | undefined;
+    let coverage = 0;
+
+    for (;;) {
+      try {
+        // Same window as the snapshot: a diff against a different window
+        // would report changes that never happened to this one.
+        const post = await captureSurface({ kind, target, pid, full: false });
+        after = post.surface.nodes;
+        afterTitle = post.surface.root.title;
+        coverage = post.surface.coverage;
+      } catch {
+        after = [];
+        afterTitle = undefined;
+      }
+      if (!pc) break;
+
+      const v = verifyPostcondition(pc, {
+        before, beforeTitle, after, afterTitle,
+        surfacePresent: after.length > 0,
+      });
+      if (v.satisfied) {
+        satisfied = true;
+        lines.push(`Verified: ${v.detail}`);
+        break;
+      }
+
+      const rung = nextHealRung({ attempted });
+      if (rung === null || rung === 'report') {
+        if (rung) attempted.push(rung);
+        lines.push(
+          `NOT VERIFIED: ${v.detail}.`,
+          `The ${action} was dispatched once and was NOT repeated - it may still have taken effect. Read the diff below before deciding; if you need certainty, take a screenshot or ask the user.`,
+        );
+        break;
+      }
+      attempted.push(rung);
+      if (rung === 'settle') await new Promise((res) => setTimeout(res, SETTLE_MS));
+    }
+
+    lines.push(diffSurface(before, after));
+
+    recordPerception({
+      provider: kind === 'browser' ? 'cdp' : 'uia',
+      action,
+      coverage,
+      verified: pc ? satisfied : undefined,
+      visionRecommended: pc && !satisfied ? 'unverified_outcome' : undefined,
+      detail: attempted.length ? `self-heal: ${attempted.join(' -> ')}` : undefined,
+    });
+    return lines.join('\n');
+  },
+};
+
+/** Compact before->after diff by named-element set + focus changes. */
+function diffSurface(before: SemanticNode[], after: SemanticNode[]): string {
+  const beforeNames = new Set(before.map((n) => `${n.role}|${n.name}`));
+  const afterNames = new Set(after.map((n) => `${n.role}|${n.name}`));
+  const appeared = after.filter((n) => n.name && !beforeNames.has(`${n.role}|${n.name}`)).slice(0, 8);
+  const gone = before.filter((n) => n.name && !afterNames.has(`${n.role}|${n.name}`)).slice(0, 8);
+  const focused = after.find((n) => n.state.focused);
+
+  const parts: string[] = ['Changed:'];
+  if (appeared.length) parts.push(`  appeared: ${appeared.map((n) => `${n.role} "${n.name}"`).join(', ')}`);
+  if (gone.length) parts.push(`  gone: ${gone.map((n) => `${n.role} "${n.name}"`).join(', ')}`);
+  if (focused) parts.push(`  focus: ${focused.role} "${focused.name}"`);
+  if (parts.length === 1) parts.push('  (no visible structural change)');
+  return parts.join('\n');
+}
+
+export const UI_TOOLS: ToolDefinition[] = [uiSnapshotTool, uiActTool];

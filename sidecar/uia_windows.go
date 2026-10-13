@@ -1,0 +1,1604 @@
+//go:build windows
+
+// uia_windows.go — Core UIAutomation COM wrapper.
+//
+// All COM operations run on a single dedicated goroutine (STA apartment)
+// to avoid threading issues. Public functions send requests via channel.
+
+package main
+
+import (
+	"fmt"
+	"log"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"unsafe"
+
+	"github.com/go-ole/go-ole"
+)
+
+// ── COM GUIDs ────────────────────────────────────────────────────────
+
+var (
+	CLSID_CUIAutomation = ole.NewGUID("{FF48DBA4-60EF-4201-AA87-54103EEF594E}")
+	IID_IUIAutomation   = ole.NewGUID("{30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}")
+)
+
+// UIAutomation property IDs
+const (
+	UIA_BoundingRectanglePropertyId   = 30001
+	UIA_ProcessIdPropertyId           = 30002
+	UIA_ControlTypePropertyId         = 30003
+	UIA_NamePropertyId                = 30005
+	UIA_IsKeyboardFocusablePropertyId = 30009
+	UIA_IsEnabledPropertyId           = 30010
+	UIA_AutomationIdPropertyId        = 30011
+	UIA_ClassNamePropertyId           = 30012
+	UIA_IsPasswordPropertyId          = 30019
+	UIA_NativeWindowHandlePropertyId  = 30020
+	UIA_IsOffscreenPropertyId         = 30022
+)
+
+// UIAutomation pattern IDs
+const (
+	UIA_InvokePatternId         = 10000
+	UIA_ValuePatternId          = 10002
+	UIA_ExpandCollapsePatternId = 10005
+	UIA_SelectionItemPatternId  = 10010
+	UIA_TextPatternId           = 10014
+	UIA_TogglePatternId         = 10015
+	UIA_ScrollItemPatternId     = 10017
+)
+
+// TreeScope constants
+const (
+	TreeScope_Children    = 0x2
+	TreeScope_Descendants = 0x4
+)
+
+// ── COM Thread ───────────────────────────────────────────────────────
+
+// uiaComThread manages the dedicated COM thread and request dispatch.
+type uiaComThread struct {
+	once    sync.Once
+	reqCh   chan uiaReq
+	initErr error
+}
+
+type uiaReq struct {
+	fn     func(*uiaState) (any, error)
+	result chan uiaRes
+}
+
+type uiaRes struct {
+	val any
+	err error
+}
+
+// uiaState holds COM objects that live on the COM thread.
+type uiaState struct {
+	automation *ole.IDispatch // IUIAutomation
+	cache      *uiaElementCache
+}
+
+var comThread = &uiaComThread{
+	reqCh: make(chan uiaReq, 16),
+}
+
+// ensureStarted lazily starts the COM thread on first use.
+func (t *uiaComThread) ensureStarted() error {
+	t.once.Do(func() {
+		ready := make(chan error, 1)
+		go t.run(ready)
+		t.initErr = <-ready
+		if t.initErr != nil {
+			log.Printf("[uia] COM thread init failed: %v", t.initErr)
+		} else {
+			log.Printf("[uia] COM thread started")
+		}
+	})
+	return t.initErr
+}
+
+func (t *uiaComThread) run(ready chan<- error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
+		ready <- fmt.Errorf("CoInitializeEx: %w", err)
+		return
+	}
+	defer ole.CoUninitialize()
+
+	// Create IUIAutomation
+	unknown, err := ole.CreateInstance(CLSID_CUIAutomation, IID_IUIAutomation)
+	if err != nil {
+		ready <- fmt.Errorf("create IUIAutomation: %w", err)
+		return
+	}
+	automation := (*ole.IDispatch)(unsafe.Pointer(unknown))
+
+	state := &uiaState{
+		automation: automation,
+		cache:      newUIAElementCache(),
+	}
+
+	ready <- nil
+
+	// Process requests forever (with panic recovery to avoid crashing the sidecar)
+	for req := range t.reqCh {
+		val, err := func() (v any, e error) {
+			defer func() {
+				if r := recover(); r != nil {
+					v = nil
+					e = fmt.Errorf("COM thread panic: %v", r)
+					log.Printf("[uia] Recovered from panic: %v", r)
+				}
+			}()
+			return req.fn(state)
+		}()
+		req.result <- uiaRes{val, err}
+	}
+
+	// Cleanup (only reached if channel is closed)
+	state.cache.clear()
+	automation.Release()
+}
+
+// call dispatches a function to the COM thread and waits for result.
+func (t *uiaComThread) call(fn func(*uiaState) (any, error)) (any, error) {
+	if err := t.ensureStarted(); err != nil {
+		return nil, err
+	}
+	req := uiaReq{fn: fn, result: make(chan uiaRes, 1)}
+	t.reqCh <- req
+	res := <-req.result
+	return res.val, res.err
+}
+
+// ── IUIAutomation vtable helpers ─────────────────────────────────────
+
+// IUIAutomation vtable layout (inherits IUnknown):
+//  [0]  QueryInterface    [1]  AddRef             [2]  Release
+//  [3]  CompareElements   [4]  CompareRuntimeIds  [5]  GetRootElement
+//  [6]  ElementFromHandle [7]  ElementFromPoint   [8]  GetFocusedElement
+//  [9]  GetRootElementBuildCache   [10] ElementFromHandleBuildCache
+//  [11] ElementFromPointBuildCache [12] GetFocusedElementBuildCache
+//  [13] CreateTreeWalker  [14] get_ControlViewWalker
+//  [15] get_ContentViewWalker     [16] get_RawViewWalker
+//  [17] get_RawViewCondition      [18] get_ControlViewCondition
+//  [19] get_ContentViewCondition
+//  [20] CreateCacheRequest        [21] CreateTrueCondition
+//  [22] CreateFalseCondition      [23] CreatePropertyCondition
+//  [24] CreatePropertyConditionEx [25] CreateAndCondition
+
+func vtblOffset(iface *ole.IDispatch, idx int) uintptr {
+	// IDispatch vtable: [QueryInterface, AddRef, Release, GetTypeInfoCount, GetTypeInfo, GetIDsOfNames, Invoke]
+	// IUIAutomation is actually IUnknown-based, not IDispatch, but go-ole wraps it.
+	// The actual vtable pointer is at the beginning of the object.
+	vtbl := (*[1024]uintptr)(unsafe.Pointer(iface.RawVTable))
+	return vtbl[idx]
+}
+
+func uiaGetRootElement(automation *ole.IDispatch) (*ole.IDispatch, error) {
+	var elem *ole.IDispatch
+	// IUIAutomation::GetRootElement = IUnknown(3) + offset 2 = vtable[5]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 5),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(unsafe.Pointer(&elem)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("GetRootElement", hr)
+	}
+	return elem, nil
+}
+
+// uiaGetFocusedElement returns the element with keyboard focus (used by the
+// skill recorder to capture what the user is acting on).
+func uiaGetFocusedElement(automation *ole.IDispatch) (*ole.IDispatch, error) {
+	var elem *ole.IDispatch
+	// IUIAutomation::GetFocusedElement = IUnknown(3) + offset 5 = vtable[8]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 8),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(unsafe.Pointer(&elem)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("GetFocusedElement", hr)
+	}
+	if elem == nil {
+		return nil, fmt.Errorf("no focused element")
+	}
+	return elem, nil
+}
+
+// recordedElement is what the skill recorder captures for one interaction:
+// the element's identity as the snapshot walk would emit it (same name
+// limits, same ancestry path, same sibling ordinal, therefore the same sig),
+// plus the app and window it lives in and, for a commit, the field's value.
+type recordedElement struct {
+	Role    string
+	Name    string
+	AutoID  string
+	Secure  bool
+	Path    []map[string]any
+	Ordinal int
+	Sig     string
+	App     string
+	Title   string
+	Value   string
+	HasVal  bool
+	// Owning process of the element itself.
+	Pid uint32
+	// Owning process of the top-level window the element sits in, and whether
+	// that window could be established at all. A WebView2 panel's controls
+	// belong to msedgewebview2.exe while the window that hosts them belongs
+	// to the sidecar, so this is what identifies pipo's own panels.
+	// HostKnown false means unknown, not "not ours": see ownWindowVerdict.
+	HostPid   uint32
+	HostKnown bool
+}
+
+// uiaElementFromPoint returns the element under a screen point.
+func uiaElementFromPoint(automation *ole.IDispatch, x, y int) (*ole.IDispatch, error) {
+	var elem *ole.IDispatch
+	// IUIAutomation::ElementFromPoint = vtable[7]. POINT is 8 bytes and is
+	// passed by value in one register on x64 (see packPoint).
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 7),
+		uintptr(unsafe.Pointer(automation)),
+		packPoint(x, y),
+		uintptr(unsafe.Pointer(&elem)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("ElementFromPoint", hr)
+	}
+	if elem == nil {
+		return nil, fmt.Errorf("no element at point")
+	}
+	return elem, nil
+}
+
+// uiaElementFromHandle returns the element for a top-level window handle.
+func uiaElementFromHandle(automation *ole.IDispatch, hwnd uintptr) (*ole.IDispatch, error) {
+	var elem *ole.IDispatch
+	// IUIAutomation::ElementFromHandle = vtable[6]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 6),
+		uintptr(unsafe.Pointer(automation)),
+		hwnd,
+		uintptr(unsafe.Pointer(&elem)),
+	)
+	if hr != 0 || elem == nil {
+		return nil, uiaOpError("ElementFromHandle", hr)
+	}
+	return elem, nil
+}
+
+// uiaHostingWindowPid reports the process that owns the top-level window
+// hosting elem, and whether that window could be established at all.
+//
+// This is what identifies one of pipo's own panels. A panel is a WebView2
+// control: its elements belong to msedgewebview2.exe while the window the
+// person sees belongs to the sidecar, so the element's own ProcessId never
+// recognises one. Reading NativeWindowHandle on a single ancestor is not
+// enough either -- not every element in the chain exposes one -- so this
+// tries elem itself and then each ancestor in turn, taking the first handle
+// that resolves through GA_ROOT to a real process.
+//
+// ok=false means "unknown", never "not ours": every caller that uses this to
+// decide what to record must drop the element rather than record it, because
+// an element with no hosting window cannot be shown NOT to be a panel.
+func uiaHostingWindowPid(walker, elem *ole.IDispatch) (uint32, bool) {
+	_, pid, ok := uiaHostingWindow(walker, elem)
+	return pid, ok
+}
+
+// uiaHostingWindow is uiaHostingWindowPid plus the window itself. The handle
+// is what says whether two elements live in the SAME window, which pids
+// cannot: cross-process hosting is ordinary on Windows (a UWP app's frame
+// belongs to ApplicationFrameHost.exe, any WebView2 app's content belongs to
+// msedgewebview2.exe), so a process difference inside one window is not an
+// overlay and must not be read as one.
+func uiaHostingWindow(walker, elem *ole.IDispatch) (uintptr, uint32, bool) {
+	cur := elem
+	// Ancestors this function opened, released on the way out. elem itself is
+	// owned by the caller and must outlive us.
+	var opened []*ole.IDispatch
+	defer func() {
+		for _, e := range opened {
+			e.Release()
+		}
+	}()
+	for climb := 0; climb < 64; climb++ {
+		if hwnd := uiaElementGetPropertyInt(cur, UIA_NativeWindowHandlePropertyId); hwnd != 0 {
+			root := win32RootWindow(uintptr(hwnd))
+			if pid := win32GetWindowPid(root); pid != 0 {
+				return root, pid, true
+			}
+		}
+		parent, perr := uiaWalkerGetParent(walker, cur)
+		if perr != nil || parent == nil {
+			break
+		}
+		opened = append(opened, parent)
+		cur = parent
+	}
+	return 0, 0, false
+}
+
+// maxOverlayDescendants bounds the fallback search below; a browser window
+// can expose tens of thousands of nodes and each rect read is a cross-process
+// call.
+const maxOverlayDescendants = 1500
+
+// uiaClickedElement resolves the element the person clicked at (x, y), given
+// what the hook recorded about where that click went (site).
+//
+// A plain hit test returns the topmost window under the cursor, and on many
+// machines that is a transparent overlay (GPU vendor overlays, screen
+// recorders, remote-control layers) rather than the app that received the
+// click -- #493. But this runs 60ms or more after the click, on a serialised
+// COM thread, so it cannot be told from the world it can see WHICH window
+// received it: by now the person may have switched apps, and reading that as
+// "an overlay is covering the foreground window" attributed clicks to
+// controls nobody touched (#499).
+//
+// So the window that received the click is not inferred here at all. It was
+// recorded when the click happened (site.HostHwnd) and everything read here
+// is checked against it: the decision is clickAttribution in recorder.go,
+// which is unit-tested on every platform because none of this is.
+//
+//   - hit: the element under the cursor is hosted by the recorded window.
+//   - host window: something is drawn over that window, so the click is
+//     re-pointed into it -- #493's fix, aimed at the window that took the
+//     click rather than at whatever is foreground now.
+//   - own window: the click went to one of pipo's own windows.
+//     errOwnWindow, and the caller drops it quietly.
+//   - drop: the recorded window is gone or was never established.
+//     errClickUnattributable, and the caller drops it loudly. Fail closed:
+//     a missing step can be re-recorded, an invented one is trusted.
+func uiaClickedElement(state *uiaState, walker *ole.IDispatch, x, y int, site clickSite) (*ole.IDispatch, error) {
+	hit, err := uiaElementFromPoint(state.automation, x, y)
+	if err != nil {
+		return nil, err
+	}
+	hitHost, _, _ := uiaHostingWindow(walker, hit)
+	exists, pidNow := win32WindowStillThere(site.HostHwnd)
+	facts := clickFacts{
+		HostHwnd:        site.HostHwnd,
+		HostPid:         site.HostPid,
+		FgHwnd:          site.FgHwnd,
+		FgPid:           site.FgPid,
+		CaptureHwnd:     site.CaptureHwnd,
+		MenuUp:          site.MenuUp,
+		HostStillExists: exists,
+		HostPidNow:      pidNow,
+		HitPid:          uint32(uiaElementGetPropertyInt(hit, UIA_ProcessIdPropertyId)),
+		HitHostHwnd:     hitHost,
+		CurrentFgPid:    win32GetWindowPid(win32GetForegroundWindow()),
+		OwnPid:          ownPid,
+	}
+
+	switch target, reason := clickAttribution(facts); target {
+	case clickTargetHit:
+		return hit, nil
+	case clickTargetOwnWindow:
+		hit.Release()
+		return nil, fmt.Errorf("%w: %s", errOwnWindow, reason)
+	case clickTargetHostWindow:
+		hit.Release()
+		return uiaElementInClickedWindow(state, walker, site, x, y, reason)
+	default:
+		hit.Release()
+		return nil, fmt.Errorf("%w: %s", errClickUnattributable, reason)
+	}
+}
+
+// uiaElementInClickedWindow finds the control of the window that received the
+// click (site.HostHwnd) at the click point, for the case where something else
+// is drawn on top of it.
+//
+// It tries the keyboard-focused element first -- a click usually focuses the
+// control it lands on, and that is one read rather than a whole tree walk --
+// but only when that element is hosted by the very window that received the
+// click AND its bounds contain the point. Same process is not enough: focus
+// may have moved to another window of the same app in the meantime, and the
+// focused control of a window is often not the one under the pointer. Both
+// checks exist so this path cannot hand back a plausible control the person
+// never touched.
+func uiaElementInClickedWindow(state *uiaState, walker *ole.IDispatch, site clickSite, x, y int, reason string) (*ole.IDispatch, error) {
+	if focused, ferr := uiaGetFocusedElement(state.automation); ferr == nil {
+		host, _, ok := uiaHostingWindow(walker, focused)
+		fx, fy, fw, fh := uiaElementGetBoundingRect(focused)
+		if ok && host == site.HostHwnd && pointInRect(x, y, fx, fy, fw, fh) {
+			return focused, nil
+		}
+		focused.Release()
+	}
+
+	window, werr := uiaElementFromHandle(state.automation, site.HostHwnd)
+	if werr != nil {
+		return nil, fmt.Errorf("%w: %s, and that window could not be read: %v", errClickUnattributable, reason, werr)
+	}
+	defer window.Release()
+	trueCond, cerr := uiaCreateTrueCondition(state.automation)
+	if cerr != nil {
+		// Wrapped like its neighbours: this is still a dropped click, and
+		// the click-time facts in reason are what make it diagnosable.
+		return nil, fmt.Errorf("%w: %s, and no condition could be built to read it: %v", errClickUnattributable, reason, cerr)
+	}
+	defer trueCond.Release()
+	arr, aerr := uiaElementFindAll(window, TreeScope_Descendants, trueCond)
+	if aerr != nil || arr == nil {
+		return nil, fmt.Errorf("%w: %s, and that window's tree could not be read", errClickUnattributable, reason)
+	}
+	defer arr.Release()
+	count := uiaArrayLength(arr)
+	if count > maxOverlayDescendants {
+		count = maxOverlayDescendants
+	}
+	var best *ole.IDispatch
+	bestArea := int64(-1)
+	for i := 0; i < count; i++ {
+		el := uiaArrayGetElement(arr, i)
+		if el == nil {
+			continue
+		}
+		ex, ey, ew, eh := uiaElementGetBoundingRect(el)
+		if !pointInRect(x, y, ex, ey, ew, eh) {
+			el.Release()
+			continue
+		}
+		area := int64(ew) * int64(eh)
+		if best == nil || area < bestArea {
+			if best != nil {
+				best.Release()
+			}
+			best, bestArea = el, area
+			continue
+		}
+		el.Release()
+	}
+	if best == nil {
+		return nil, fmt.Errorf("%w: %s, and no control of that window contains the point", errClickUnattributable, reason)
+	}
+	return best, nil
+}
+
+// uiaRawViewWalker returns IUIAutomation's raw-view tree walker, whose parent
+// chain matches the children FindAll(TrueCondition) enumerates.
+func uiaRawViewWalker(automation *ole.IDispatch) (*ole.IDispatch, error) {
+	var walker *ole.IDispatch
+	// IUIAutomation::get_RawViewWalker = vtable[16]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 16),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(unsafe.Pointer(&walker)),
+	)
+	if hr != 0 || walker == nil {
+		return nil, uiaOpError("get_RawViewWalker", hr)
+	}
+	return walker, nil
+}
+
+// uiaWalkerGetParent returns the parent of elem in the walker's view, or nil
+// at the desktop root.
+func uiaWalkerGetParent(walker, elem *ole.IDispatch) (*ole.IDispatch, error) {
+	var parent *ole.IDispatch
+	// IUIAutomationTreeWalker::GetParentElement = IUnknown(3) + offset 0 = vtable[3]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(walker, 3),
+		uintptr(unsafe.Pointer(walker)),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(unsafe.Pointer(&parent)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("GetParentElement", hr)
+	}
+	return parent, nil
+}
+
+// uiaCompareElements reports whether two element interfaces refer to the same
+// UI element (runtime-id comparison), which pointer equality does not.
+func uiaCompareElements(automation, a, b *ole.IDispatch) bool {
+	var same int32
+	// IUIAutomation::CompareElements = vtable[3]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 3),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(unsafe.Pointer(a)),
+		uintptr(unsafe.Pointer(b)),
+		uintptr(unsafe.Pointer(&same)),
+	)
+	return hr == 0 && same != 0
+}
+
+// interactableControlTypes are the control types a click is "on" even when
+// the hit-test lands on a child text or image inside them.
+var interactableControlTypes = map[string]bool{
+	"Button": true, "CheckBox": true, "ComboBox": true, "Edit": true, "Hyperlink": true,
+	"ListItem": true, "MenuItem": true, "RadioButton": true, "SplitButton": true,
+	"TabItem": true, "TreeItem": true, "Slider": true, "Spinner": true, "Document": true,
+}
+
+// uiaRecordedElement captures the element the person just acted on. For a
+// click it hit-tests the click point and climbs at most a few levels to the
+// enclosing control (a button's label text is not what the skill should
+// address); for a commit it takes the keyboard-focused element, which is the
+// field that was typed into.
+//
+// The ancestry path and sibling ordinal are computed exactly as walkTree
+// does for a snapshot: the path starts at the top-level window (the child
+// of the desktop root), each segment is {role, name cut at pathNameRunes},
+// and the ordinal counts every earlier raw-view sibling with the same
+// control type and name. That is what makes the recorded sig equal the
+// live one, so the resolver's sig rung (1.0) re-finds the element at replay.
+func uiaRecordedElement(state *uiaState, kind string, x, y int, site clickSite) (*recordedElement, error) {
+	// The walker comes first: the click path needs it to find the window
+	// hosting the element under the cursor before it decides whether the
+	// click is even ours to record.
+	walker, err := uiaRawViewWalker(state.automation)
+	if err != nil {
+		return nil, err
+	}
+	defer walker.Release()
+
+	var elem *ole.IDispatch
+	if kind == "click" {
+		elem, err = uiaClickedElement(state, walker, x, y, site)
+	} else {
+		elem, err = uiaGetFocusedElement(state.automation)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Closure, not `defer elem.Release()`: the climb below reassigns elem,
+	// and a method-value defer would capture the receiver as it is HERE --
+	// releasing the pre-climb element a second time (the loop already
+	// released it) and leaking the one we end up recording.
+	defer func() { elem.Release() }()
+
+	// Climb from a passive child (Text, Image, Group) to the control that
+	// owns it, so the ref addresses what the person meant to click.
+	if kind == "click" {
+		for climb := 0; climb < 4; climb++ {
+			ctrl := controlTypeName(uiaElementGetPropertyInt(elem, UIA_ControlTypePropertyId))
+			if interactableControlTypes[ctrl] || len(getSupportedPatterns(elem)) > 0 {
+				break
+			}
+			parent, perr := uiaWalkerGetParent(walker, elem)
+			if perr != nil || parent == nil {
+				break
+			}
+			// Do not climb past a window or pane: a click on empty canvas
+			// stays a click on the canvas.
+			pctrl := controlTypeName(uiaElementGetPropertyInt(parent, UIA_ControlTypePropertyId))
+			if pctrl == "Window" || pctrl == "Pane" {
+				parent.Release()
+				break
+			}
+			elem.Release()
+			elem = parent
+		}
+	}
+
+	rec := &recordedElement{}
+	rec.Role = controlTypeName(uiaElementGetPropertyInt(elem, UIA_ControlTypePropertyId))
+	rec.Name = truncateRunes(uiaElementGetPropertyStr(elem, UIA_NamePropertyId), elementNameRunes)
+	rec.AutoID = uiaElementGetPropertyStr(elem, UIA_AutomationIdPropertyId)
+	rec.Secure = uiaElementGetPropertyBool(elem, UIA_IsPasswordPropertyId)
+	if pid := uiaElementGetPropertyInt(elem, UIA_ProcessIdPropertyId); pid > 0 {
+		rec.Pid = uint32(pid)
+		rec.App = processBaseName(uint32(pid))
+	}
+	// The window hosting the element, which is what identifies a pipo panel
+	// (the element's own process does not: a panel's controls are
+	// msedgewebview2.exe's). Resolved from elem rather than from the ancestor
+	// chain below, so an ancestor that exposes no native window handle does
+	// not silently leave this unknown.
+	rec.HostPid, rec.HostKnown = uiaHostingWindowPid(walker, elem)
+
+	// Ancestors from the immediate parent up to the top-level window. The
+	// desktop root (whose own parent is nil) is excluded, like the walk.
+	var chain []*ole.IDispatch
+	defer func() {
+		for _, a := range chain {
+			a.Release()
+		}
+	}()
+	cur := elem
+	for {
+		parent, perr := uiaWalkerGetParent(walker, cur)
+		if perr != nil || parent == nil {
+			break
+		}
+		grand, gerr := uiaWalkerGetParent(walker, parent)
+		if gerr != nil || grand == nil {
+			// parent is the desktop root: stop, cur is the top-level window.
+			parent.Release()
+			break
+		}
+		grand.Release()
+		chain = append(chain, parent)
+		cur = parent
+		if len(chain) > 64 {
+			break
+		}
+	}
+
+	// chain is [parent, grandparent, ..., topWindow]; the path reads root first.
+	for i := len(chain) - 1; i >= 0; i-- {
+		a := chain[i]
+		name := uiaElementGetPropertyStr(a, UIA_NamePropertyId)
+		if i == len(chain)-1 {
+			rec.Title = name
+			rec.Path = append(rec.Path, windowSegment(name))
+			continue
+		}
+		ctrl := controlTypeName(uiaElementGetPropertyInt(a, UIA_ControlTypePropertyId))
+		rec.Path = append(rec.Path, pathSegment(ctrl, truncateRunes(name, elementNameRunes)))
+	}
+	if rec.Path == nil {
+		rec.Path = []map[string]any{}
+	}
+
+	// Ordinal among raw-view siblings under the immediate parent.
+	if len(chain) > 0 {
+		if trueCond, cerr := uiaCreateTrueCondition(state.automation); cerr == nil {
+			if arr, ferr := uiaElementFindAll(chain[0], TreeScope_Children, trueCond); ferr == nil && arr != nil {
+				count := uiaArrayLength(arr)
+				keys := make([]siblingKey, 0, count)
+				self := -1
+				for i := 0; i < count; i++ {
+					sib := uiaArrayGetElement(arr, i)
+					if sib == nil {
+						keys = append(keys, siblingKey{})
+						continue
+					}
+					keys = append(keys, siblingKey{
+						Ctrl: controlTypeName(uiaElementGetPropertyInt(sib, UIA_ControlTypePropertyId)),
+						Name: truncateRunes(uiaElementGetPropertyStr(sib, UIA_NamePropertyId), elementNameRunes),
+					})
+					if self < 0 && uiaCompareElements(state.automation, sib, elem) {
+						self = i
+					}
+					sib.Release()
+				}
+				if self >= 0 {
+					rec.Ordinal = siblingOrdinal(keys, self)
+				}
+				arr.Release()
+			}
+			trueCond.Release()
+		}
+	}
+
+	rec.Sig = semanticSig(rec.Role, rec.Name, rec.AutoID, rec.Path, rec.Ordinal)
+
+	// The committed value comes from the Value pattern of the same element,
+	// read in this same COM call so focus cannot move between the two reads.
+	// A secure field yields no value; the brain treats it as redacted.
+	if kind == "commit" && !rec.Secure {
+		if v, verr := patternGetValue(elem); verr == nil {
+			rec.Value = v
+			rec.HasVal = true
+		}
+	}
+	return rec, nil
+}
+
+func uiaCreateTrueCondition(automation *ole.IDispatch) (*ole.IDispatch, error) {
+	var cond *ole.IDispatch
+	// IUIAutomation::CreateTrueCondition = vtable[21]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 21),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(unsafe.Pointer(&cond)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("CreateTrueCondition", hr)
+	}
+	return cond, nil
+}
+
+func uiaCreatePropertyCondition(automation *ole.IDispatch, propertyId int, value interface{}) (*ole.IDispatch, error) {
+	v := ole.NewVariant(ole.VT_I4, int64(0))
+	switch val := value.(type) {
+	case int:
+		v = ole.NewVariant(ole.VT_I4, int64(val))
+	case string:
+		bstr := ole.SysAllocStringLen(val)
+		v = ole.NewVariant(ole.VT_BSTR, int64(uintptr(unsafe.Pointer(bstr))))
+		defer ole.SysFreeString(bstr)
+	}
+
+	var cond *ole.IDispatch
+	// IUIAutomation::CreatePropertyCondition = vtable[23]
+	// VARIANT (16 bytes) is passed by reference on x64 per Windows calling convention.
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 23),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(propertyId),
+		uintptr(unsafe.Pointer(&v)),
+		uintptr(unsafe.Pointer(&cond)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError(fmt.Sprintf("CreatePropertyCondition(%d)", propertyId), hr)
+	}
+	return cond, nil
+}
+
+func uiaCreateAndCondition(automation *ole.IDispatch, cond1, cond2 *ole.IDispatch) (*ole.IDispatch, error) {
+	var cond *ole.IDispatch
+	// IUIAutomation::CreateAndCondition = vtable[25]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(automation, 25),
+		uintptr(unsafe.Pointer(automation)),
+		uintptr(unsafe.Pointer(cond1)),
+		uintptr(unsafe.Pointer(cond2)),
+		uintptr(unsafe.Pointer(&cond)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("CreateAndCondition", hr)
+	}
+	return cond, nil
+}
+
+// ── IUIAutomationElement helpers ─────────────────────────────────────
+//
+// IUIAutomationElement vtable layout (inherits IUnknown):
+//  [0]  QueryInterface         [1]  AddRef                 [2]  Release
+//  [3]  SetFocus               [4]  GetRuntimeId           [5]  FindFirst
+//  [6]  FindAll                [7]  FindFirstBuildCache    [8]  FindAllBuildCache
+//  [9]  BuildUpdatedCache      [10] GetCurrentPropertyValue
+//  [11] GetCurrentPropertyValueEx  [12] GetCachedPropertyValue
+//  [13] GetCachedPropertyValueEx   [14] GetCurrentPatternAs
+//  [15] GetCachedPatternAs     [16] GetCurrentPattern      [17] GetCachedPattern
+//  [18] GetCachedParent        [19] GetCachedChildren
+//  [20] get_CurrentProcessId   [21] get_CurrentControlType
+//  [22] get_CurrentLocalizedControlType  [23] get_CurrentName
+//  ... (more Current* properties) ...
+//  [43] get_CurrentBoundingRectangle
+
+func uiaElementGetPropertyStr(elem *ole.IDispatch, propertyId int) string {
+	var v ole.VARIANT
+	ole.VariantInit(&v)
+	defer ole.VariantClear(&v)
+
+	// IUIAutomationElement::GetCurrentPropertyValue = IUnknown(3) + offset 7 = vtable[10]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 10),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(propertyId),
+		uintptr(unsafe.Pointer(&v)),
+	)
+	if hr != 0 {
+		return ""
+	}
+	if v.VT == ole.VT_BSTR {
+		return v.ToString()
+	}
+	return ""
+}
+
+func uiaElementGetPropertyInt(elem *ole.IDispatch, propertyId int) int {
+	var v ole.VARIANT
+	ole.VariantInit(&v)
+	defer ole.VariantClear(&v)
+
+	// IUIAutomationElement::GetCurrentPropertyValue = vtable[10]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 10),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(propertyId),
+		uintptr(unsafe.Pointer(&v)),
+	)
+	if hr != 0 {
+		return 0
+	}
+	if v.VT == ole.VT_I4 {
+		return int(v.Val)
+	}
+	return 0
+}
+
+func uiaElementGetPropertyBool(elem *ole.IDispatch, propertyId int) bool {
+	var v ole.VARIANT
+	ole.VariantInit(&v)
+	defer ole.VariantClear(&v)
+
+	// IUIAutomationElement::GetCurrentPropertyValue = vtable[10]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 10),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(propertyId),
+		uintptr(unsafe.Pointer(&v)),
+	)
+	if hr != 0 {
+		return false
+	}
+	if v.VT == ole.VT_BOOL {
+		return v.Val != 0
+	}
+	return false
+}
+
+// RECT matches the Windows RECT structure.
+type uiaRECT struct {
+	Left, Top, Right, Bottom int32
+}
+
+func uiaElementGetBoundingRect(elem *ole.IDispatch) (x, y, w, h int) {
+	var r uiaRECT
+	// IUIAutomationElement::get_CurrentBoundingRectangle = IUnknown(3) + offset 40 = vtable[43]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 43),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(unsafe.Pointer(&r)),
+	)
+	if hr != 0 {
+		return 0, 0, 0, 0
+	}
+	return int(r.Left), int(r.Top), int(r.Right - r.Left), int(r.Bottom - r.Top)
+}
+
+func uiaElementSetFocus(elem *ole.IDispatch) error {
+	// IUIAutomationElement::SetFocus = IUnknown(3) + offset 0 = vtable[3]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 3),
+		uintptr(unsafe.Pointer(elem)),
+	)
+	if hr != 0 {
+		return uiaOpError("SetFocus", hr)
+	}
+	return nil
+}
+
+// IUIAutomationElement::FindFirst
+func uiaElementFindFirst(elem *ole.IDispatch, scope int, condition *ole.IDispatch) (*ole.IDispatch, error) {
+	var found *ole.IDispatch
+	// IUIAutomationElement::FindFirst = IUnknown(3) + offset 2 = vtable[5]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 5),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(scope),
+		uintptr(unsafe.Pointer(condition)),
+		uintptr(unsafe.Pointer(&found)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("FindFirst", hr)
+	}
+	return found, nil
+}
+
+// IUIAutomationElement::FindAll
+func uiaElementFindAll(elem *ole.IDispatch, scope int, condition *ole.IDispatch) (*ole.IDispatch, error) {
+	var arr *ole.IDispatch
+	// IUIAutomationElement::FindAll = IUnknown(3) + offset 3 = vtable[6]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 6),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(scope),
+		uintptr(unsafe.Pointer(condition)),
+		uintptr(unsafe.Pointer(&arr)),
+	)
+	if hr != 0 {
+		return nil, uiaOpError("FindAll", hr)
+	}
+	return arr, nil
+}
+
+// IUIAutomationElement::GetCurrentPattern
+func uiaElementGetPattern(elem *ole.IDispatch, patternId int) (*ole.IDispatch, error) {
+	var pattern *ole.IDispatch
+	// IUIAutomationElement::GetCurrentPattern = IUnknown(3) + offset 13 = vtable[16]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(elem, 16),
+		uintptr(unsafe.Pointer(elem)),
+		uintptr(patternId),
+		uintptr(unsafe.Pointer(&pattern)),
+	)
+	if hr != 0 || pattern == nil {
+		return nil, uiaOpError(fmt.Sprintf("GetCurrentPattern(%d)", patternId), hr)
+	}
+	return pattern, nil
+}
+
+// ── IUIAutomationElementArray helpers ────────────────────────────────
+
+func uiaArrayLength(arr *ole.IDispatch) int {
+	var length int32
+	// IUIAutomationElementArray::get_Length = IUnknown(3) + offset 0 = vtable[3]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(arr, 3),
+		uintptr(unsafe.Pointer(arr)),
+		uintptr(unsafe.Pointer(&length)),
+	)
+	if hr != 0 {
+		return 0
+	}
+	return int(length)
+}
+
+func uiaArrayGetElement(arr *ole.IDispatch, index int) *ole.IDispatch {
+	var elem *ole.IDispatch
+	// IUIAutomationElementArray::GetElement = IUnknown(3) + offset 1 = vtable[4]
+	hr, _, _ := syscall.SyscallN(
+		vtblOffset(arr, 4),
+		uintptr(unsafe.Pointer(arr)),
+		uintptr(index),
+		uintptr(unsafe.Pointer(&elem)),
+	)
+	if hr != 0 {
+		return nil
+	}
+	return elem
+}
+
+// ── High-level operations ────────────────────────────────────────────
+
+// controlTypeNames maps UIAutomation ControlType IDs to human-readable names.
+var controlTypeNames = map[int]string{
+	50000: "Button", 50001: "Calendar", 50002: "CheckBox",
+	50003: "ComboBox", 50004: "Edit", 50005: "Hyperlink",
+	50006: "Image", 50007: "ListItem", 50008: "List",
+	50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
+	50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
+	50015: "Slider", 50016: "Spinner", 50017: "StatusBar",
+	50018: "Tab", 50019: "TabItem", 50020: "Text",
+	50021: "ToolBar", 50022: "ToolTip", 50023: "Tree",
+	50024: "TreeItem", 50025: "Custom", 50026: "Group",
+	50027: "Thumb", 50028: "DataGrid", 50029: "DataItem",
+	50030: "Document", 50031: "SplitButton", 50032: "Window",
+	50033: "Pane", 50034: "Header", 50035: "HeaderItem",
+	50036: "Table", 50037: "TitleBar", 50038: "Separator",
+	50039: "SemanticZoom", 50040: "AppBar",
+}
+
+func controlTypeName(id int) string {
+	if name, ok := controlTypeNames[id]; ok {
+		return name
+	}
+	return fmt.Sprintf("Unknown(%d)", id)
+}
+
+// buildElementInfo extracts element properties into a map matching the expected JSON shape.
+func buildElementInfo(elem *ole.IDispatch, id, depth int) map[string]any {
+	x, y, w, h := uiaElementGetBoundingRect(elem)
+	name := truncateRunes(uiaElementGetPropertyStr(elem, UIA_NamePropertyId), elementNameRunes)
+	ctrl := controlTypeName(uiaElementGetPropertyInt(elem, UIA_ControlTypePropertyId))
+	autoID := uiaElementGetPropertyStr(elem, UIA_AutomationIdPropertyId)
+	return buildElementInfoPrefetched(elem, id, depth, name, ctrl, autoID, x, y, w, h)
+}
+
+// buildElementInfoPrefetched is buildElementInfo for callers that already
+// read name/control-type/automation-id/bounds (the tree walk reads them for
+// ordinal computation) — avoids duplicate cross-process COM property reads.
+func buildElementInfoPrefetched(elem *ole.IDispatch, id, depth int, name, ctrl, autoID string, x, y, w, h int) map[string]any {
+	info := map[string]any{
+		"id":            id,
+		"name":          name,
+		"automation_id": autoID,
+		"class_name":    uiaElementGetPropertyStr(elem, UIA_ClassNamePropertyId),
+		"control_type":  ctrl,
+		"enabled":       uiaElementGetPropertyBool(elem, UIA_IsEnabledPropertyId),
+		"focusable":     uiaElementGetPropertyBool(elem, UIA_IsKeyboardFocusablePropertyId),
+		"rect":          map[string]any{"x": x, "y": y, "w": w, "h": h},
+		"patterns":      getSupportedPatterns(elem),
+		"depth":         depth,
+	}
+	// Only present when true. Every key here is pretty-printed straight into
+	// the model's context (routeToSidecar JSON.stringify), so a per-element
+	// "offscreen": false on every snapshot would be pure payload -- and
+	// offscreen is only ever interesting when it is the reason a click failed.
+	if uiaElementGetPropertyBool(elem, UIA_IsOffscreenPropertyId) {
+		info["offscreen"] = true
+	}
+	return info
+}
+
+func hasPattern(patterns []string, name string) bool {
+	for _, p := range patterns {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}
+
+// getSupportedPatterns checks which UIA patterns are available on an element.
+func getSupportedPatterns(elem *ole.IDispatch) []string {
+	patternChecks := []struct {
+		id   int
+		name string
+	}{
+		{UIA_InvokePatternId, "Invoke"},
+		{UIA_ValuePatternId, "Value"},
+		{UIA_TogglePatternId, "Toggle"},
+		{UIA_SelectionItemPatternId, "SelectionItem"},
+		{UIA_ExpandCollapsePatternId, "ExpandCollapse"},
+		{UIA_ScrollItemPatternId, "ScrollItem"},
+		{UIA_TextPatternId, "Text"},
+	}
+
+	var patterns []string
+	for _, pc := range patternChecks {
+		p, err := uiaElementGetPattern(elem, pc.id)
+		if err == nil && p != nil {
+			patterns = append(patterns, pc.name)
+			p.Release()
+		}
+	}
+	return patterns
+}
+
+// findWindowByPid finds the first top-level window for a given PID using UIAutomation.
+func findWindowByPid(state *uiaState, pid int) (*ole.IDispatch, error) {
+	root, err := uiaGetRootElement(state.automation)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Release()
+
+	cond, err := uiaCreatePropertyCondition(state.automation, UIA_ProcessIdPropertyId, pid)
+	if err != nil {
+		return nil, err
+	}
+	defer cond.Release()
+
+	window, err := uiaElementFindFirst(root, TreeScope_Children, cond)
+	if err != nil {
+		return nil, err
+	}
+	if window == nil {
+		return nil, fmt.Errorf("no window found for PID %d", pid)
+	}
+	return window, nil
+}
+
+// resolvePid returns the given PID or resolves the foreground window PID.
+func resolvePid(pid int) (int, error) {
+	if pid > 0 {
+		return pid, nil
+	}
+	fgHwnd := win32GetForegroundWindow()
+	if fgHwnd == 0 {
+		return 0, fmt.Errorf("no foreground window found")
+	}
+	fgPid := win32GetWindowPid(fgHwnd)
+	if fgPid == 0 {
+		return 0, fmt.Errorf("could not determine foreground window PID")
+	}
+	return int(fgPid), nil
+}
+
+// walkTree recursively walks the UIAutomation tree using FindAll(TreeScope_Children).
+// trueCond is a pre-created TrueCondition to avoid repeated COM allocations.
+// When semantic is true each emitted element also carries its ancestry path,
+// sibling ordinal, and durable sig (kept opt-in: paths meaningfully grow the
+// JSON payload the LLM currently reads verbatim).
+func walkTree(state *uiaState, trueCond *ole.IDispatch, parent *ole.IDispatch, depth, maxDepth int, includeInvisible, semantic bool, path []map[string]any, results *[]map[string]any) {
+	if depth > maxDepth {
+		return
+	}
+
+	arr, err := uiaElementFindAll(parent, TreeScope_Children, trueCond)
+	if err != nil || arr == nil {
+		return
+	}
+	defer arr.Release()
+
+	type childMeta struct {
+		elem       *ole.IDispatch
+		name, ctrl string
+		autoID     string
+		x, y, w, h int
+		visible    bool
+	}
+
+	count := uiaArrayLength(arr)
+	kids := make([]childMeta, 0, count)
+	for i := 0; i < count; i++ {
+		child := uiaArrayGetElement(arr, i)
+		if child == nil {
+			continue
+		}
+		x, y, w, h := uiaElementGetBoundingRect(child)
+		meta := childMeta{elem: child, x: x, y: y, w: w, h: h, visible: w > 0 && h > 0}
+		// Name/type/automation-id are cross-process COM reads. Semantic walks
+		// need them for every sibling (ordinals count skipped ones too, so an
+		// element's ordinal does not shift when a sibling becomes visible);
+		// a plain walk needs them only for the elements it emits.
+		if semantic || meta.visible || includeInvisible {
+			meta.name = truncateRunes(uiaElementGetPropertyStr(child, UIA_NamePropertyId), elementNameRunes)
+			meta.ctrl = controlTypeName(uiaElementGetPropertyInt(child, UIA_ControlTypePropertyId))
+			meta.autoID = uiaElementGetPropertyStr(child, UIA_AutomationIdPropertyId)
+		}
+		kids = append(kids, meta)
+	}
+
+	// Ordinal disambiguates same-signature siblings (third "row" in a list).
+	ordCount := map[string]int{}
+	for _, k := range kids {
+		ord := ordCount[k.ctrl+"|"+k.name]
+		ordCount[k.ctrl+"|"+k.name]++
+
+		if k.visible || includeInvisible {
+			id := state.cache.add(k.elem, desktopElementPrint{name: k.name, role: k.ctrl, autoID: k.autoID, x: k.x, y: k.y, w: k.w, h: k.h})
+			info := buildElementInfoPrefetched(k.elem, id, depth, k.name, k.ctrl, k.autoID, k.x, k.y, k.w, k.h)
+			if semantic {
+				info["path"] = path
+				info["ordinal"] = ord
+				info["sig"] = semanticSig(k.ctrl, k.name, k.autoID, path, ord)
+				// The field's current text, so a value_equals postcondition
+				// can be verified on the desktop surface. Never for a
+				// password field (#465).
+				if patterns, _ := info["patterns"].([]string); hasPattern(patterns, "Value") && !uiaElementGetPropertyBool(k.elem, UIA_IsPasswordPropertyId) {
+					if v, verr := patternGetValue(k.elem); verr == nil && v != "" {
+						info["value"] = truncateRunes(v, 200)
+					}
+				}
+			}
+			*results = append(*results, info)
+		}
+
+		childPath := path
+		if semantic {
+			childPath = append(append([]map[string]any{}, path...), pathSegment(k.ctrl, k.name))
+		}
+		walkTree(state, trueCond, k.elem, depth+1, maxDepth, includeInvisible, semantic, childPath, results)
+
+		if !k.visible && !includeInvisible {
+			k.elem.Release()
+		}
+	}
+}
+
+// uiaInspect performs a tree inspection and returns the result map. With
+// semantic=true, elements additionally carry {path, ordinal, sig} — the
+// durable SemanticRef fields for the structural runtime.
+func uiaInspect(state *uiaState, pid, maxDepth int, includeInvisible, semantic bool) (map[string]any, error) {
+	pid, err := resolvePid(pid)
+	if err != nil {
+		return nil, err
+	}
+
+	window, err := findWindowByPid(state, pid)
+	if err != nil {
+		return nil, err
+	}
+	defer window.Release()
+
+	state.cache.clear()
+
+	trueCond, err := uiaCreateTrueCondition(state.automation)
+	if err != nil {
+		return nil, fmt.Errorf("CreateTrueCondition: %w", err)
+	}
+	defer trueCond.Release()
+
+	windowTitle := uiaElementGetPropertyStr(window, UIA_NamePropertyId)
+
+	var rootPath []map[string]any
+	if semantic {
+		rootPath = []map[string]any{windowSegment(windowTitle)}
+	}
+
+	var elements []map[string]any
+	walkTree(state, trueCond, window, 0, maxDepth, includeInvisible, semantic, rootPath, &elements)
+
+	return map[string]any{
+		"window_title":  windowTitle,
+		"pid":           pid,
+		"element_count": len(elements),
+		"elements":      elements,
+	}, nil
+}
+
+// uiaFindElements searches for elements matching the given criteria.
+func uiaFindElements(state *uiaState, pid int, automationId, name, className, controlType string) (map[string]any, error) {
+	pid, err := resolvePid(pid)
+	if err != nil {
+		return nil, err
+	}
+
+	window, err := findWindowByPid(state, pid)
+	if err != nil {
+		return nil, err
+	}
+	defer window.Release()
+
+	// Build conditions
+	var conditions []*ole.IDispatch
+	defer func() {
+		for _, c := range conditions {
+			c.Release()
+		}
+	}()
+
+	if automationId != "" {
+		c, err := uiaCreatePropertyCondition(state.automation, UIA_AutomationIdPropertyId, automationId)
+		if err == nil {
+			conditions = append(conditions, c)
+		}
+	}
+	if name != "" {
+		c, err := uiaCreatePropertyCondition(state.automation, UIA_NamePropertyId, name)
+		if err == nil {
+			conditions = append(conditions, c)
+		}
+	}
+	if className != "" {
+		c, err := uiaCreatePropertyCondition(state.automation, UIA_ClassNamePropertyId, className)
+		if err == nil {
+			conditions = append(conditions, c)
+		}
+	}
+	if controlType != "" {
+		// Map control type name to ID
+		ctrlId := controlTypeIdFromName(controlType)
+		if ctrlId > 0 {
+			c, err := uiaCreatePropertyCondition(state.automation, UIA_ControlTypePropertyId, ctrlId)
+			if err == nil {
+				conditions = append(conditions, c)
+			}
+		}
+	}
+
+	if len(conditions) == 0 {
+		return nil, fmt.Errorf("at least one search criterion required: automation_id, name, class_name, or control_type")
+	}
+
+	// Combine conditions with AND
+	var condition *ole.IDispatch
+	if len(conditions) == 1 {
+		condition = conditions[0]
+		condition.AddRef() // prevent release in defer above
+	} else {
+		combined := conditions[0]
+		combined.AddRef()
+		for i := 1; i < len(conditions); i++ {
+			next, err := uiaCreateAndCondition(state.automation, combined, conditions[i])
+			if err != nil {
+				combined.Release()
+				return nil, err
+			}
+			combined.Release()
+			combined = next
+		}
+		condition = combined
+	}
+	defer condition.Release()
+
+	// Find all matching elements
+	arr, err := uiaElementFindAll(window, TreeScope_Descendants, condition)
+	if err != nil {
+		return nil, err
+	}
+	if arr != nil {
+		defer arr.Release()
+	}
+
+	// Don't clear cache — allow mixing inspect + find results (matches C# behavior)
+	var results []map[string]any
+	if arr != nil {
+		length := uiaArrayLength(arr)
+		for i := 0; i < length; i++ {
+			elem := uiaArrayGetElement(arr, i)
+			if elem != nil {
+				id := state.cache.add(elem, uiaElementPrint(elem))
+				results = append(results, buildElementInfo(elem, id, 0))
+			}
+		}
+	}
+
+	out := map[string]any{
+		"match_count": len(results),
+		"elements":    results,
+	}
+	if len(results) == 0 {
+		// An empty result gave the model nothing to correct with (it would
+		// blindly retry the same query). Surface the closest-named elements
+		// in the window so it can fix its search terms — exact-match Name
+		// conditions miss "Save As…" when asked for "Save".
+		similar, truncated := collectNearMisses(state, window, name, controlType)
+		switch {
+		case len(similar) > 0:
+			out["similar"] = similar
+			out["hint"] = "no exact match; 'similar' lists close elements in this window - Name matching is exact and case-sensitive, so retry with one of those exact names, or use desktop_snapshot to see everything"
+		case truncated:
+			// Only part of a large window was scanned, so "nothing similar"
+			// is not something we are in a position to say.
+			out["hint"] = "no exact match, and the search for similar elements stopped partway through a large window without finding one - that is not the same as there being none; run desktop_snapshot to see what this window actually contains"
+		default:
+			out["hint"] = "no match and nothing similar found in this window - the target may not exist yet (still loading?) or lives in another window; run desktop_list_windows and desktop_snapshot to orient"
+		}
+	}
+	return out, nil
+}
+
+// nearMissCondition narrows the near-miss walk where doing so cannot change
+// the answer.
+//
+// Only the nameless search qualifies. With no name, scoring keeps an element
+// solely for having the requested control type, so asking UIA for that type
+// up front returns the same candidates over a fraction of the tree. As soon
+// as a name is in play the walk has to stay wide: "you asked for a button
+// called Save, but there is a menu item called Save As" is the single most
+// useful correction this can offer, and filtering by control type first is
+// exactly what would throw it away.
+func nearMissCondition(state *uiaState, wantName, wantType string) (*ole.IDispatch, error) {
+	if wantName == "" && wantType != "" {
+		if ctrlID := controlTypeIdFromName(wantType); ctrlID > 0 {
+			if cond, err := uiaCreatePropertyCondition(state.automation, UIA_ControlTypePropertyId, ctrlID); err == nil {
+				return cond, nil
+			}
+		}
+	}
+	return uiaCreateTrueCondition(state.automation)
+}
+
+// collectNearMisses walks the window subtree and returns up to 8 elements
+// whose name loosely matches the requested one (or whose control type
+// matches when no name was given). Read-only: nothing is cached.
+//
+// This runs on the failure path, and the walk is not free: FindAll over a
+// window's descendants materialises the whole subtree before any of the
+// scoring below happens, which is the real cost here (scanCap only bounds
+// what we then inspect). So the search is narrowed as far as the caller's
+// own criteria allow, and skipped outright when they leave nothing to score
+// against.
+// The second return says whether the scan was cut short by scanCap. An
+// empty result then means "nothing similar in the part we looked at", which
+// is not the same claim as "nothing similar in this window", and the caller
+// has to phrase its hint accordingly.
+func collectNearMisses(state *uiaState, window *ole.IDispatch, wantName, wantType string) ([]map[string]any, bool) {
+	want := strings.ToLower(strings.TrimSpace(wantName))
+
+	// Scoring needs either a name to be near or a control type to share.
+	// Searches by automation_id or class_name alone give neither, and every
+	// candidate would score zero after a full-tree walk.
+	if want == "" && wantType == "" {
+		return nil, false
+	}
+
+	cond, err := nearMissCondition(state, want, wantType)
+	if err != nil {
+		return nil, false
+	}
+	defer cond.Release()
+
+	arr, err := uiaElementFindAll(window, TreeScope_Descendants, cond)
+	if err != nil || arr == nil {
+		return nil, false
+	}
+	defer arr.Release()
+
+	type scored struct {
+		info  map[string]any
+		score int
+	}
+	wantTokens := strings.Fields(want)
+
+	var candidates []scored
+	length := uiaArrayLength(arr)
+	const scanCap = 500 // bound the walk on huge trees
+	truncated := length > scanCap
+	if truncated {
+		length = scanCap
+	}
+	for i := 0; i < length; i++ {
+		elem := uiaArrayGetElement(arr, i)
+		if elem == nil {
+			continue
+		}
+		elemName := uiaElementGetPropertyStr(elem, UIA_NamePropertyId)
+		ctrlType := controlTypeNames[uiaElementGetPropertyInt(elem, UIA_ControlTypePropertyId)]
+		autoID := uiaElementGetPropertyStr(elem, UIA_AutomationIdPropertyId)
+		elem.Release()
+
+		if strings.TrimSpace(elemName) == "" {
+			continue
+		}
+		score := 0
+		if want != "" {
+			lower := strings.ToLower(elemName)
+			switch {
+			case strings.Contains(lower, want) || strings.Contains(want, lower):
+				score = 3
+			default:
+				for _, tok := range wantTokens {
+					if len(tok) >= 3 && strings.Contains(lower, tok) {
+						score = 2
+						break
+					}
+				}
+			}
+		} else if wantType != "" && ctrlType == wantType {
+			score = 1
+		}
+		if score == 0 {
+			continue
+		}
+		candidates = append(candidates, scored{
+			info:  map[string]any{"name": elemName, "control_type": ctrlType, "automation_id": autoID},
+			score: score,
+		})
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+	if len(candidates) > 8 {
+		candidates = candidates[:8]
+	}
+	out := make([]map[string]any, len(candidates))
+	for i, c := range candidates {
+		out[i] = c.info
+	}
+	return out, truncated
+}
+
+// controlTypeIdFromName maps a human-readable control type name to its UIAutomation ID.
+func controlTypeIdFromName(name string) int {
+	for id, n := range controlTypeNames {
+		if n == name {
+			return id
+		}
+	}
+	return 0
+}
+
+// ── Win32 helpers ────────────────────────────────────────────────────
+
+var (
+	user32                    = syscall.NewLazyDLL("user32.dll")
+	kernel32                  = syscall.NewLazyDLL("kernel32.dll")
+	procGetForegroundWindow   = user32.NewProc("GetForegroundWindow")
+	procGetWindowThreadProcId = user32.NewProc("GetWindowThreadProcessId")
+	procGetAncestor           = user32.NewProc("GetAncestor")
+	procWindowFromPoint       = user32.NewProc("WindowFromPoint")
+	procGetGUIThreadInfo      = user32.NewProc("GetGUIThreadInfo")
+	procSetCursorPos          = user32.NewProc("SetCursorPos")
+	procMouseEvent            = user32.NewProc("mouse_event")
+	procSetForegroundWindow   = user32.NewProc("SetForegroundWindow")
+	procShowWindow            = user32.NewProc("ShowWindow")
+	procSleep                 = kernel32.NewProc("Sleep")
+)
+
+func win32GetForegroundWindow() uintptr {
+	hwnd, _, _ := procGetForegroundWindow.Call()
+	return hwnd
+}
+
+func win32GetWindowPid(hwnd uintptr) uint32 {
+	var pid uint32
+	procGetWindowThreadProcId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	return pid
+}
+
+// gaRoot is GA_ROOT: walk up the PARENT chain to the top-level window,
+// stopping before the desktop, so a child HWND inside a hosted control (a
+// WebView2 surface, say) resolves to the window the person actually sees.
+// It does not follow owners (that is GA_ROOTOWNER): an owned popup is its own
+// top-level window.
+const gaRoot = 2
+
+// win32RootWindow returns the top-level window that hosts hwnd, or hwnd
+// itself when it is already top-level (or GetAncestor fails).
+func win32RootWindow(hwnd uintptr) uintptr {
+	if hwnd == 0 {
+		return 0
+	}
+	root, _, _ := procGetAncestor.Call(hwnd, gaRoot)
+	if root == 0 {
+		return hwnd
+	}
+	return root
+}
+
+// guiThreadInfo mirrors Win32's GUITHREADINFO. Field order and widths are
+// the SDK's: two DWORDs, six HWNDs, then a RECT, which is 72 bytes on amd64.
+// cbSize must be set or the call fails.
+type guiThreadInfo struct {
+	CbSize        uint32
+	Flags         uint32
+	HwndActive    uintptr
+	HwndFocus     uintptr
+	HwndCapture   uintptr
+	HwndMenuOwner uintptr
+	HwndMoveSize  uintptr
+	HwndCaret     uintptr
+	RcCaret       struct{ Left, Top, Right, Bottom int32 }
+}
+
+const (
+	guiInMenuMode     = 0x00000004
+	guiSystemMenuMode = 0x00000008
+	guiPopupMenuMode  = 0x00000010
+)
+
+// win32ForegroundGUIInfo reads the input state of the foreground thread:
+// which window holds the mouse capture, and whether a menu is up. It is a
+// kernel-side read with no message send, so it is safe from a low-level
+// hook callback.
+//
+// ok is false when the call fails, and every caller must then behave as if
+// it had never asked. Failing that way round is deliberate: this guard
+// exists to suppress clicks, and a guard that cannot read the state must
+// not start suppressing everything.
+func win32ForegroundGUIInfo() (guiThreadInfo, bool) {
+	var gui guiThreadInfo
+	gui.CbSize = uint32(unsafe.Sizeof(gui))
+	// idThread 0 means the foreground thread.
+	r, _, _ := procGetGUIThreadInfo.Call(0, uintptr(unsafe.Pointer(&gui)))
+	if r == 0 {
+		return guiThreadInfo{}, false
+	}
+	return gui, true
+}
+
+// win32WindowFromPoint returns the window under a screen point -- the one
+// that would receive a click there. It hit-tests, so a window that declares
+// itself transparent to the mouse is skipped in favour of the window behind
+// it, which is what makes it a better answer than the topmost window UIA's
+// own hit test returns.
+//
+// The result can be a child window; resolve it through win32RootWindow to
+// get the top-level window a person would name.
+func win32WindowFromPoint(x, y int) uintptr {
+	hwnd, _, _ := procWindowFromPoint.Call(packPoint(x, y))
+	return hwnd
+}
+
+// win32WindowStillThere reports whether hwnd still exists, and which process
+// owns it now.
+//
+// Both halves matter to a caller checking a handle it recorded earlier:
+// Windows reuses HWND values, so a handle that still answers IsWindow can be
+// a different window wearing a dead one's number, and only the owning
+// process tells the two apart.
+func win32WindowStillThere(hwnd uintptr) (exists bool, pid uint32) {
+	if hwnd == 0 {
+		return false, 0
+	}
+	alive, _, _ := procIsWindow.Call(hwnd)
+	if alive == 0 {
+		return false, 0
+	}
+	return true, win32GetWindowPid(hwnd)
+}
+
+const (
+	MOUSEEVENTF_LEFTDOWN  = 0x0002
+	MOUSEEVENTF_LEFTUP    = 0x0004
+	MOUSEEVENTF_RIGHTDOWN = 0x0008
+	MOUSEEVENTF_RIGHTUP   = 0x0010
+)
+
+func win32Click(x, y int) {
+	procSetCursorPos.Call(uintptr(x), uintptr(y))
+	procSleep.Call(50)
+	procMouseEvent.Call(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+	procMouseEvent.Call(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+}
+
+func win32DoubleClick(x, y int) {
+	procSetCursorPos.Call(uintptr(x), uintptr(y))
+	procSleep.Call(50)
+	procMouseEvent.Call(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+	procMouseEvent.Call(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+	procSleep.Call(50)
+	procMouseEvent.Call(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+	procMouseEvent.Call(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+}
+
+func win32RightClick(x, y int) {
+	procSetCursorPos.Call(uintptr(x), uintptr(y))
+	procSleep.Call(50)
+	procMouseEvent.Call(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+	procMouseEvent.Call(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+}

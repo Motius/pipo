@@ -1,0 +1,578 @@
+<div align="center">
+
+# pipo
+
+**Pipo — Your Company Workflow Brain**
+
+[![CI](https://github.com/Motius/pipo/actions/workflows/test.yml/badge.svg)](https://github.com/Motius/pipo/actions/workflows/test.yml)
+[![bun](https://img.shields.io/npm/v/@pipo/brain?label=bun&logo=bun&color=%23f9f1e1)](https://bun.sh/packages/@pipo/brain)
+[![License](https://img.shields.io/badge/license-RSALv2-blue)](LICENSE)
+[![Runtime](https://img.shields.io/badge/runtime-Bun-%23f9f1e1)](https://bun.sh)
+[![Website](https://img.shields.io/badge/website-pipo.dev-black)](https://pipo.dev)
+
+*An always-on autonomous AI daemon with desktop awareness, multi-agent hierarchy, visual workflows, and goal pursuit.*
+
+pipo is not a chatbot with tools. It is a persistent daemon that sees your screen, understands what you're doing, and acts — within the authority limits you define. Run it on a server for 24/7 availability, then connect sidecars on your laptop, desktop, or any other machine to give it eyes and hands everywhere.
+
+</div>
+
+> **Pipo migration note:** this checkout is the Pipo-branded migration of the upstream daemon. The complete rename, premium UI direction, verification notes, scaling guidance, and launch plan are in [`docs/PIPO_OPERATIONS_GUIDE.md`](docs/PIPO_OPERATIONS_GUIDE.md).
+
+<!-- Add the final product screenshot or demo GIF here when the Motius media asset is approved. -->
+
+---
+
+## Table of Contents
+
+- [pipo](#pipo)
+  - [Table of Contents](#table-of-contents)
+  - [🔍 What Makes pipo Different](#-what-makes-pipo-different)
+  - [⚡ Quick Start](#-quick-start)
+  - [🪨 Ambient mode (recommended)](#-ambient-mode-recommended)
+  - [☁️ Managed Hosting](#️-managed-hosting)
+  - [💡 Use Cases](#-use-cases)
+  - [📋 Requirements](#-requirements)
+  - [📦 Installation](#-installation)
+    - [bun (recommended)](#bun-recommended)
+    - [Docker](#docker)
+    - [One-liner](#one-liner)
+    - [Manual](#manual)
+  - [🚀 Usage](#-usage)
+    - [Keeping pipo running](#keeping-pipo-running)
+    - [Updating](#updating)
+    - [Removing pipo](#removing-pipo)
+  - [🖥️ Sidecar Setup](#️-sidecar-setup)
+    - [1. Install the sidecar](#1-install-the-sidecar)
+    - [2. Enroll in the dashboard](#2-enroll-in-the-dashboard)
+    - [3. Run the sidecar](#3-run-the-sidecar)
+  - [🧠 Core Capabilities](#-core-capabilities)
+  - [⚙️ Configuration](#️-configuration)
+  - [🏗️ Architecture](#️-architecture)
+  - [🛠️ Development](#️-development)
+    - [Stack](#stack)
+  - [📖 Documentation](#-documentation)
+  - [💬 Community](#-community)
+  - [📊 Telemetry](#-telemetry)
+  - [🔒 Security](#-security)
+  - [📄 License](#-license)
+
+---
+
+## 🔍 What Makes pipo Different
+
+| Feature | Typical AI Assistant | pipo |
+|---|---|---|
+| Always-on | No — request/response only | Yes — persistent daemon, runs 24/7 on a server or locally |
+| Reach across machines | No — single machine only | Yes — one daemon, unlimited sidecars on any machine |
+| Desktop awareness | No | Yes — screen capture every 5-10s via sidecar |
+| Native app control | No | Yes — Go sidecar with Win32/X11/macOS automation |
+| Multi-agent delegation | No | Yes — 9 specialist roles |
+| Visual workflow builder | No | Yes — 50+ nodes, n8n-style |
+| Voice with wake word | No | Yes — streaming TTS + openwakeword |
+| Goal pursuit (OKRs) | No | Yes — drill sergeant accountability |
+| Authority gating | No | Yes — runtime enforcement + audit trail |
+| LLM provider choice | Usually locked to one | Anthropic, OpenAI, Gemini, Ollama, Groq, OpenRouter, OmniRoute, and more |
+
+---
+
+## ⚡ Quick Start
+
+```bash
+bun install -g @pipo/brain   # Install the daemon
+pipo start -d                   # Start as background daemon
+```
+
+Open `http://localhost:1846` — the dashboard walks you through LLM provider, voice, and a quick conversational profile interview the first time you visit.
+
+---
+
+## 🪨 Ambient mode
+
+pipo ships a "dashboard-less" experience built around a small cursor-following pebble — **on by default** after onboarding. Just run:
+
+```bash
+bun run start
+```
+
+What you get:
+
+- **Pebble** — a small paper-toned disc that follows your cursor. Wake-word ("Hey pipo"), `Ctrl+Shift+Space`, or click summons it. Long-press the disc to blind awareness instantly (privacy toggle); the eye glyph next to it shows when pipo is actively reading your screen.
+- **Native windows** — every dashboard room (workflows, memory, settings, …) opens as a real Windows window via voice ("open settings", "show me workflows") or `Ctrl+Shift+K`. No browser tab.
+
+  Both hotkeys changed in #563: they used to be `Ctrl+Space` and `Ctrl+K`, which collide with macOS's "select the previous input source" and with the system-wide Emacs kill-line binding that every text field honours. Set `pebble.summon_hotkey` / `pebble.palette_hotkey` in `~/.pipo/config.yaml` to change them, or to `off` to have none. One cost worth knowing on **Windows and Linux**, where a hotkey is grabbed exclusively: while pipo runs it takes `Ctrl+Shift+K` away from Firefox's Web Console and VS Code's delete-line, and `Ctrl+Shift+Space` away from VS Code's parameter hints and Word's non-breaking space. On macOS those apps use Cmd for all four, so nothing is taken. See [docs/PEBBLE_HOTKEYS.md](docs/PEBBLE_HOTKEYS.md).
+- **Sub-pebble rail** — say "in the background, research X" and a colored sub-pebble flies to the right edge of your screen. Click it to see what the agent is doing; "open full ↗" pops a dedicated result panel.
+- **Voice-first** — "what's on my screen?", "close all background agents", "open the workflows window", "in the background, summarize today's meeting notes" — all routed inline, no LLM round-trip for the common verbs.
+
+The native sidecar has platform-specific backends for **Windows, macOS, and Linux**. On headless machines, CI, or systems without native desktop integration, the `localhost:1846` dashboard remains available as the primary surface.
+
+> **Opt out:** set `pipo_AMBIENT_UI=0` to disable the pebble + sidecar voice loop (useful for headless servers, CI, or users who only want the web dashboard).
+
+---
+
+## ☁️ Managed Hosting
+
+Don't want to deal with servers, DNS, or TLS certificates? We've partnered with **[opencove.host](https://opencove.host)** — a managed hosting platform built specifically for pipo.
+
+- **No self-hosting hassle** — no server to provision, no dependencies to install
+- **Dedicated domain included** — no need to buy a domain or configure DNS and TLS
+- **Up and running in under 5 minutes** — spin up your pipo instance and start using it immediately
+
+Visit [opencove.host](https://opencove.host) to get started.
+
+---
+
+## 💡 Use Cases
+
+**Research while you work** — Ask pipo to deep-dive a topic. It runs browser searches, reads pages, and compiles a summary in the background while you focus on other things.
+
+**Automate across machines** — Run the daemon on your home server. Connect sidecars on your work laptop and your desktop. pipo can move files between them, run scripts on your server, and open apps on your laptop — all from one conversation.
+
+**Inbox triage** — Set up a workflow that monitors your Gmail, categorizes incoming messages, drafts replies for your review, and schedules follow-ups on your calendar.
+
+**Desktop co-pilot** — pipo watches your screen via the sidecar. If it sees you struggling with an error message or a complex form, it proactively offers help or fills in fields for you.
+
+**Goal accountability** — Define OKRs in the Goals dashboard. pipo plans your day each morning, checks in during the evening, and escalates if you're falling behind — like a personal drill sergeant.
+
+**Multi-step workflows** — Build visual automations with 50+ node types: "when a file appears in this folder, OCR it, extract key data, update the spreadsheet, and notify me on Telegram."
+
+---
+
+## 📋 Requirements
+
+- **Bun** >= 1.0 (installed automatically if missing)
+- **OS (native daemon install)**: macOS, Linux, Windows, or WSL
+- **LLM API key** — at least one of: Anthropic, OpenAI, Google Gemini, or a local Ollama instance
+
+---
+
+## 📦 Installation
+
+### bun (recommended)
+
+```bash
+bun install -g @pipo/brain
+pipo start
+```
+
+The first time you run `pipo start`, the daemon boots in setup mode and the dashboard at `http://localhost:1846` guides you through LLM provider, voice (TTS) choice, a conversational profile interview, and a 10-minute spotlight tour.
+
+> **Restart after first-time setup:** The daemon constructs background services (heartbeat, commitments, awareness) at boot, gated on setup having already been completed. Once you finish setup in the dashboard, those services don't activate until the next start — the dashboard shows a banner reminding you. Run `pipo restart` (or stop/start) to bring them online. This will go away in a follow-up that constructs the services in-process at setup completion.
+
+> **Windows note:** Native Windows is supported for the daemon and sidecar where the required desktop permissions are available. Docker or WSL2 remain useful for headless/server deployments. The dashboard and core workflow engine do not require a native desktop sidecar.
+
+### Docker
+
+Run pipo on any OS with a single command — no Bun or dependencies required. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows, macOS, Linux) if you don't have Docker yet.
+
+```bash
+docker run -d --name pipo \
+  -p 1846:1846 \
+  -v pipo-data:/data \
+  ghcr.io/Motius/pipo:latest
+```
+
+The image is available on [GHCR](https://ghcr.io/Motius/pipo). Non-LLM configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume. LLM providers, API keys, and model routing are configured from the settings dashboard (open http://localhost:1846 after first boot) and stored in the database + encrypted keychain - they are not set via env vars or `config.yaml`.
+
+> **Note:** Docker runs in an isolated container, so the daemon inside it cannot access your host desktop, browser, or clipboard directly. You must still install the [sidecar](#️-sidecar-setup) on each machine where you want pipo to have desktop awareness and automation capabilities.
+
+### One-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
+```
+
+After opening a new terminal, run:
+
+```bash
+pipo start
+```
+
+The install script sets up Bun, clones the repo, and links the `pipo` CLI. Then finish setup in your browser at `http://localhost:1846`.
+
+> **Note:** The one-liner is intended for macOS, Linux, and WSL. On native Windows, use the manual Bun install or Docker Desktop; the runtime and asset build scripts are platform-neutral.
+
+### Manual
+
+```bash
+git clone https://github.com/Motius/pipo.git ~/.pipo/daemon
+cd ~/.pipo/daemon
+bun install
+bun run build:ui
+bun link
+pipo start
+```
+
+Then open `http://localhost:1846` to finish setup in the dashboard.
+
+---
+
+## 🚀 Usage
+
+```bash
+pipo start            # Start in foreground
+pipo start -d         # Start as background daemon
+pipo start --port 1846 # Start on a specific port
+pipo stop             # Stop the daemon
+pipo status           # Check if running
+pipo doctor           # Verify environment & connectivity
+pipo logs -f          # Follow live logs
+pipo autostart        # Keep it running across logins (and boots, on Linux)
+```
+
+The dashboard is available at `http://localhost:1846` once the daemon is running.
+
+### Logs
+
+`pipo start -d` writes the daemon's output to `~/.pipo/logs/pipo.log`, and
+`pipo logs -f` follows it. Started any other way - in the foreground, under
+systemd, in Docker - there is no file: output goes to the terminal, `journalctl`
+or `docker logs`. To get the same file in every launch mode, add to
+`~/.pipo/config.yaml`:
+
+```yaml
+daemon:
+  log_file_path: "~/.pipo/logs/pipo.log"
+  log_file_max_bytes: 1048576   # optional, defaults to 1 MiB
+```
+
+The daemon mirrors its output there in addition to wherever it already goes.
+Lines are timestamped, stripped of terminal colour codes, and run through the
+credential redactor, so the file is safe to hand to someone debugging. It is
+capped: past `log_file_max_bytes` the oldest lines are dropped, so it settles at
+roughly that size instead of filling the disk. Unset means no file.
+
+The cap is an in-memory ring as well as a file size, so `log_file_max_bytes` is
+an RSS budget too - 1 MiB of log is 1 MiB of daemon memory. It is clamped to
+4 KiB..64 MiB.
+
+One thing to expect from `pipo logs -f`: it runs `tail -F`, and every time the
+cap is enforced the file is replaced, so `tail` reopens it and reprints the
+whole window. At the default size that is ~1 MiB of already-seen lines about
+every 256 KiB of new output. That is inherent to capping one file in place, not
+a bug.
+
+### Keeping pipo running
+
+`pipo autostart` installs the service that starts pipo at login and brings it
+back after a crash: a **systemd user service** on Linux, a **launchd user agent**
+on macOS. Nothing else in pipo installs one, so until you run it the daemon
+only runs for as long as you keep it running yourself.
+
+```bash
+pipo autostart              # install or refresh the definition, and start it
+pipo autostart --status     # what is installed, and whether it is current
+pipo autostart --uninstall  # stop the service and remove the definition
+```
+
+What it will and will not do:
+
+- **It never overwrites a definition that differs from the one this version
+  writes.** It prints the differences and writes nothing; `pipo autostart
+  --force` applies them. An install from an older pipo and an edit of your own
+  look the same from here, and even the `bun` path differs between shells. On
+  Linux, `systemctl --user edit pipo.service` is the way to keep your changes:
+  a drop-in survives a reinstall.
+- **It starts the service only when no daemon is running already.** The service
+  starts the daemon itself, so a second one would fail on the lock file. Pass
+  `--no-start` to install the definition without starting anything.
+- **A refresh does not restart a running daemon.** It keeps the definition it was
+  started with until it restarts, and the command prints the one line that
+  applies the new one.
+- **`pipo stop` stays stopped.** Both definitions bring pipo back after a
+  failure only, never after a clean exit. The exception is a stop whose drain
+  overruns its deadline and escalates to `SIGKILL`: that is not a clean exit, so
+  it is relaunched. Remove autostart first if you need such a daemon to stay
+  down.
+- **A crash loop is bounded on Linux only.** systemd gives up after five starts
+  in two minutes and leaves the unit failed, which `pipo status` explains.
+  launchd has no equivalent, so on macOS a daemon that cannot boot is retried
+  about every ten seconds for as long as you are logged in. A `pipo restart`
+  there also leaves the new daemon outside the agent until your next login, and
+  says so.
+
+`pipo status` names a definition that still has what this version fixed - a
+browser opening on every start, an unbounded restart loop, a `pipo stop` that
+gets undone - whenever it can tell, and `pipo uninstall` removes autostart for
+you, in the order that does not get the daemon relaunched mid-uninstall. See
+[Running under systemd](docs/SELF_HOSTING.md#running-under-systemd) for what
+changes once pipo is a unit's main process.
+
+### Updating
+
+`pipo update` detects how you installed pipo and runs the right update command. Equivalent manual commands per install method:
+
+| Install method | `pipo update` dispatches to |
+| --- | --- |
+| Bun global (`bun install -g @pipo/brain`) | `bun update -g @pipo/brain` |
+| `install.sh` (git clone under `~/.pipo/daemon`) | `git pull --ff-only` + `bun install` |
+| Docker | Refused — run `docker pull <image> && docker rm -f pipo && docker run ...` on the host |
+| Developer checkout | Refused — run `git pull` yourself |
+
+Run `pipo doctor` to see what was detected and the exact commands for your install.
+
+**Under a systemd user service** (pipo is the main process of a unit such as `pipo.service`), `pipo update` and `pipo restart` go through systemd instead of stopping and starting the daemon themselves. See [Running under systemd](docs/SELF_HOSTING.md#running-under-systemd) for the details. In short:
+
+- The update runs as a separate transient unit named `<unit>-update`, for example `pipo-update`. It stops the service, installs, and starts the service again. From a terminal, `pipo update` follows it until it finishes or hits its time limit. From anywhere else, including the assistant's own shell, it returns straight away. Follow it with `journalctl --user -u pipo-update -f`, and `pipo status` shows the last result.
+- `pipo restart` asks systemd to restart the unit and ignores `-d`, `--port` and the other start flags.
+
+### Removing pipo
+
+`pipo uninstall` stops the daemon, removes autostart hooks, deletes `~/.pipo`, and — where applicable — runs the correct package-manager uninstall. It does **not** touch sidecars.
+
+| Install method | `pipo uninstall` dispatches to |
+| --- | --- |
+| Bun global | `bun uninstall -g @pipo/brain` + side-effect cleanup |
+| `install.sh` | `rm -rf ~/.pipo/daemon` + CLI wrapper + side-effect cleanup |
+| Docker | Refused — run `docker rm -f pipo` (and optionally `docker volume rm pipo-data`) on the host |
+| Developer checkout | Side-effect cleanup only — your checkout is left in place |
+
+> **Tip:** If you already ran `bun uninstall -g @pipo/brain` without going through `pipo uninstall`, your daemon may still be running and `~/.pipo` is still on disk. Run `pipo doctor` before uninstalling to see what will be cleaned up, or stop the daemon and remove `~/.pipo` manually.
+
+---
+
+## 🖥️ Sidecar Setup
+
+The sidecar is what gives pipo physical reach beyond the machine it runs on. It is a lightweight agent that you install on any machine — your laptop, a dev server, a home PC — and it connects back to the central daemon over an authenticated WebSocket. Each sidecar gives pipo access to that machine's desktop, browser, terminal, filesystem, clipboard, and screenshots.
+
+This means you can run the daemon on an always-on server and still interact with your desktop machines as if pipo were running locally. Enroll as many sidecars as you want.
+
+### 1. Install the sidecar
+
+**Via bun:**
+
+```bash
+bun install -g @pipo/sidecar
+```
+
+**Or download the binary** from [GitHub Releases](https://github.com/Motius/pipo/releases) for your platform (macOS, Linux, Windows).
+
+### 2. Enroll in the dashboard
+
+1. Open the pipo dashboard at `http://localhost:1846`
+2. Go to **Settings** → **Sidecar**
+3. Enter a friendly name for this machine (e.g. "work laptop") and click **Enroll**
+4. Click **Copy** to copy the token command
+
+### 3. Run the sidecar
+
+Just start it:
+
+```bash
+pipo
+```
+
+The first time it runs unconfigured, a small **setup window** pops up asking for
+the enrollment token — paste the token you copied and click **Connect**. The
+sidecar saves it locally (`~/.pipo/sidecar.yaml`) and connects.
+
+Prefer the terminal / a headless box? Pass the token on the CLI instead (no
+window):
+
+```bash
+pipo --token <your-token>
+```
+
+Either way, subsequent runs are just `pipo` (the saved token is reused).
+
+Once connected, the sidecar appears as online in the Settings page where you can configure its capabilities (terminal, filesystem, desktop, browser, clipboard, screenshot, awareness, file watch, processes, notifications). The host-sensing observers (clipboard, file watch, process monitor, desktop notifications) run inside the sidecar on your machine and stream to the brain - the brain no longer observes its own host.
+
+### Versioning & updates
+
+The sidecar is versioned **independently of the brain**, and every brain release ships with a specific sidecar version. Run `pipo --version` to see what you have.
+
+The sidecar updates itself to the version your brain ships with (never to anything newer than your brain knows about):
+
+- **At startup**, if an update is available, the sidecar shows a prompt: *Update now*, *Later*, or *Skip this version* (Windows and macOS).
+- **While running**, the tray menu gets an *Update to vX.Y.Z* item, and the dashboard shows a *sidecar update* hint in the top bar and an *Update* button in **Settings -> Sidecar**. On Windows and macOS these open the same prompt on that machine; on Linux the dashboard installs the update directly after asking you.
+- The update is downloaded from npm, checked (sha512, plus the code signature on Windows and macOS) and swapped in place, and the sidecar restarts in a few seconds; the brain keeps working meanwhile. If the new version keeps failing to start, the previous one is restored.
+- A sidecar installed with bun or npm is updated with that package manager. If it cannot be updated automatically, you get the exact command to run instead (`bun add -g @pipo/sidecar@X.Y.Z`, or the installer from [GitHub Releases](https://github.com/Motius/pipo/releases/tag/installer-latest)).
+
+If a sidecar is too old for the brain (**Update required**), the brain refuses the connection; the sidecar stays running, shows its update prompt (or a desktop notification on Linux) and tries the brain again every 30 minutes. Local development builds report `dev` and are never updated or blocked.
+
+---
+
+## 🧠 Core Capabilities
+
+**Conversations** — Multi-provider LLM routing (Anthropic Claude, OpenAI GPT, Google Gemini, Ollama). Streaming responses, personality engine, vault-injected memory context on every message.
+
+**Tool Execution** — 14+ builtin tools with up to 200 iterations per turn. The agent loop runs until the task is complete, not until the response looks done.
+
+**Memory & Knowledge** — Vault knowledge graph (entities, facts, relationships) stored in SQLite. Extracted automatically after each response. Injected into the system prompt so pipo always remembers what matters.
+
+**Browser Control** — Auto-launches Chromium via CDP. 7 browser tools handle navigation, interaction, extraction, and form filling.
+
+**Desktop Automation** — Go sidecar with JWT-authenticated WebSocket, RPC protocol, and binary streaming. Win32 API automation (EnumWindows, UIAutomation, SendKeys) on Windows, X11 tools on Linux.
+
+**Multi-Agent Hierarchy** — `delegate_task` and `manage_agents` tools. An AgentTaskManager coordinates 9 specialist roles. Sub-agents are denied governed actions — authority stays with the top-level agent.
+
+**Voice Interface** — Edge TTS or ElevenLabs with streaming sentence-by-sentence playback. Binary WebSocket protocol carries mic audio (WebM) and TTS audio (MP3) on the same connection. Wake word via openwakeword (ONNX, runs in-browser).
+
+**Continuous Awareness** — Full desktop capture at 5-10 second intervals. Hybrid OCR (Tesseract.js) + Cloud Vision. Struggle detection, activity session inference, entity-linked context graph. Proactive suggestions and an overlay widget.
+
+**Workflow Automation** — Visual builder powered by `@xyflow/react`. 50+ nodes across 5 categories. Triggers: cron, webhook, file watch, screen events, polling, clipboard, process, git, email, calendar. NL chat creation, YAML export/import, retry + fallback + AI-powered self-heal.
+
+**Goal Pursuit** — OKR hierarchy (objective → key result → daily action). Google-style 0.0-1.0 scoring. Morning planning, evening review, drill sergeant escalation. Awareness pipeline auto-advances progress. Three dashboard views: kanban, timeline, metrics.
+
+**Authority & Autonomy** — Runtime enforcement with soft-gate approvals. Multi-channel approval delivery (chat, Telegram, and desktop). Full audit trail. Emergency pause/kill controls. Consecutive-approval learning suggests auto-approve rules.
+
+---
+
+## ⚙️ Configuration
+
+pipo stores its system configuration at `~/.pipo/config.yaml`; user-level settings live in its database and are managed from the dashboard. Access is **JWT-only by default**: run `pipo enroll "<device-name>"` and paste the printed token into the sidecar (desktop app), which connects and gives you the dashboard. Setting up without a sidecar? Temporarily add `auth:\n  insecure_open_access: true` to config.yaml, open `http://localhost:1846` after `pipo start` for the guided setup, then **remove the flag** once your device is enrolled. The Settings room lets you tweak channels, personality, and authority later.
+
+Running the brain on another machine — a home server, a LAN box, or a VPS with a domain? Read [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for the reverse-proxy setup, `brain_domain`, device enrollment across machines, and what plain-HTTP access does and doesn't support.
+
+```yaml
+daemon:
+  port: 1846
+  data_dir: "~/.pipo"
+  db_path: "~/.pipo/pipo.db"
+
+llm:
+  primary: "anthropic"
+  fallback: ["openai", "gemini", "ollama"]
+  anthropic:
+    api_key: "sk-ant-..."
+    model: "claude-sonnet-4-6"
+
+personality:
+  core_traits: ["loyal", "efficient", "proactive"]
+  assistant_name: "pipo"
+
+authority:
+  default_level: 3
+
+active_role: "personal-assistant"
+```
+
+See [config.example.yaml](config.example.yaml) for the full reference including Google OAuth, Telegram, ElevenLabs, and voice settings.
+
+---
+
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     pipo Daemon                           │
+│                  (server or local machine)                  │
+│                                                             │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐   │
+│  │ LLM      │  │ Vault    │  │ Agent     │  │ Workflow  │   │
+│  │ Router   │  │ Memory   │  │ Manager   │  │ Engine    │   │
+│  └──────────┘  └──────────┘  └───────────┘  └───────────┘   │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐   │ 
+│  │ Tool     │  │ Authority│  │ Goal      │  │ Awareness │   │
+│  │ Executor │  │ Engine   │  │ Tracker   │  │ Pipeline  │   │
+│  └──────────┘  └──────────┘  └───────────┘  └───────────┘   │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ Bun.serve() — HTTP + WebSocket + Dashboard (React)   │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────┬──────────────────────┬───────────────────────┘
+               │ JWT-auth WebSocket   │
+       ┌───────┴───────┐       ┌──────┴────────┐
+       │  Sidecar #1   │       │  Sidecar #2   │      ...
+       │  (laptop)     │       │  (dev server) │
+       │               │       │               │
+       │  desktop      │       │  terminal     │
+       │  browser      │       │  filesystem   │
+       │  terminal     │       │  screenshots  │
+       │  clipboard    │       │               │
+       └───────────────┘       └───────────────┘
+```
+
+The **daemon** is the brain — it holds the LLM connections, memory vault, agent hierarchy, and all decision-making. It can run on a home server, a VPS, or your local machine.
+
+**Sidecars** are the hands. Each sidecar is a lightweight Go binary that connects to the daemon and exposes its host machine's capabilities. The daemon can orchestrate actions across all connected sidecars simultaneously. Sidecars authenticate via JWT and communicate over a binary WebSocket protocol.
+
+This separation means pipo stays reachable 24/7 on a server while still being able to see your screen, type in your apps, and manage files on any machine where a sidecar is running.
+
+---
+
+## 🛠️ Development
+
+```bash
+bun test                # Run all tests (379 tests across 22 files)
+bun run dev             # Hot-reload daemon
+bun run build:ui        # Rebuild dashboard
+bun run db:init         # Initialize or reset the database
+```
+
+### Stack
+
+- **Runtime**: Bun (not Node.js)
+- **Language**: TypeScript (ESM)
+- **Database**: SQLite via `bun:sqlite`
+- **UI**: React 19, Tailwind CSS 4, `@xyflow/react`
+- **LLM**: Anthropic Claude, OpenAI GPT, Google Gemini, Ollama
+- **Desktop sidecar**: Go (JWT auth, WebSocket RPC, platform-specific automation)
+- **Voice**: openwakeword (ONNX), Edge TTS / ElevenLabs
+- **Package**: `@pipo/brain` (published to npm registry, installable via bun)
+
+---
+
+## 📖 Documentation
+
+General:
+
+- [config.example.yaml](config.example.yaml) — Full configuration reference
+- [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) — Deploying the brain: single machine, LAN, or VPS behind a reverse proxy
+- [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) — LLM provider configuration and routing
+- [docs/VAULT_EXTRACTOR.md](docs/VAULT_EXTRACTOR.md) — Memory and knowledge vault
+- [docs/PERSONALITY_ENGINE.md](docs/PERSONALITY_ENGINE.md) — Personality and role system
+- [docs/TELEMETRY.md](docs/TELEMETRY.md) — What anonymous metrics are collected, and how to opt out
+
+Workflows (contributor reading order):
+
+- [docs/WORKFLOW_AUTOMATION.md](docs/WORKFLOW_AUTOMATION.md) — Architecture, source-tree map, and runtime walkthrough. Start here.
+- [docs/PIECE_VERIFICATION.md](docs/PIECE_VERIFICATION.md) — 8-stage checklist to verify a piece end-to-end. Required before adding or editing any piece.
+- [src/workflows/activepieces/UPSTREAM.md](src/workflows/activepieces/UPSTREAM.md) — Pinned Activepieces SHA, license posture, vendored exclusions
+- [src/workflows/pieces-library/README.md](src/workflows/pieces-library/README.md) — How community pieces are curated and installed at runtime
+
+---
+
+## 💬 Community
+
+- [Website](https://pipo.dev) — Project homepage and documentation
+- [GitHub Issues](https://github.com/Motius/pipo/issues) — Bug reports and feature requests
+
+---
+
+## 📊 Telemetry
+
+pipo sends **anonymous** usage metrics so the project can measure its unique
+user base and retention. Each ping contains only a hashed machine id (derived
+from hostname + username, never reversible to either), the app version, the
+install method, and the OS/arch. No personal data, config, content, or feature
+usage is ever sent. Pings go out at startup and every hour.
+
+It is on by default (opt-out). Disable it with any of:
+
+```yaml
+# ~/.pipo/config.yaml
+telemetry:
+  enabled: false
+```
+
+```bash
+pipo_TELEMETRY=0   # or the cross-tool standard: DO_NOT_TRACK=1
+```
+
+Full details: [docs/TELEMETRY.md](docs/TELEMETRY.md).
+
+---
+
+## 🔒 Security
+
+pipo includes a built-in authority engine that gates every action at runtime. All tool executions are logged in an audit trail, and sensitive operations require explicit approval via the dashboard, Telegram, or desktop notifications. Emergency pause and kill controls are always available. An approved action that a restart interrupted before its receipt shows up in Authority as unresolved: it is never rerun on its own, and you decide whether to run it once or close it.
+
+If you discover a security vulnerability, please report it privately by emailing the maintainer rather than opening a public issue.
+
+---
+
+## 📄 License
+
+pipo is distributed under the [pipo Source Available License 2.0](LICENSE) (based on RSALv2).
+
+The pipo codebase incorporates third-party components under their own licenses. Those components retain their original licenses for any party who extracts them as a standalone work; the combined pipo distribution is governed by the pipo Source Available License. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full list and per-component license text.

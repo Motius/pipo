@@ -1,0 +1,13 @@
+{
+  "name": "@pipo/sidecar-darwin-x64",
+  "version": "0.1.0",
+  "description": "pipo sidecar binary for macOS x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Motius/pipo.git",
+    "directory": "sidecar/npm/darwin-x64"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["bin"]
+}

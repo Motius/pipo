@@ -1,0 +1,870 @@
+# Self-Hosting Guide
+
+How to run the pipo brain yourself and connect to it securely. This covers
+the three common deployment shapes:
+
+1. [Single machine](#1-single-machine) - brain and browser on the same computer
+2. [Home LAN](#2-home-lan) - brain on one machine, accessed from others via IP
+3. [VPS with a domain](#3-vps-with-a-domain) - brain on a public server behind a reverse proxy
+
+Read [How connections work](#how-connections-work) first if you want the model
+in your head; skip straight to your scenario if you just want it running.
+
+## How connections work
+
+Two facts drive every decision below:
+
+**The brain never terminates TLS itself.** The daemon serves plain HTTP on
+`daemon.port` (default 1846), or a unix domain socket if `daemon.listen` is
+set. If you want HTTPS - and for anything beyond a single machine you do -
+you put a reverse proxy (Caddy, nginx, traefik) in front. The daemon honors
+`X-Forwarded-Proto`, so cookies and redirects behave correctly behind a
+proxy.
+
+`daemon.port` must be a whole number from 1 to 65535. A quoted port
+(`port: "8080"`) is accepted and means the same as an unquoted one. Anything
+else - `0`, out of range, fractional, `"8080abc"` - aborts startup with a
+message naming the value, rather than quietly falling back to 1846. `0` is
+rejected on purpose: it means "bind any free port", which leaves nothing able
+to say afterwards which port that was. The same goes for a `daemon.listen` the
+daemon will not resolve, and for a file it cannot load at all.
+
+When the port cannot be determined, `pipo stop` stops the daemon by PID only
+and skips port cleanup instead of clearing 1846, because on that machine 1846
+belongs to something else. A running daemon is always stoppable regardless: it
+records the port it bound in its lock file, which `pipo stop` reads first. A
+`pipo_PORT` left over in your shell does not stand in for a broken
+`daemon.port` - the daemon rejects the file before it ever reads the env var, so
+that port is not pipo's either - but `pipo stop --port N` is still honored,
+for stopping a daemon whose config was edited after it started.
+
+**Access is JWT-only by default.** There is no shared password or token. You
+enroll devices:
+
+```
+pipo enroll "my-desktop"
+```
+
+This mints a long-lived enrollment token (ES256 JWT) and prints it. The
+enrollment token is accepted on exactly two endpoints: `/sidecar/connect`
+(the sidecar WebSocket) and `POST /sidecar/token`, which exchanges it for a
+short-lived access token (10 minutes). That access token is a bootstrap, not
+the thing the dashboard runs on: a panel opens with it in the URL, the brain
+trades it for a panel session, and everything else - dashboard, API, `/ws` -
+is authorized by that session's cookie. The desktop sidecar app handles all of
+it: paste the enrollment token into it once, and it connects, mints as needed,
+and opens dashboard panels that are already authenticated.
+
+A panel session lasts until whichever comes first: the device is revoked, the
+panel has been closed for 4 hours while that device's sidecar is connected, or
+an absolute 12-hour cap. A sleeping or offline machine accrues no idle time at
+all, so closing the lid over lunch does not cost you your open windows, and
+neither does a brain restart - sessions are persisted.
+
+The only public (unauthenticated) routes are `/health`, `/sidecar/connect`,
+the JWKS endpoint (`/api/sidecars/.well-known/jwks.json`), and
+`/api/webhooks/*`.
+
+Device management runs without the daemon (the CLIs open the database
+directly), so you can manage devices over SSH:
+
+```
+pipo enroll "<name>"            # mint (or re-mint) a device token
+pipo enroll "<name>" --rotate   # re-enroll AND invalidate all previous tokens
+pipo sidecars list [--json]     # list enrolled devices
+pipo revoke <sid>               # revoke a device
+```
+
+Revoking takes effect within ~30 seconds on a running daemon (it sweeps and
+severs live sessions of revoked devices), and immediately for new
+connections and token mints.
+
+### The URL baked into enrollment tokens
+
+`pipo enroll` embeds the brain's address into the token - that is where the
+sidecar will connect. It comes from `daemon.public_url` in `config.yaml`
+(environment override: `pipo_PUBLIC_URL`). The older `daemon.brain_domain`
+and `pipo_BRAIN_DOMAIN` names remain supported as aliases. If unset, tokens
+point at `localhost:<port>` and only work for sidecars on the same machine;
+the CLI warns when this happens.
+
+The scheme rules are secure by default:
+
+- A full URL is respected: `https://pipo.example.com` gives `wss`,
+  `http://192.168.1.10:1846` gives plain `ws`.
+- A bare host is assumed **secure** (`wss`/`https`) unless it is a loopback
+  address (`localhost`, `127.0.0.1`, `[::1]`).
+
+The consequence: a bare LAN IP like `192.168.1.10:1846` produces a `wss://`
+URL, and the sidecar will fail its TLS handshake against the plain-HTTP
+daemon. Plaintext to anything that is not loopback must be spelled out with
+an explicit `http://` prefix. It is never inferred, so a public brain can't
+silently downgrade to sending tokens in the clear.
+
+### Troubleshooting `401` or "invalid enrollment key"
+
+The enrollment JWT is the only source of truth for the sidecar connection.
+Its signed `brain` and `jwks` claims cannot be corrected in the sidecar after
+the token is issued. A token minted while `daemon.public_url` is missing or
+wrong must be replaced; editing `brain:` in `sidecar.yaml` does not repair it.
+
+On the brain machine:
+
+1. Set `daemon.public_url` to the exact origin the sidecar can reach. Include
+   `http://` for an intentionally plaintext LAN deployment; use `https://` for
+   a reverse proxy or public deployment.
+2. Restart pipo so every service resolves the same public origin.
+3. Run `pipo enroll "<device-name>" --rotate` to mint a token with corrected
+   signed claims and invalidate earlier tokens for that device.
+4. Replace the saved token on the sidecar and reconnect.
+
+You can inspect the non-secret destination before copying a token by decoding
+its JWT payload locally and checking that `brain` names the WebSocket endpoint
+and `jwks` names the matching public-key endpoint. Do not paste enrollment
+tokens into online JWT debugging sites: they grant access to the brain.
+
+Common misconfigurations:
+
+- `brain` contains `localhost` but the sidecar is on another machine: set a
+  reachable LAN or public URL and re-enroll.
+- `brain` uses `wss://` against the daemon's plain HTTP port: either include
+  `http://` in the LAN `public_url`, or terminate HTTPS at a reverse proxy.
+- The URL is correct but returns 401 after a reinstall or data-directory
+  change: the brain is using a different enrollment signing key; re-enroll.
+- A reverse proxy serves the dashboard but not WebSocket upgrades or the JWKS
+  route: proxy the entire origin, including `/sidecar/connect` and
+  `/api/sidecars/.well-known/jwks.json`.
+
+### First-time setup escape hatch
+
+Enrollment normally happens from the CLI (`pipo enroll`). If you are
+setting up without a sidecar and need the dashboard open before any device
+exists, `config.yaml` accepts:
+
+```yaml
+auth:
+  insecure_open_access: true
+```
+
+While this is on, **anyone who can reach the daemon can use your pipo** -
+the daemon logs a loud warning on every boot. Use it on a machine that is
+not exposed (or reachable only via localhost/SSH tunnel), enroll your first
+device, then remove the flag and restart. It can only be enabled by editing
+the file on the server; nothing in the dashboard or API can turn it on.
+
+## 1. Single machine
+
+The simplest case, and the only one that needs no TLS at all.
+
+```
+pipo start
+pipo enroll "my-desktop"    # paste the token into the desktop sidecar app
+```
+
+Browsers treat `localhost` as a secure context, so the dashboard at
+`http://localhost:1846` gets microphone access (voice, wake word), clipboard,
+and every other gated API without a certificate. Enrollment recognizes
+loopback and mints plain `ws://localhost:1846` tokens. Everything works.
+
+## 2. Home LAN
+
+Brain on one machine (say `192.168.1.10`), dashboard and sidecars on others.
+
+Set the brain address so tokens point somewhere reachable, with an explicit
+`http://` since there is no TLS on the LAN:
+
+```yaml
+daemon:
+  public_url: "http://192.168.1.10:1846"
+```
+
+Then enroll each device and paste the token into its sidecar. Remember:
+without the explicit `http://`, a bare `192.168.1.10:1846` is treated as
+secure and the sidecar will try `wss://` and fail to connect.
+
+### What works over plain HTTP on a LAN
+
+Auth works: the session cookie is intentionally not marked `Secure` on plain
+HTTP, so the flow functions. Chat, tools, workflows - all fine. Sending a
+credential in cleartext across your own LAN is the accepted tradeoff here;
+don't do it on a network you don't trust.
+
+What does NOT work from a `http://192.168.x.x` dashboard is anything the
+browser gates behind secure contexts. That is browser policy and cannot be
+polyfilled:
+
+- **No microphone**: voice input and wake word are unavailable.
+- **Clipboard**: copy buttons fall back to select-and-copy manually.
+
+### Getting the full experience on a LAN
+
+Any of these turns the dashboard into a secure context (and lets enrollment
+default to `wss`):
+
+- **SSH tunnel / port-forward**: `ssh -L 1846:localhost:1846 user@192.168.1.10`,
+  then browse `http://localhost:1846`. Zero config, since localhost is a
+  secure context.
+- **Tailscale**: install it on the machines and use `tailscale cert` /
+  Tailscale Serve for automatic HTTPS between your own devices.
+- **Local CA**: run Caddy with its internal CA (or mkcert) on the brain
+  machine and trust the certificate on your client devices.
+
+## 3. VPS with a domain
+
+The production shape: a reverse proxy owns ports 80/443 and TLS, the daemon
+listens privately behind it. Set `daemon.public_url` (or the
+`pipo_PUBLIC_URL` environment variable) to the public HTTPS origin and
+restart pipo — network configuration is deliberately config-file/env only,
+never editable from the dashboard.
+
+`~/.pipo/config.yaml` on the VPS:
+
+```yaml
+daemon:
+  port: 1846                                    # bound behind the proxy
+  public_url: "https://pipo.example.com"      # OAuth, webhooks, device tokens
+```
+
+Caddy makes the proxy a two-liner (automatic Let's Encrypt certificates,
+WebSocket support out of the box):
+
+```
+pipo.example.com {
+    reverse_proxy 127.0.0.1:1846
+}
+```
+
+nginx needs the WebSocket upgrade and forwarded-proto headers spelled out:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name pipo.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:1846;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+pipo uses `public_url` as the authoritative external origin for OAuth
+callbacks, sidecar enrollment, CORS, and generated public links. It is never
+inferred from request headers: if it is unset, pipo assumes
+`localhost:<port>` and warns when requests appear to come through a proxy.
+
+For Google OAuth, register this exact Authorized redirect URI in Google Cloud:
+
+```text
+https://pipo.example.com/api/auth/google/callback
+```
+
+Settings → Integrations displays the resolved value reported by the daemon, so
+you do not need to translate a localhost example manually.
+
+> **Upgrading with `brain_domain` set?** The dashboard Google flow used to
+> always call back to `http://localhost:1846/...`; it now calls back to your
+> configured origin. Register the new redirect URI shown in Settings →
+> Integrations in Google Cloud, and make sure that origin routes to the
+> daemon, or re-connecting Google will fail.
+
+Make sure port 1846 is not directly reachable from the internet (bind
+firewall rules accordingly, or use the unix socket below and skip TCP
+entirely). If you expose it raw, the failure mode is at least the safe one:
+tokens enrolled against the `https://` domain use `wss` and will refuse to
+connect over plain HTTP - but the dashboard would be reachable in cleartext,
+so don't.
+
+Then, over SSH on the VPS:
+
+```
+pipo enroll "my-laptop"
+```
+
+Because `public_url` is an `https://` URL, the token carries
+`wss://pipo.example.com/sidecar/connect`. Paste it into the sidecar on
+your laptop and everything - dashboard included - flows through TLS. The
+dashboard is a secure context, so voice and all other features work.
+
+### Unix socket instead of a TCP port
+
+If the proxy runs on the same host, you can remove the TCP listener
+entirely:
+
+```yaml
+daemon:
+  listen: "unix:/run/pipo/pipo.sock"
+```
+
+```
+pipo.example.com {
+    reverse_proxy unix//run/pipo/pipo.sock
+}
+```
+
+The daemon binds only the socket (created mode 0660, so put the proxy user
+in your group), and nothing on the machine can reach it over TCP.
+
+### Headless servers and the browser
+
+A VPS usually has no display. Set:
+
+```yaml
+browser:
+  local: false
+```
+
+and the brain will never try to launch a local Chromium; browser actions
+route to a connected sidecar's browser (your desktop) instead.
+
+A sidecar's browser applies the same rules as the brain's own, on the machine
+it runs on: it opens only `http://`, `https://`, `data:` and `about:blank`
+URLs, fails any request for a local file inside the browser itself, and
+refuses to snapshot, screenshot or run script in a page showing a local file
+or one of the browser's own `chrome://` pages. So a `file:///` URL is refused
+whether the model asks the brain or a sidecar, and typing one into a visible
+sidecar browser's address bar gets you a page the model cannot read.
+
+If you do run the local browser on Linux, pipo keeps Chrome's sandbox on.
+Before the first launch it starts Chrome once, headless, to check that the
+sandbox works. It drops the sandbox only if that check fails with Chrome's
+"No usable sandbox" error, or if the brain runs as root. The log says which
+of the two happened. Some hosts pass that check but still can't start a
+sandboxed Chrome: containers with a restrictive seccomp profile, or kernels
+without unprivileged user namespaces. On those, the launch fails with "CDP
+not reachable". Only on a host you trust, turn the sandbox off yourself:
+
+```bash
+pipo_BROWSER_NO_SANDBOX=1 pipo start
+```
+
+For the systemd user service, run `systemctl --user edit pipo.service` and
+add `Environment=pipo_BROWSER_NO_SANDBOX=1` under `[Service]`.
+
+Without the sandbox, a bug in a page the model visits can run with the
+brain's own privileges. Prefer fixing the host, for example by enabling
+unprivileged user namespaces, and fall back to `browser.local: false` if you
+can't.
+
+### Where the assistant may upload files from
+
+`browser_upload_file` sends a file's bytes to whatever page the browser is on,
+so it only sends files from folders meant for sharing:
+
+- your document folders - `~/Documents`, `~/Downloads`, `~/Desktop`,
+  `~/Pictures`, or wherever your desktop actually puts them (the `XDG_*_DIR`
+  settings and `~/.config/user-dirs.dirs` are both read, so a localized
+  `~/Dokumente` works, and both names are allowed if you have both);
+- your cloud-drive folders, when they exist: `~/OneDrive`, `~/Dropbox`,
+  `~/Nextcloud`, `~/Sync`, and on macOS `~/Library/CloudStorage` and iCloud
+  Drive;
+- the site builder's projects directory;
+- `<data dir>/uploads`, a staging folder for anything else you want to share.
+  pipo creates it at startup, readable only by you.
+
+The folder list is fixed when the daemon starts, so changing your desktop's
+folder settings needs a restart to take effect.
+
+Anything else is refused, with a message telling the assistant to ask you to
+move the file. To add a folder:
+
+```yaml
+browser:
+  upload_roots:
+    - ~/Sync/shared
+    - /mnt/data/exports
+```
+
+This is worth setting if your files live somewhere unusual - a second drive, a
+network share, or, on WSL, your Windows profile (`/mnt/c/Users/<you>/Downloads`),
+which is not one of the defaults because the brain cannot tell which Windows
+account is yours. A file the assistant produced in `/tmp` is also outside the
+list: have it write to `<data dir>/uploads` instead, or move the file yourself.
+
+Adding a folder can only ever *narrow* what leaves your machine. The refusal
+list from earlier releases still runs first and underneath: hidden entries like
+`~/.ssh` and `~/.aws`, the pipo data directory, `/proc`, `/etc`, `AppData`,
+`~/Library` and the credential locations named by `GNUPGHOME`, `KUBECONFIG` and
+friends are refused even inside a folder you allow. A folder set to `/` or to
+your home directory is dropped, because it would put the old guessing game back.
+
+Uploads into a page with an opaque origin - a `data:` document, `about:blank` -
+are refused whatever the folder. Such a page only reads the file back to the
+model, which is what `read_file` is for. Every upload still needs a click, and
+the card names the resolved path, the file size and the origin of the page that
+will receive it; if the page moves to another origin between the card and your
+click, the upload is refused and the assistant has to ask again.
+
+### What the assistant cannot read
+
+`read_file` and `list_directory` refuse pipo's own credentials, whatever path
+is used to reach them. Resolved first, so a symlink, a hard link, a relative
+path and a `/proc/self/root/...` spelling all land on the same verdict:
+
+- process memory and startup state: `/proc/<pid>/environ`, `mem`, `cmdline` and
+  friends, for every process, not just pipo's. Your daemon's environment is
+  where `ANTHROPIC_API_KEY` and `pipo_WORKFLOW_ENCRYPTION_KEY` live. Use
+  `run_command` if you want the assistant to inspect a process; that is a
+  higher-authority action and will ask.
+- key material in the data and secrets directories: `.secrets.key`,
+  `.secrets.enc`, `workflow-encryption.key` (and a leftover `.tmp` beside it,
+  which is a second link to the same key), `google-tokens.json`, `sidecar-keys/`,
+  the vault database, and the local Chrome profile with your cookies.
+- `config.yaml` and `sidecar.yaml`, which can hold a bot token or a provider key.
+- the files your daemon's environment comes FROM: its systemd unit and drop-ins,
+  its launchd plist, anything an `EnvironmentFile=` in that unit points at,
+  `/etc/default/*`, `/etc/sysconfig/*`, `/etc/environment` and
+  `~/.config/environment.d/*`. Closing `/proc` while leaving the unit readable
+  would have been cosmetic.
+- a `pipo export` archive, which holds all of the above verbatim.
+
+Your own files are untouched: documents, logs, `~/.gitconfig`, `~/.config`,
+project files and `~/.pipo/logs` all read as before, and `~/.pipo` is still
+listable. A shell startup file is a special case - `~/.bashrc`, `~/.zshrc`,
+`~/.config/fish/config.fish` and the like read normally, but if one of them
+actually assigns a provider key or the workflow key, that read is refused,
+because it is the same disclosure as reading the daemon's environment. Move such
+a key into the keychain or the unit file and the rc file reads again.
+
+Every refusal is logged by the daemon with the path and the reason. A burst of
+them is worth looking at: a turn that keeps reaching for credentials is the
+clearest sign of a prompt injection you will get.
+
+This is containment for the file tools, not a sandbox. `run_command` and
+workflow code steps run as your user, so they do not go through the file
+tools at all.
+
+On Linux the daemon closes that route underneath them: at startup it calls
+`prctl(PR_SET_DUMPABLE, 0)`, which makes its own `/proc` entry unreadable to
+every other process running as the same user. `cat /proc/<daemon pid>/environ`
+returns "Permission denied" instead of the environment the daemon was started
+with, `/proc/<daemon pid>/fd` no longer lists its open files, and strace, gdb
+and core dumps of the daemon stop working without root. Nothing needs enabling;
+it is the default.
+
+What it does not do: it is Linux-only (macOS and Windows get nothing), it is not
+a boundary against the same user -- who can still read `~/.pipo`, the keychain
+and the log file directly, and can restart the daemon -- and a few `/proc`
+entries stay readable by design, including `cmdline`, `mounts` and `mountinfo`.
+The file tools still refuse those by path, so both layers matter.
+
+To turn it off, when you need to strace, gdb or get a core dump out of the
+daemon itself:
+
+```yaml
+daemon:
+  allow_process_inspection: true
+```
+
+It takes effect at startup, so restart the daemon afterwards. `yes`/`no`,
+`on`/`off` and `1`/`0` work as well as `true`/`false`; anything that is not a
+yes-or-no is reported in the log and treated as `false`, so a typo cannot switch
+the hardening off quietly. Each boot logs which way it went, and says so too
+when the kernel refused the call or the helper could not be built -- the daemon
+starts either way rather than failing over a hardening step.
+
+### `--no-local-tools` and the site builder
+
+`pipo start --no-local-tools` (the Docker image sets it) stops the general
+tools from acting on the machine the brain runs on. `run_command`,
+`read_file`, `write_file`, `list_directory`, the clipboard, screenshots, the
+desktop tools and the local browser only work when they are routed to a
+connected sidecar, which is your own machine. Without one they refuse.
+
+The flag does **not** cover the site builder. Site projects live on the
+brain's host, and building them runs code there:
+
+- `site_run_command` runs a shell command in the project directory, such as
+  `bun add react-router`;
+- creating a project runs the template's scaffolder and `make install`,
+  which runs package install scripts;
+- the preview server runs `make dev`, which executes the project's own
+  `Makefile` and build config (a `vite.config.ts`, for example).
+
+Every one of those is code the model can write, running with the daemon's
+user and permissions on the host. The daemon logs a warning at startup when
+`--no-local-tools` is set and the site builder is enabled. If the brain's
+host must not run model-written code at all, turn the site builder off.
+`sites` is a user-owned section, so a value in `config.yaml` is imported
+into your stored settings on the next start:
+
+```yaml
+sites:
+  enabled: false
+```
+
+### Timezone
+
+A VPS typically runs on UTC. Set your IANA timezone so cron triggers and
+morning/evening routines fire at your wall-clock time:
+
+```yaml
+timezone: "Europe/Rome"
+```
+
+### Autostart: keeping the daemon running
+
+`pipo autostart` writes and enables the service that starts pipo at login and
+brings it back after a crash. It is the only thing in pipo that installs one:
+
+| Platform | What it installs |
+| --- | --- |
+| Linux | a systemd **user** service, `~/.config/systemd/user/pipo.service`, plus `loginctl enable-linger` so it also starts at boot rather than only at login. The install says so when lingering could not be enabled. |
+| macOS | a launchd **user** agent, `~/Library/LaunchAgents/ai.pipo.daemon.plist`, which starts at login. There is no boot equivalent. |
+
+```bash
+pipo autostart               # install or refresh the definition, and start it
+pipo autostart --no-start    # install it, start nothing now
+pipo autostart --force       # overwrite a definition that differs from this version's
+pipo autostart --status      # manager, path, state, enablement, overrides, drift
+pipo autostart --uninstall   # stop the service and remove the definition
+```
+
+`--status` also names any `pipo.service.d/*.conf` drop-in, because everything
+else here reads the main unit file: the drift detector goes quiet entirely once a
+drop-in exists, and `systemctl --user cat pipo.service` is the only thing that
+shows the merged result.
+
+A unit whose text is already current but which systemd will not start by itself
+is repaired without rewriting the file: `installSystemd` writes before it reloads
+and enables, so a failure at either of those steps leaves exactly that state, and
+re-running `pipo autostart` enables it and says so.
+
+**It refuses to overwrite a definition it did not just write.** When the file on
+disk differs from the one this version would install, the command prints the
+differing lines, writes nothing and exits non-zero. There is no way for it to
+tell an install from an older pipo apart from an edit you made on purpose: the
+drift detector below is tolerant of extra keys by design, and the generated text
+depends on the shell that installs it (`bun` is resolved through `PATH`, and
+`pipo_HOME` is carried into the unit when it is set). So the decision is
+yours - `--force` to take this version's definition, or a drop-in to keep both:
+
+```bash
+systemctl --user edit pipo.service   # Linux: a drop-in survives a reinstall
+```
+
+Differences in comments and blank lines are not differences: the comparison is
+over systemd directives (`[Service] Restart=on-failure`) and over plist key/value
+pairs (`KeepAlive.SuccessfulExit=<false/>`), so a note you added and a rationale
+this version reworded neither demand `--force` nor cause a rewrite. The flip side
+is that `--force` replaces the whole file, comments included, and the command
+counts the ones it would take with it before you decide.
+
+**What it starts, and what it leaves alone.** A fresh install is started
+immediately, but only when no daemon holds the lock file: the service's own
+`ExecStart` is `pipo start --foreground`, which exits non-zero against a live
+lock, and under `Restart=on-failure` that would be five failed starts and a unit
+left **failed** - installing autostart would have taken down a daemon that was
+running perfectly well. When a daemon is already running the command says so and
+stops there. A refresh never restarts anything either, because the running daemon
+may not be the service's own; it prints the command that applies the new
+definition:
+
+```bash
+systemctl --user restart pipo.service                       # Linux
+launchctl bootout gui/$(id -u)/ai.pipo.daemon && \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.pipo.daemon.plist   # macOS
+```
+
+**On macOS, a `pipo restart` hands the daemon out of the agent.** systemd has
+`routeRestart` (#525) and restarts the unit itself; launchd has no counterpart, so
+`pipo restart` and `pipo update` stop the daemon, which now exits cleanly and
+is deliberately not relaunched, and start a new one as a child of your shell. It
+runs, but the agent is not supervising it until your next login. `pipo restart`
+prints that, and the way back is:
+
+```bash
+pipo stop && launchctl kickstart -k gui/$(id -u)/ai.pipo.daemon
+```
+
+`pipo autostart --uninstall` stops the service and removes the definition, and
+nothing else - `pipo uninstall` is the one that removes pipo itself, and it
+removes autostart first so the daemon is not relaunched halfway through.
+
+### Running under systemd
+
+When the daemon is the main process of a systemd **user** unit, such as the `pipo.service` that `pipo autostart` installs, `pipo restart` and `pipo update` hand the work to systemd. Otherwise they stop and start the daemon themselves. They used to do that in every case, and it went wrong in two ways:
+
+- Run from inside the service, for example by the assistant's `run_command`, the command was part of the unit. It stopped the daemon, and systemd then killed the command before it could start a new one. pipo stayed down.
+- Run from a terminal, the new daemon ran outside the unit, so systemd no longer supervised it.
+
+What happens now:
+
+- **`pipo restart`**
+  - From a terminal: runs `systemctl --user restart <unit>` and waits up to 20 s for the new daemon.
+  - From inside the service: schedules that restart two seconds out, through a transient timer, and returns at once. The command's output still reaches whoever ran it.
+  - Start flags such as `-d` and `--port` are ignored, because the unit's `ExecStart` decides.
+- **`pipo update`**
+  - Runs as a transient unit, `<unit>-update`. It stops the service, installs, and starts the service again, whether the install worked or not.
+  - From a terminal, it follows that unit's journal until the unit finishes or hits its time limit. Anywhere else it returns straight away.
+  - Follow it with `journalctl --user -u pipo-update -f`. `pipo status` shows the result of the last one, as long as that result still matches the installed version.
+- **Safety net:** the updater's `ExecStopPost` starts the service whenever the updater ends, even if it crashed, was killed, or hit its time limit. The limit is `RuntimeMaxSec`: roughly 35 minutes, more if the unit's `TimeoutStopSec` is longer. The install steps together get 30 minutes, and no single step gets more than 10.
+  - One consequence: a `pipo stop` or `systemctl --user stop` issued while an update is running is overridden when the updater finishes. Wait for the update to end, then stop.
+- **Environment:** the daemon is always started by its own unit, so it keeps the unit's `Environment=` and `EnvironmentFile=`. The updater gets only what an install needs:
+  - `PATH`, `HOME`, `pipo_HOME`, `BUN_INSTALL`, `XDG_CONFIG_HOME`;
+  - locale settings and `TMPDIR`;
+  - proxy settings and CA bundles;
+  - registry URLs.
+
+  Registry tokens are not passed on. They belong in your `.npmrc` or `bunfig.toml`, which the updater reads from `HOME`. On systemd 250 and later the values are passed by name, so they never appear on a command line. On older versions they do, briefly, and a proxy password in `HTTPS_PROXY` is then visible to your own user in the process list.
+- **`pipo stop` and `pipo drain`** still signal the daemon directly. It drains and exits cleanly, and the unit shows as inactive, just as `systemctl --user stop` would leave it.
+- **When `systemctl --user` cannot be reached:**
+  - From inside the service, or when the daemon was started by the user manager itself, the command refuses and leaves pipo running. It tells you the `systemctl` command to run from a login shell.
+  - Otherwise, for example a daemon started by hand inside some other service such as a tmux unit, it falls back to stopping and starting the daemon itself.
+- **System-level units** (`/etc/systemd/system`) are not handled. Restart those with `systemctl` yourself.
+
+### What the generated unit sets, and why
+
+The unit pipo writes (`~/.config/systemd/user/pipo.service`) makes three choices worth knowing about:
+
+- **`ExecStart=... start --foreground --no-open`.** The service starts at login, after a crash and after an update. Without `--no-open` each of those starts tries to open a browser: a failed attempt on a headless box, a tab popping up on a desktop.
+- **`Restart=on-failure`, not `always`.** A crash exits non-zero (3 for an uncaught exception, 4 for an unhandled rejection), so systemd restarts it. A deliberate shutdown exits 0, and `pipo stop` and `pipo drain` signal the daemon directly rather than going through `systemctl`: under `Restart=always` systemd would bring pipo back five seconds after the CLI told you it had stopped.
+- **`StartLimitIntervalSec=120` with `StartLimitBurst=5`.** A daemon that dies the moment it boots is restarted five times, about twenty seconds apart in total, and then left alone: systemd marks the unit **failed** and will not start it again by itself, so `pipo status` shows pipo stopped and `systemctl --user status pipo.service` says why. Without a limit it would be relaunched every `RestartSec` for as long as the machine is up, which is worse than being down: nothing tells you, and the loop burns CPU and log space. systemd's own default limit (five starts in ten seconds) can never be reached at `RestartSec=5`, so the unit sets its own.
+
+  The limit counts **every** start in the window, deliberate ones included, so a unit that has hit it refuses the next start. pipo runs `systemctl --user reset-failed` before each restart and update it asks for, so those never trip over it. `pipo autostart` deliberately does not: its start is blocking, so systemd's own "Start request repeated too quickly" reaches you instead of being cleared behind your back. If you hit the limit:
+
+  ```bash
+  systemctl --user reset-failed pipo.service
+  systemctl --user start pipo.service
+  ```
+
+### What the generated launchd plist sets, and why
+
+The plist pipo writes (`~/Library/LaunchAgents/ai.pipo.daemon.plist`) makes
+the same choices as the unit above, as far as launchd allows:
+
+- **`ProgramArguments` ends in `--no-open`,** for the reason the unit has it: the
+  agent starts at login and after a crash, and each of those would otherwise try
+  to open a browser.
+- **`KeepAlive` is a dictionary with `SuccessfulExit=false`,** not `<true/>`.
+  That is launchd's `Restart=on-failure`: a non-zero exit is relaunched, exit 0 is
+  left alone. With the plain `<true/>` earlier versions wrote, launchd relaunched
+  the daemon after **any** exit - `pipo stop` signals the daemon directly and
+  never goes through `launchctl`, so a stop was undone under a new pid while the
+  CLI printed success (at once, not ten seconds later: `ThrottleInterval` only
+  bounds how often a job that has just started may respawn). `pipo autostart --force`
+  replaces such a plist, and `pipo status` names it in the meantime.
+
+  A death by signal is not exit 0 either, so it is relaunched too. That covers a
+  real kill, and also the `SIGKILL` `pipo stop` falls back to when the drain
+  overruns its deadline: to stop a daemon that will not drain and keep it
+  stopped, remove autostart first (`pipo autostart --uninstall`, or
+  `launchctl bootout gui/$(id -u)/ai.pipo.daemon`).
+- **There is no crash-loop bound.** launchd throttles the respawns of a job that
+  keeps dying to about one per ten seconds (`ThrottleInterval`) and never gives
+  up, and it has no equivalent of `StartLimitBurst`. So a daemon that dies the moment it boots is retried for as
+  long as you stay logged in, where systemd would have left the unit failed. This
+  is the one asymmetry between the two platforms that pipo cannot close from
+  the definition; watch `~/.pipo/logs/pipo-error.log`, which the plist points
+  the agent's stderr at.
+
+### Refreshing an autostart service
+
+A unit or launchd plist is only rewritten when autostart is installed again, so a service installed by an older version keeps whatever it was written with. `pipo status` says so when it can tell, and names what the old definition still does.
+
+The fix is `pipo autostart`: it prints how the definition on disk differs from
+this version's and writes nothing, and `pipo autostart --force` replaces it.
+See [Autostart: keeping the daemon running](#autostart-keeping-the-daemon-running)
+for why the two steps are separate.
+
+To fix an existing `pipo.service` without replacing it, keeping your own edits,
+add an override instead:
+
+```bash
+systemctl --user edit pipo.service
+```
+
+```ini
+[Unit]
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+# The empty assignment clears the old command; the second line replaces it.
+# Keep your own paths -- copy them from: systemctl --user cat pipo.service
+ExecStart=
+ExecStart=/home/you/.bun/bin/bun /path/to/pipo/bin/pipo.ts start --foreground --no-open
+```
+
+`systemctl --user daemon-reload` is run by `edit` itself; `systemctl --user restart pipo.service` applies it. An override lives in `pipo.service.d/override.conf` and survives a reinstall of the unit, which is also why `pipo status` stops reporting drift once a drop-in exists: it cannot tell what the override changed.
+
+On macOS there is no drop-in mechanism, so either let `pipo autostart --force`
+write the plist and copy your own changes back into it, or edit it by hand: add a
+`<string>--no-open</string>` entry after `<string>--foreground</string>` in
+`ProgramArguments`, and replace
+
+```xml
+  <key>KeepAlive</key>
+  <true/>
+```
+
+with
+
+```xml
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+```
+
+then `launchctl bootout gui/$(id -u)/ai.pipo.daemon` and `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.pipo.daemon.plist` to load it. Until that `KeepAlive` is a dictionary, the plist relaunches the daemon after a clean exit too, so a `pipo stop` on macOS is undone moments later unless you remove autostart first (`pipo autostart --uninstall` does exactly that, and `pipo uninstall` does it in the right order).
+
+### Logs
+
+`pipo start -d` redirects the detached daemon's output into
+`~/.pipo/logs/pipo.log`, and `pipo logs [-f]` tails it. Under **systemd**
+or **Docker** that redirection does not happen: output goes to journald
+(`journalctl -u pipo`) or `docker logs`, and there is no file. To get the same
+file in every launch mode, point the daemon at one:
+
+```yaml
+daemon:
+  log_file_path: "~/.pipo/logs/pipo.log"
+  log_file_max_bytes: 1048576   # optional, defaults to 1 MiB
+```
+
+The daemon then mirrors its own stdout and stderr into that file, on top of
+whatever the terminal or the service manager already receives. Lines are
+stripped of ANSI escapes, run through the credential redactor, and stamped with
+an ISO-8601 timestamp. The file is a ring: past `log_file_max_bytes` the oldest
+lines are dropped from the top, so it settles at roughly that size and never
+fills the disk. Leave `log_file_path` unset and no file is written.
+
+`log_file_max_bytes` is a MEMORY budget too, not only a disk one: the window is
+kept in the daemon's heap so the file can be rewritten from it, so a 64 MiB cap
+costs ~64 MiB of RSS. Values below 4 KiB are raised and values above 64 MiB (or
+a non-finite one, which is what `log_file_max_bytes: .inf` gives you) are
+lowered, with a warning on stderr.
+
+Three caveats.
+
+- If something else already writes the daemon's stdout/stderr into that same
+  file - `pipo start -d`, the launchd plist's `StandardOutPath`, a
+  `StandardOutput=append:` in your own unit - the daemon detects it (it compares
+  the inode behind fds 1 and 2 with the configured path) and does NOT install
+  the in-process sink. You get the launcher's file, uncapped and unredacted, and
+  the log says so at startup. That check exists because the two together are
+  actively harmful: the sink caps by renaming a fresh file over the path, which
+  would leave the launcher's descriptors appending to a deleted inode that grows
+  forever and that `ls` cannot show.
+- `pipo logs -f` uses `tail -F`, and every compaction replaces the file, so
+  `tail` reopens it and re-prints the whole window. With the defaults that is
+  ~1 MiB of already-seen lines roughly every 256 KiB of new output. It is
+  inherent to capping a single file in place (rotation and truncate-in-place
+  make a tailer restart too). Raise `log_file_max_bytes` if it bothers you, or
+  follow journald instead.
+- Output from subprocesses that inherit the daemon's file descriptors reaches
+  the terminal and journald but not this file.
+
+### Package installs (pieces and the workflow engine)
+
+Installing or uninstalling a piece from the library, the startup check that
+re-installs the pieces when `node_modules` is gone, and building the workflow
+engine (on first start, and again whenever an upgrade changes its
+dependencies) all run `bun install`. They run it with a **sanitized environment**: only an
+allowlist of variables (`PATH`, `HOME`, temp and locale settings, proxies,
+CA bundles, registry URLs, bun and npm cache locations) reaches the install,
+never the daemon's API keys or tokens. Lifecycle scripts are skipped
+(`--ignore-scripts`). The cost: a native dependency that has no prebuilt
+package for your platform, and would have built or downloaded its binary in
+an install script, now fails when the piece loads, and there is no setting to
+turn the scripts back on.
+
+What that means for a private or authenticated registry:
+
+- A registry **URL** set with `NPM_CONFIG_REGISTRY` / `BUN_CONFIG_REGISTRY`, in
+  `~/.npmrc` or in `~/.bunfig.toml` still works.
+- Registry **credentials** set in environment variables do not reach the
+  install: `NPM_CONFIG_TOKEN`, `npm_config_token`, `BUN_CONFIG_TOKEN`, and any
+  `${NPM_TOKEN}`-style reference inside `.npmrc` or `bunfig.toml` (bun sends
+  it unexpanded, as literal text, so the registry answers 401). Write the
+  token literally into `~/.npmrc` (`//registry.example.com/:_authToken=...`)
+  or `~/.bunfig.toml` (`$XDG_CONFIG_HOME/.bunfig.toml` works too) instead.
+  Bun does not read `NPM_CONFIG_USERCONFIG`, so pointing it at another file
+  does not help either.
+- Other install-time tuning variables are dropped as well, for example
+  `ESBUILD_BINARY_PATH`.
+
+A failed install says so in its error message. `HOME` is forwarded because
+bun needs it, so anything readable under your home directory is still readable
+to the install; the sanitizing keeps secrets out of the environment, it is not
+a sandbox.
+
+### Commands, apps and the browser the assistant runs
+
+`run_command`, apps the assistant launches, the local Chrome it drives and the
+Windows desktop bridge get your full environment (`PATH`, nvm and virtualenv
+settings, `SSH_AUTH_SOCK`, `DISPLAY`, proxies, your own `GITHUB_TOKEN` or
+`AWS_*`) **minus the daemon's own secrets**:
+
+- every `pipo_*` variable except the settings the `pipo` CLI reads
+  (`pipo_HOME`, `pipo_PORT`, `pipo_SECRETS_DIR`, and so on), so
+  `pipo_WORKFLOW_ENCRYPTION_KEY`, `pipo_GITHUB_TOKEN` and the provider
+  keys releases before v0.7.0 read, such as `pipo_OPENAI_KEY`, are removed;
+- `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `NVIDIA_API_KEY`, the provider keys
+  earlier releases read from the environment or told you to export. If you
+  exported one of these for a CLI of your own and want the assistant to run
+  that CLI, pass the key inside the command.
+
+If the assistant runs `pipo start`, `pipo restart` or `pipo update`
+itself on an install no service manager runs (one you started with
+`pipo start -d`), the new daemon is started from the assistant's shell and
+comes up without the secrets above. Restart from your own terminal to bring
+them back.
+
+Under systemd, `pipo restart` and `pipo update` go through the unit even
+when the assistant runs them (see [Running under systemd](#running-under-systemd)),
+so the restarted pipo gets the unit's environment, secrets included. Under
+launchd there is no such routing: only a stop that ends in a SIGKILL is undone by
+the launch agent, so a `pipo restart` normally starts the daemon from the
+calling shell's environment, and it stays a child of that shell until your next
+login. `pipo restart` prints a line saying so, and the way back is
+`pipo stop && launchctl kickstart -k gui/$(id -u)/ai.pipo.daemon`.
+
+If your workflow encryption key lives only in `pipo_WORKFLOW_ENCRYPTION_KEY`,
+a daemon started from the assistant's shell uses a workflow key only if it is
+provably that same key. It will not generate one, and it will not use a key
+file that holds a different key, such as a leftover or another instance's. So
+it cannot split your credentials: workflow credentials fail there until you
+start pipo yourself with the key set, and the daemon logs a warning saying
+so. An install whose key lives in a file is unaffected.
+
+To tell "that same key" apart, the assistant's commands carry
+`pipo_MODEL_EXEC_ENV_KEY`, a 16-character check value derived from the key
+with scrypt. It cannot be turned back into the key, but it can confirm a guess,
+so generate `pipo_WORKFLOW_ENCRYPTION_KEY` at random (`openssl rand -hex 32`)
+rather than from a passphrase.
+
+Like the install sanitizing above, this is environment hygiene, not a
+sandbox. The commands run as the daemon's user, so they can still read the
+daemon's `~/.pipo` -- `read_file` and `list_directory` no longer will (see
+[What the assistant cannot read](#what-the-assistant-cannot-read)), but a shell
+is a shell. `/proc/<daemon pid>/environ` is the one route that IS closed, on
+Linux, by the process hardening described above; do not count on it off Linux or
+with `allow_process_inspection` set. Keeping a secret out of the daemon's
+environment (the dashboard and keychain hold LLM keys) keeps it out of that file
+either way, and nothing short of a sandbox keeps the daemon's files from what it
+runs.
+
+## Quick reference
+
+| | Single machine | LAN via IP | VPS + domain |
+|---|---|---|---|
+| TLS needed | no | no (with tradeoffs) | yes, via reverse proxy |
+| `public_url` | not needed | `http://<ip>:1846` (explicit scheme) | `https://your.domain` |
+| Voice / mic in dashboard | yes | no (secure-context gated) | yes |
+| Tokens on the wire | loopback only | cleartext on your LAN | encrypted |
+| Sidecar URL in tokens | `ws://localhost:1846` | `ws://<ip>:1846` | `wss://your.domain` |
+
+## Health checks
+
+`GET /health` is unauthenticated and safe to point uptime monitors at. It
+works over the unix socket too, e.g.
+`curl --unix-socket /run/pipo/pipo.sock http://localhost/health`.

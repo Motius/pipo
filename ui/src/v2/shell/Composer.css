@@ -1,0 +1,143 @@
+.v2-composer {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: 16px 28px 22px;
+  background: var(--paper);
+  border-top: var(--hair);
+}
+
+.v2-composer__wrap {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s-3);
+  padding: 10px 14px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: 14px;
+  max-width: 720px;
+  margin: 0 auto;
+  width: 100%;
+  box-shadow: 0 1px 3px rgba(44, 40, 34, 0.03);
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.v2-composer__wrap:focus-within {
+  background: var(--paper);
+  border-color: var(--ink);
+  box-shadow: 0 1px 4px rgba(44, 40, 34, 0.06);
+}
+
+.v2-composer__input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  outline: none;
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  color: var(--ink);
+  padding: 4px 0;
+  line-height: 1.4;
+  resize: none;
+  overflow-y: auto;
+  max-height: 150px;
+}
+
+.v2-composer__input::placeholder {
+  color: var(--ink-3);
+  font-style: italic;
+}
+
+.v2-composer__slash {
+  padding: 4px 9px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--paper-3);
+  border: 0;
+  border-radius: var(--r-2);
+  cursor: pointer;
+  flex-shrink: 0;
+  align-self: center;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+.v2-composer__slash:hover {
+  background: var(--rule-soft);
+}
+
+.v2-composer__slash:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.v2-composer__send {
+  width: 28px;
+  height: 28px;
+  border-radius: 14px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+}
+
+.v2-composer__send:hover:not(:disabled) {
+  background: #A62F22;
+}
+
+.v2-composer__send--stop {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.v2-composer__send--stop:hover:not(:disabled) {
+  background: var(--ink-2);
+}
+
+.v2-composer__send:active:not(:disabled) {
+  transform: scale(0.92);
+}
+
+.v2-composer__send:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.v2-composer__send:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Conversational dock — a quiet surface, not a command-line box. */
+.v2-composer {
+  padding: 14px clamp(16px, 4vw, 42px) 22px;
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--paper-2) 72%, transparent));
+  border-top: 0;
+}
+.v2-composer__wrap {
+  max-width: 760px;
+  padding: 13px 15px 13px 18px;
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--raise) 84%, transparent);
+  box-shadow: 0 18px 44px -28px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.08);
+  backdrop-filter: blur(16px);
+}
+.v2-composer__wrap:focus-within {
+  border-color: color-mix(in srgb, var(--listen) 72%, var(--rule));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--listen) 12%, transparent), 0 18px 44px -28px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.1);
+}
+.v2-composer__input { font-size: 16px; letter-spacing: -.01em; }
+.v2-composer__input::placeholder { font-style: normal; color: var(--ink-3); }
+.v2-composer__send { width: 32px; height: 32px; border-radius: 50%; }
