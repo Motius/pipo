@@ -24,7 +24,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { join } from "node:path";
 const REPO_ROOT = join(import.meta.dir, "..");
 
 // Per-instance DB DDL sources (the user data whose shape a rollback depends on).
