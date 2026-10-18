@@ -1,6 +1,6 @@
 {
   "name": "@pipo/brain",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Pipo — Your Company Workflow Brain. An always-on autonomous AI daemon.",
   "module": "src/daemon/index.ts",
   "type": "module",
