@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import { REQUIRED, missingFrom, parseBunPack, parseNpmPack } from "./check-package-files.ts";
 
 describe("check-package-files parseBunPack", () => {
@@ -101,7 +102,7 @@ describe("check-package-files against the real package", () => {
   // via the same entry point CI and the release use.
   test("the shipped package really does contain every REQUIRED path", async () => {
     const proc = Bun.spawn(["bun", "run", "scripts/check-package-files.ts"], {
-      cwd: new URL("..", import.meta.url).pathname,
+      cwd: join(import.meta.dir, ".."),
       stdout: "pipe",
       stderr: "pipe",
     });

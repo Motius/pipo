@@ -14,12 +14,36 @@ import { formatUserProfileForPrompt, USER_PROFILE_SETTING_KEY } from '../user/pr
 import { extractAndStore } from './extractor';
 import type { LLMManager } from '../llm/manager';
 
+/**
+ * Remove a directory tree, robust to Windows file locking.
+ *
+ * bun:sqlite can keep the vault file (and its WAL/SHM sidecars) locked for a
+ * moment after `closeDb()` returns on Windows, so a straight `rmSync` throws
+ * `EBUSY`. Retry with growing backoff so the temp vault dir is reliably
+ * reclaimed instead of leaking into %TEMP%.
+ */
+async function removeDirRobust(dir: string, attempts = 10): Promise<void> {
+  let lastError: unknown = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      const msg = error instanceof Error ? error.message : String(error);
+      if (!msg.includes('EBUSY') && !msg.includes('busy') && !msg.includes('ENOTEMPTY')) break;
+      await Bun.sleep(150 * (i + 1));
+    }
+  }
+  throw lastError;
+}
+
 let directory: string, path: string, subject: string;
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'pipo-facts-')); path = join(directory, 'vault.db');
   initDatabase(path); subject = createEntity('person', 'Alex').id;
 });
-afterEach(() => { closeDb(); rmSync(directory, { recursive: true, force: true }); });
+afterEach(async () => { closeDb(); await removeDirRobust(directory); });
 const inference = { source: 'llm_extraction', confidence: 0.7 };
 
 test('confirmed correction is used on the next recall and after restart; late inference stays qualified', () => {

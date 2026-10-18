@@ -22,7 +22,7 @@
 import { readdirSync, statSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
-const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const REPO_ROOT = join(import.meta.dir, "..");
 const VENDOR_DIR = join(REPO_ROOT, "src/workflows/activepieces");
 const SCAN_DIRS = ["src", "ui/src", "scripts", "bin"];
 const SOURCE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/;

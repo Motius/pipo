@@ -21,6 +21,30 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+/**
+ * Remove a directory tree, robust to Windows file locking.
+ *
+ * bun:sqlite can keep the vault file (and its WAL/SHM sidecars) locked for a
+ * moment after `closeDb()` returns on Windows, so a straight `rmSync` throws
+ * `EBUSY`. Retry with growing backoff so the temp vault dir is reliably
+ * reclaimed instead of leaking into %TEMP%.
+ */
+async function removeDirRobust(dir: string, attempts = 10): Promise<void> {
+  let lastError: unknown = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      const msg = error instanceof Error ? error.message : String(error);
+      if (!msg.includes('EBUSY') && !msg.includes('busy') && !msg.includes('ENOTEMPTY')) break;
+      await Bun.sleep(150 * (i + 1));
+    }
+  }
+  throw lastError;
+}
+
 const role = { id: 'personal-assistant', name: 'PA', description: 't', responsibilities: [],
   tools: ['browser', 'desktop', 'ui'], authority_level: 10 } as unknown as RoleDefinition;
 const baseConfig: AuthorityConfig = { default_level: 10, governed_categories: [], overrides: [], context_rules: [],
@@ -238,7 +262,7 @@ describe('UI approval execution stays bound to its origin', () => {
       expect(after.getRequest(request.id)?.execution_result).toContain('fresh');
     } finally {
       closeDb();
-      rmSync(dir, { recursive: true, force: true });
+      await removeDirRobust(dir);
     }
   });
 

@@ -24,7 +24,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+import { join } from "node:path";
+const REPO_ROOT = join(import.meta.dir, "..");
 
 // Per-instance DB DDL sources (the user data whose shape a rollback depends on).
 const DDL_FILES = ["src/vault/schema.ts", "src/vault/fact-schema.ts", "src/workflows/db/schema.ts"];

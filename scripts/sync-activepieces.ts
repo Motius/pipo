@@ -32,7 +32,7 @@ const PINNED_TAG = "0.82.1";
 const PINNED_SHA = "d04e6807c485ecd788a72af0d04abffba78563c7";
 const REMOTE = "https://github.com/activepieces/activepieces.git";
 
-const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const REPO_ROOT = join(import.meta.dir, "..");
 const VENDOR_DIR = join(REPO_ROOT, "src/workflows/activepieces");
 
 /** Paths relative to upstream repo root, copied verbatim into VENDOR_DIR. */

@@ -13,6 +13,30 @@ import { packRecallContext, RECALL_LIMITS } from './recall-context.ts';
 import { formatFact } from './fact-format.ts';
 import { runRecallBenchmark } from '../../scripts/benchmark-memory-recall.ts';
 
+/**
+ * Remove a directory tree, robust to Windows file locking.
+ *
+ * bun:sqlite can keep the vault file (and its WAL/SHM sidecars) locked for a
+ * moment after `closeDb()` returns on Windows, so a straight `rmSync` throws
+ * `EBUSY`. Retry with growing backoff so the temp vault dir is reliably
+ * reclaimed instead of leaking into %TEMP%.
+ */
+async function removeDirRobust(dir: string, attempts = 10): Promise<void> {
+  let lastError: unknown = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      const msg = error instanceof Error ? error.message : String(error);
+      if (!msg.includes('EBUSY') && !msg.includes('busy') && !msg.includes('ENOTEMPTY')) break;
+      await Bun.sleep(150 * (i + 1));
+    }
+  }
+  throw lastError;
+}
+
 beforeEach(() => initDatabase(':memory:', { quiet: true }));
 afterEach(() => closeDb());
 
@@ -459,7 +483,7 @@ test('packing keeps C8 source references, scope, validity and contested status i
   }
 });
 
-test('default recall recovers qualified facts after a database restart', () => {
+test('default recall recovers qualified facts after a database restart', async () => {
   closeDb();
   const dir = mkdtempSync(join(tmpdir(), 'pipo-recall-'));
   try {
@@ -471,10 +495,10 @@ test('default recall recovers qualified facts after a database restart', () => {
     closeDb(); initDatabase(file, { quiet: true });
     expect(getKnowledgeForMessage('Михаил срок')).toBe(before);
     expect(before).toContain('Завтра');
-  } finally { closeDb(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { closeDb(); await removeDirRobust(dir); }
 });
 
-test('value queries retain the correction through aliases, crowding and restart', () => {
+test('value queries retain the correction through aliases, crowding and restart', async () => {
   closeDb();
   const dir = mkdtempSync(join(tmpdir(), 'pipo-recall-correction-'));
   try {
@@ -510,10 +534,10 @@ test('value queries retain the correction through aliases, crowding and restart'
     expect(before.length).toBeLessThanOrEqual(RECALL_LIMITS.chars);
     expect((repository.getFact(old.id) as RecallFact)?.status).toBe('superseded');
     expect((repository.getFact(current.id) as RecallFact)?.binding_eligible).toBe(true);
-  } finally { closeDb(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { closeDb(); await removeDirRobust(dir); }
 });
 
-test('repeated evidence preserves corrected recall and the full ledger after restart', () => {
+test('repeated evidence preserves corrected recall and the full ledger after restart', async () => {
   closeDb();
   const dir = mkdtempSync(join(tmpdir(), 'pipo-recall-evidence-'));
   try {
@@ -547,7 +571,7 @@ test('repeated evidence preserves corrected recall and the full ledger after res
     const stored = repository.getFact(current.id) as RecallFact;
     expect(stored.evidence).toHaveLength(5);
     expect(stored.evidence?.filter(e => (e.quote?.length ?? 0) > 3000)).toHaveLength(4);
-  } finally { closeDb(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { closeDb(); await removeDirRobust(dir); }
 });
 
 test('corrections, periods and source ledger survive default recall', () => {
