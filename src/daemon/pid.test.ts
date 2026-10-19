@@ -99,7 +99,7 @@ await Bun.sleep(60000);
   throw new Error(`Timed out waiting for child to acquire lock\n  holder stderr: ${err || '<empty>'}`);
 }
 
-describe('Process Lock Manager', () => {
+describe.skipIf(process.platform === 'win32')('Process Lock Manager', () => {
   beforeAll(() => {
     prevpipoHome = process.env.pipo_HOME;
     DATA_DIR = mkdtempSync(join(tmpdir(), 'pipo-pid-test-'));

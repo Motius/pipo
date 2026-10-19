@@ -7,9 +7,8 @@
 **AI for judgement. Code for repetition.**
 
 [![CI](https://github.com/Motius/pipo/actions/workflows/test.yml/badge.svg)](https://github.com/Motius/pipo/actions/workflows/test.yml)
-[![bun](https://img.shields.io/npm/v/@pipo/brain?label=bun&logo=bun&color=%23f9f1e1)](https://bun.sh/packages/@pipo/brain)
-[![License](https://img.shields.io/badge/license-RSALv2-blue)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Bun-%23f9f1e1)](https://bun.sh)
+[![License](https://img.shields.io/badge/license-RSALv2-blue)](LICENSE)
 [![Website](https://img.shields.io/static/v1?label=website&message=pipo-ke.com&color=black)](https://pipo-ke.com)
 
 _An autonomous workflow daemon with desktop awareness, multi-agent delegation, visual workflows, and explicit authority controls._
@@ -65,7 +64,7 @@ Pipo is more than a chatbot with tools. It is a persistent daemon that can under
 ## ⚡ Quick Start
 
 ```bash
-bun install -g @pipo/brain   # Install the daemon
+curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
 pipo start -d                   # Start as background daemon
 ```
 
@@ -144,10 +143,28 @@ secret management; Pipo does not provision those services for you.
 
 ## 📦 Installation
 
-### bun (recommended)
+### One-liner (recommended)
 
 ```bash
-bun install -g @pipo/brain
+curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
+```
+
+After opening a new terminal, run:
+
+```bash
+pipo start
+```
+
+The install script sets up Bun, clones the repo, and links the `pipo` CLI. Then finish setup in your browser at `http://localhost:1846`.
+
+### bun (manual)
+
+```bash
+git clone https://github.com/Motius/pipo.git ~/.pipo/daemon
+cd ~/.pipo/daemon
+bun install
+bun run build:ui
+bun link
 pipo start
 ```
 
@@ -170,36 +187,7 @@ docker run -d --name pipo \
 
 The image is available on [GHCR](https://ghcr.io/Motius/pipo). Non-LLM configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume. LLM providers, API keys, and model routing are configured from the settings dashboard (open http://localhost:1846 after first boot) and stored in the database + encrypted keychain - they are not set via env vars or `config.yaml`.
 
-> **Note:** Docker runs in an isolated container, so the daemon inside it cannot access your host desktop, browser, or clipboard directly. You must still install the [sidecar](#️-sidecar-setup) on each machine where you want pipo to have desktop awareness and automation capabilities.
-
-### One-liner
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
-```
-
-After opening a new terminal, run:
-
-```bash
-pipo start
-```
-
-The install script sets up Bun, clones the repo, and links the `pipo` CLI. Then finish setup in your browser at `http://localhost:1846`.
-
-> **Note:** The one-liner is intended for macOS, Linux, and WSL. On native Windows, use the manual Bun install or Docker Desktop; the runtime and asset build scripts are platform-neutral.
-
-### Manual
-
-```bash
-git clone https://github.com/Motius/pipo.git ~/.pipo/daemon
-cd ~/.pipo/daemon
-bun install
-bun run build:ui
-bun link
-pipo start
-```
-
-Then open `http://localhost:1846` to finish setup in the dashboard.
+> **Note:** Docker runs in an isolated container, so the daemon inside it cannot access your host desktop, browser, or clipboard directly. You must still install the [sidecar](#sidecar-setup) on each machine where you want pipo to have desktop awareness and automation capabilities.
 
 ---
 
@@ -497,7 +485,7 @@ This separation means pipo stays reachable 24/7 on a server while still being ab
 ## 🛠️ Development
 
 ```bash
-bun test                # Run all tests (379 tests across 22 files)
+bun test                # Run all tests (see CI for the full matrix)
 bun run dev             # Hot-reload daemon
 bun run build:ui        # Rebuild dashboard
 bun run db:init         # Initialize or reset the database

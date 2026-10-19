@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { initDatabase, closeDb } from '../vault/schema.ts';
 import { getSetting, setSetting } from '../vault/settings.ts';
 import { DEFAULT_CONFIG, type pipoConfig } from '../config/types.ts';
@@ -10,7 +13,19 @@ import {
   pipo_PROVIDER_NAME,
 } from './pipo-ai.ts';
 
-afterEach(() => closeDb());
+let secretsDir: string;
+let prevSecretsDir: string | undefined;
+beforeEach(() => {
+  prevSecretsDir = process.env.pipo_SECRETS_DIR;
+  secretsDir = mkdtempSync(join(tmpdir(), 'pipo-llm-settings-'));
+  process.env.pipo_SECRETS_DIR = secretsDir;
+});
+afterEach(() => {
+  closeDb();
+  if (prevSecretsDir === undefined) delete process.env.pipo_SECRETS_DIR;
+  else process.env.pipo_SECRETS_DIR = prevSecretsDir;
+  try { rmSync(secretsDir, { recursive: true, force: true }); } catch {}
+});
 
 describe('LLM provider deletion', () => {
   it('clears every model ref the deleted provider owned', () => {

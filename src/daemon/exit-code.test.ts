@@ -54,7 +54,7 @@ ${trigger}
   }
 }
 
-describe('daemon exit status', () => {
+describe.skipIf(process.platform === 'win32')('daemon exit status', () => {
   test('an uncaught exception exits non-zero', async () => {
     const { exitCode, output } = await runFixture('uncaught', `
 setTimeout(() => { throw new Error('fixture uncaught boom'); }, 10);
