@@ -128,6 +128,25 @@ export const TRIGGER_GROUPS: readonly TriggerGroup[] = [
     words: ['skill', 'skills', 'record', 'replay', 'macro', 'teach', 'demonstrate'],
   },
   {
+    // The zero-LLM fast path: taught phrases ("when I say morning layout",
+    // "teach you a phrase", "call that a shortcut"). 'teach' itself stays
+    // with the skills group -- recording is a skill -- and 'replay' likewise
+    // fires both, which is fine: these tools bind and manage what replay
+    // runs. Word choices are deliberately narrower than "learn": a bare
+    // 'learn' would fire on every research ask about a topic the person is
+    // studying.
+    tools: ['learn_command', 'manage_learned_commands'],
+    words: ['phrase', 'shortcut', 'learned', 'teach you', 'when i say', 'fast path'],
+  },
+  {
+    // The cheap "tell me when" watches. Whole-word matching means 'watch'
+    // does not reach 'watching', so the -ing form is listed for "stop
+    // watching"; 'watcher' covers its plural alone.
+    tools: ['manage_watchers'],
+    words: ['watch', 'watching', 'watcher', 'tell me when', 'let me know when',
+      'notify me'],
+  },
+  {
     tools: ['delegate_task', 'manage_agents'],
     words: ['delegate', 'agent', 'agents', 'specialist', 'parallel', 'background', 'spawn'],
   },

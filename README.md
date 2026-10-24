@@ -407,6 +407,18 @@ If a sidecar is too old for the brain (**Update required**), the brain refuses t
 
 **Authority & Autonomy** — Runtime enforcement with soft-gate approvals. Multi-channel approval delivery (chat, Telegram, and desktop). Full audit trail. Emergency pause/kill controls. Consecutive-approval learning suggests auto-approve rules.
 
+**Learned Commands (zero-LLM replay)** — Teach a phrase once (`learn_command`) and say it forever after: pipo replays the recorded action with no model call. Whether a phrase may replay free is re-decided from live skill/tool state at every replay (`decideReplay`) — anything reaching email, payments, deletes or settings falls back to the normal approval-card turn, never a bypass. Runs are counted per phrase, including refusals.
+
+**Cheap "tell me when" watchers** — `manage_watchers` creates a one-row watch over a window title or clipboard on a chosen sidecar. Polling is deterministic sidecar RPC (default every 5s, no tokens), fires once, expires on its own, notifies the pebble and dashboard, and can hand a recorded follow-up back as a fresh turn. "Tell me when Codex is done" and "stop watching" work by voice without the model.
+
+**Dictation (pebble)** — Say "start dictation" and every subsequent pebble summon inserts the transcript straight into the app you were in — the window focused at summon time is re-focused by pid before typing, so the pebble bubble never becomes the destination. "Stop dictation" is honored even mid-mode. No model calls while inserting.
+
+**Steering live tasks** — Corrections fold into running background agents instead of restarting them: `manage_agents steer` for the model, `POST /api/agents/tasks/:id/steer` for the dashboard. The note is drained at the sub-agent's next provider-call boundary, so work already done is kept.
+
+**`pipo budget`** — Honest local spend report from the usage ledger: calls, tokens (incl. cache), model time, median ask cost, split by subsystem and model (`GET /api/llm/cost-report` for the dashboard). Prices are deliberately not baked in — the report speaks in tokens and time; you multiply by your own rates.
+
+**How pipo compares** — see [`docs/COMPARISON_ATTICUS.md`](docs/COMPARISON_ATTICUS.md) for a feature-by-feature comparison with the Atticus voice assistant (learned commands, watchers, dictation, steering, budget), including what only pipo does and the gaps that remain.
+
 ---
 
 ## ⚙️ Configuration

@@ -1032,6 +1032,31 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // Steering a RUNNING background task. The dashboard's task detail panel
+    // posts a correction; it reaches the sub-agent at the runner's next
+    // tool-turn boundary (AgentTaskManager.steerTask), so work already done
+    // is kept, not thrown away. The status names are surfaced as plain
+    // sentences so the UI can render the truth: queued is not "done".
+    '/api/agents/tasks/:id/steer': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        const tm = ctx.agentService.getTaskManager();
+        if (!tm) return error('Persistent agents are not available.', 503);
+        let message = '';
+        try {
+          const body = await req.json() as { message?: unknown };
+          message = typeof body.message === 'string' ? body.message : '';
+        } catch {
+          return error('Body must be JSON: { "message": "..." }', 400);
+        }
+        if (!message.trim()) return error('`message` is required — say what should change about the running task.', 400);
+        const outcome = tm.steerTask(req.params.id, message);
+        if (outcome === 'unknown') return error(`Task "${req.params.id}" not found.`, 404);
+        if (outcome === 'completed') return error('That task already completed — too late to steer it.', 409);
+        if (outcome === 'failed') return error('That task already failed — too late to steer it.', 409);
+        return json({ ok: true, task_id: req.params.id, steered: outcome });
+      },
+    },
+
     // Pebble long-answer panel — when a pipo response overflows the
     // speaking bubble, the daemon registers it in the answer store and
     // the sidecar shows an "open full ↗" button. Click spawns a panel
@@ -2020,6 +2045,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return json({ error: msg, rows: [], total: { calls: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, total_latency_ms: 0, errors: 0 } });
+        }
+      },
+    },
+
+    // Local cost report — the same data `pipo budget` prints in the
+    // dashboard-friendly JSON shape. Deliberately secrets-free: the payload
+    // is computed from the llm_usage ledger alone and carries no provider
+    // keys and no hosted meter, so it is safe for a browser tab the way the
+    // hosted /api/llm/budget next door needs guarding to be.
+    '/api/llm/cost-report': {
+      GET: async (req: Request) => {
+        try {
+          const { getBudgetReport } = await import('../llm/usage.ts');
+          const url = new URL(req.url);
+          const raw = Number(url.searchParams.get('days'));
+          // 1..3650 mirrors the CLI's range; anything else falls to a week.
+          const days = Number.isFinite(raw) && raw >= 1 && raw <= 3650 ? Math.round(raw) : 7;
+          return json(getBudgetReport(days));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ available: false, error: msg, window_days: 7, calls: 0, errors: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, total_latency_ms: 0, avg_latency_ms: null, ask: null, by_subsystem: [], by_provider_model: [] });
         }
       },
     },

@@ -41,7 +41,8 @@ import { compileSkill } from '../../skills/compiler.ts';
 import { ActionOutcomeError, type ActionFailure } from '../action-outcome.ts';
 import { forCard } from '../../util/card-text.ts';
 
-const RPC_TIMEOUT = { initial: 30_000, max: 60_000 };
+/** Shared RPC deadline for skill-related sidecar dispatches (exported for the replay runner). */
+export const RPC_TIMEOUT = { initial: 30_000, max: 60_000 };
 /**
  * Cap for a stored value in the MIDDLE of a card sentence: the sibling
  * convention (src/sites/builder-tools.ts, ui.ts's UI_CARD_VALUE), short

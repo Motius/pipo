@@ -29,6 +29,7 @@ import { getUserProfile } from '../vault/user-profile.ts';
 import { formatUserProfileForPrompt } from '../user/profile.ts';
 import { routeByConfidence, intentToRoomKey, intentIsBackToThread, type Intent, type RoomKey } from '../voice/intent.ts';
 import { matchWindowControl, type WindowControl } from '../voice/window-control.ts';
+import { replayIfLearned } from '../agents/learned-command-runner.ts';
 import { containsStopPhrase, containsWakePhrase } from '../voice/wake-phrase.ts';
 import {
   createInterviewSession,
@@ -2158,6 +2159,31 @@ CRITICAL — when in genuine doubt between "make in a new project" vs "add to th
       this.broadcastWindowControl(winCtrl, requestId);
       this.broadcastAssistantAck(
         ackForWindowControl(winCtrl),
+        requestId,
+      );
+      return;
+    }
+
+    // Learned-command fast path — a phrase taught once via learn_command
+    // replays its recorded action here with no classifier round trip. The
+    // dashboard has no pebble in-hand, so the replay runs with a blank
+    // sidecar context: the runner then uses the recorded target when the
+    // phrase carries one, and otherwise the best connected machine —
+    // the same rule the pebble path applies when its own sidecar can't.
+    // A refused replay says so honestly and still ends the turn: the person
+    // already declared the intent, and a semi-random LLM detour is the worse
+    // outcome. Fallover over to the classifier is reserved for phrases this
+    // store has never seen.
+    let learned: Awaited<ReturnType<typeof replayIfLearned>> = null;
+    try {
+      learned = await replayIfLearned(trimmed, '');
+    } catch (err) {
+      console.warn('[WSService] learned-command fast path error:', err);
+    }
+    if (learned !== null) {
+      console.log('[WSService] Learned-command replay:', learned.ok ? 'ok' : 'refused');
+      this.broadcastAssistantAck(
+        learned.ok ? learned.message : `${learned.message} Use the normal ask for this one.`,
         requestId,
       );
       return;

@@ -26,6 +26,11 @@ import { modelExecDaemonWarning } from "../util/model-exec-marker.ts";
 import { getRecorder, parseInteractionEvent } from "../skills/recorder.ts";
 import { onRecordingStopped } from "../actions/tools/skills.ts";
 import { createObservation } from "../vault/observations.ts";
+import { replayIfLearned } from "../agents/learned-command-runner.ts";
+import { WatcherService } from "./watcher-service.ts";
+import { cancelWatcher, createWatcher, listWatchers } from "../vault/watchers.ts";
+import { routeToSidecar } from "../actions/tools/sidecar-route.ts";
+import { DictationController, matchDictationIntent } from "./dictation-service.ts";
 import { ObserverService, mapEventType } from "./observer-service.ts";
 import { WebSocketService } from "./ws-service.ts";
 import { PebbleRealtimeManager, wireRealtimeReadvertisement } from "./pebble-realtime.ts";
@@ -1352,12 +1357,39 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         return null;
       };
 
+      // The foreground window pid from a `list_windows` reply, or null when
+      // none is marked (the flag is a win32 native; other platforms may
+      // omit it). Shapes tolerated: {windows:[{is_foreground,pid}]}, a bare
+      // array, and stringified JSON — extractWindowTitles-style defensiveness
+      // shared by the watcher reads.
+      const foregroundPidFromWindows = (resp: unknown): number | null => {
+        const raw = typeof resp === 'string' ? resp : JSON.stringify(resp ?? '');
+        try {
+          const start = raw.indexOf('{') === -1 ? raw.indexOf('[') : Math.min(raw.indexOf('{'), raw.indexOf('[') === -1 ? Number.MAX_SAFE_INTEGER : raw.indexOf('['));
+          if (start < 0) return null;
+          const parsed = JSON.parse(raw.slice(start)) as unknown;
+          const list = Array.isArray(parsed)
+            ? parsed
+            : (parsed && typeof parsed === 'object' && Array.isArray((parsed as { windows?: unknown }).windows)
+              ? (parsed as { windows: unknown[] }).windows
+              : []);
+          for (const entry of list) {
+            if (entry && typeof entry === 'object') {
+              const w = entry as { is_foreground?: unknown; pid?: unknown };
+              if (w.is_foreground === true && typeof w.pid === 'number' && Number.isFinite(w.pid)) return w.pid;
+            }
+          }
+          return null;
+        } catch {
+          return null;
+        }
+      };
+
       // Wrap raw PCM s16 mono in a minimal RIFF/WAVE header so the
       // STT provider (which uploads via multipart and labels as audio.webm
       // by default) sees a recognizable audio container. Whisper sniffs
       // file content, not just the filename hint.
-      const pcmToWav = (pcm: Buffer, sampleRate: number, channels: number): Buffer => {
-        const bitsPerSample = 16;
+      const pcmToWav = (pcm: Buffer, sampleRate: number, channels: number): Buffer => {        const bitsPerSample = 16;
         const byteRate = (sampleRate * channels * bitsPerSample) / 8;
         const blockAlign = (channels * bitsPerSample) / 8;
         const dataLen = pcm.length;
@@ -2071,6 +2103,18 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         pendingSummons.set(sidecarId, { cancelled: false, sessionId: payload.session_id });
         setState(sidecarId, 'listening', '');
         console.log(`[ambient-ui] pebble.summon on ${sidecarId} — listening for audio…`);
+
+        // Dictation target recall: freeze WHICH window the forearm utterance
+        // will be typed into, before the pebble bubble can take focus. The
+        // `is_foreground` flag exists exactly for this (win32 native enum);
+        // best-effort and fire-and-forget — without a snapshot the insert
+        // path falls back to "the window that has focus now".
+        sidecarManager.dispatchRPC(sidecarId, 'list_windows', {})
+          .then((resp) => {
+            const pid = foregroundPidFromWindows(resp);
+            if (pid !== null) summonFocus.set(sidecarId, pid);
+          })
+          .catch(() => { /* no desktop capability or offline — no recall */ });
       });
 
       // W2-T22 + T23: audio session arrives → STT → LLM → speaking → idle.
@@ -2078,6 +2122,42 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       // pipeline (capture done → transcribe → think → speak), not timers.
       const audioSessions = new (await import('./audio-sessions.ts')).AudioSessionRegistry();
       audioSessions.attach((cb) => sidecarManager.onEvent(cb));
+
+      // Dictation mode — armed per sidecar by the "start dictation" fast path
+      // below; audioSessions.onComplete consults it instead of running a turn.
+      const dictation = new DictationController();
+      // pid of the window that had focus when a summon began, per sidecar.
+      const summonFocus = new Map<string, number>();
+
+      // Watchers — the "tell me when …" service. One loop; every state read
+      // is an existing sidecar RPC and nothing here calls the model, so a
+      // watch is free while it waits. A fire lands as a dashboard
+      // notification, a pebble state note on the watched machine, and — when
+      // the watch carries a follow-up prompt — a fresh response cycle through
+      // the normal pipeline, so the follow-up speaks through TTS like any
+      // other turn. `runResponseCycle` is declared later in this function;
+      // the closure below is only ever invoked after startup completes.
+      const watcherService = new WatcherService({
+        readState: async (sidecarId: string, kind) =>
+          kind === 'window_title'
+            ? routeToSidecar(sidecarId, 'list_windows', {}, 'windows')
+            : routeToSidecar(sidecarId, 'get_clipboard', {}, 'clipboard'),
+        onFired: async (w, note) => {
+          const short = note.length > 140 ? `${note.slice(0, 140)}…` : note;
+          try { wsService.broadcastNotification(`[watch] ${short}`, 'normal'); } catch { /* dashboard may be closed */ }
+          sidecarManager.dispatchRPC(w.sidecarId, 'pebble.set_state', { state: 'speaking', text: `Watch fired: ${short}` })
+            .catch(() => { /* no pebble on that machine */ });
+          console.log(`[watchers] fired watch ${w.id.slice(0, 8)} (${w.kind} on ${w.sidecarId}): ${note}`);
+        },
+        onFollowup: (w) => {
+          if (!w.followup) return;
+          void runResponseCycle(w.sidecarId, w.followup, { cancelled: false }).catch((err) => {
+            console.warn('[watchers] follow-up cycle failed:', err);
+          });
+        },
+      });
+      watcherService.start();
+
       // T20 — voice-driven settings mutation. Patches `pipoConfig` and
       // persists via the DB settings store; the saveUserSection choke-point
       // hook then runs the stt/tts appliers (pebble + dashboard providers),
@@ -3582,6 +3662,124 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           .replace(/\s+/g, ' ')
           .trim();
 
+      // tryHandleLearnedCommandIntent — the zero-LLM replay of a phrase once
+      // taught (learn_command). Mirrors Atticus's "learned shortcuts": a
+      // phrase the person rehearsed replays its recorded action instantly,
+      // and the decision of whether it may replay free is re-read from live
+      // skill/tool state at match time (decideReplay) — a phrase whose
+      // underlying action now needs email/browsers/payments falls through to
+      // the normal turn WITHOUT storing any bypass; the person hears the
+      // honest sentence instead.
+      // Returns true when this turn is fully handled (replay done or
+      // refused), false otherwise (no learned phrase or store closed).
+      const tryHandleLearnedCommandIntent = async (
+        sidecarId: string,
+        userText: string,
+        ctrl: { cancelled: boolean },
+      ): Promise<boolean> => {
+        let outcome: Awaited<ReturnType<typeof replayIfLearned>>;
+        try {
+          outcome = await replayIfLearned(userText, sidecarId);
+        } catch (err) {
+          // A closed vault or a registry hiccup is a normal turn next — the
+          // fast path must never be load-bearing.
+          console.warn('[ambient-ui] learned-command fast path error:', err);
+          return false;
+        }
+        if (outcome === null) return false;
+        const spoken = outcome.ok
+          ? outcome.message
+          : `${outcome.message} I'll handle it with the normal flow instead.`;
+        await speakConfirmation(sidecarId, spoken, ctrl);
+        return true;
+      };
+
+      // tryHandleWatchIntent — "tell me when …" creates a cheap watcher;
+      // "stop watching…" cancels; "what are you watching" lists. The parser
+      // is deliberately narrow: two shapes the daemon can pre-fill exactly
+      // (a window title condition and a clipboard condition). Anything less
+      // precise falls through to the model, which answers through the
+      // manage_watchers tool — a watch is created there with full
+      // expressiveness and the SAME store.
+      const tryHandleWatchIntent = async (
+        sidecarId: string,
+        userText: string,
+        ctrl: { cancelled: boolean },
+      ): Promise<boolean> => {
+        const t = userText.toLowerCase().trim();
+        if (!/\bwatch(ing|ers)?\b|\btell me when\b/.test(t)) return false;
+
+        // Cancellation first: stop/cancel WATCHING (not "stop music").
+        if (/\b(stop|cancel|end)\b.*\bwatch(ing|ers)?\b/.test(t)) {
+          const active = listWatchers('active');
+          for (const w of active) cancelWatcher(w.id);
+          await speakConfirmation(sidecarId, active.length
+            ? `Stopped watching — ${active.length} watcher${active.length === 1 ? '' : 's'} cancelled.`
+            : 'No watchers were running.', ctrl);
+          return true;
+        }
+        // Listing.
+        if (/\b(what|which)\b.*\bwatch(ing|ers)\b|\blist.*watchers\b/.test(t)) {
+          const active = listWatchers('active');
+          await speakConfirmation(sidecarId, active.length
+            ? `Watching ${active.map((w) => w.kind === 'window_title' ? `windows for "${w.predicate.match}"` : `the clipboard`).join(', ')}.`
+            : 'Nothing is being watched.', ctrl);
+          return true;
+        }
+
+        // Creation — "tell me when <X> is/becomes/gets done|finished|ready|open…"
+        const windowMatch = t.match(/\btell me when\s+(?:the\s+|my\s+)?(.{2,60}?)\s+(?:is|becomes?|gets?)\s+(?:done|finished|complete[d]?|ready|open|up|live|fixed|built)\b/);
+        const clipMatch = t.match(/\btell me when\s+(?:the\s+|my\s+)?clipboard\s+(?:contains|has|includes|shows|gets)\s+(?:the\s+|a\s+|an\s+)?["„]?([^"“”.!]{2,80}?)["“]?[.!\s]*$/);
+        if (!windowMatch && !clipMatch) return false;
+        try {
+          if (clipMatch) {
+            const subject = clipMatch[1]!.trim();
+            const w = createWatcher({
+              kind: 'clipboard',
+              predicate: { match: subject },
+              sidecarId,
+              createdBy: 'voice',
+            });
+            await speakConfirmation(sidecarId, `Watching your clipboard. I'll tell you when it has ${subject}. Checking every ${Math.round(w.pollMs / 1000)} seconds, costs nothing.`, ctrl);
+          } else {
+            const subject = (windowMatch![1] ?? '').trim().replace(/^(the|my)\s+/, '');
+            if (!subject || subject.length < 2) return false;
+            const w = createWatcher({
+              kind: 'window_title',
+              predicate: { match: subject },
+              sidecarId,
+              createdBy: 'voice',
+            });
+            await speakConfirmation(sidecarId, `Watching for a window that says ${subject}. I'll tell you when it shows up. Checking every ${Math.round(w.pollMs / 1000)} seconds, costs nothing.`, ctrl);
+          }
+          console.log('[ambient-ui] watch created via fast path:', kind, kind === 'clipboard' ? `clipboard "${clipMatch?.[1]}"` : `window "${windowMatch?.[1]}"`);
+        } catch (err) {
+          console.warn('[ambient-ui] watch-intent create failed:', err);
+          await speakConfirmation(sidecarId, "I couldn't start that watch — check the log. Say e.g. tell me when Codex is done.", ctrl);
+        }
+        return true;
+      };
+
+      // tryHandleDictationIntent — arms/disarms per-sidecar dictation; the
+      // actual typing happens at audioSessions.onComplete. Feedback follows
+      // the same intimate-confirm pattern as the settings intents.
+      const tryHandleDictationIntent = async (
+        sidecarId: string,
+        userText: string,
+        ctrl: { cancelled: boolean },
+      ): Promise<boolean> => {
+        const intent = matchDictationIntent(userText);
+        if (!intent) return false;
+        if (intent === 'start') {
+          dictation.start(sidecarId);
+          await speakConfirmation(sidecarId, 'Dictation on. Next summons insert what you say straight into the app you were in.', ctrl);
+        } else {
+          dictation.stop(sidecarId);
+          await speakConfirmation(sidecarId, 'Dictation off. Back to normal turns.', ctrl);
+        }
+        return true;
+      };
+
       // runResponseCycle — streams the LLM response token-by-token.
       // Each completed sentence is synthesized and queued on the sidecar
       // immediately so playback starts within ~1 s of the LLM's first
@@ -3615,6 +3813,20 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         if (!opts?.image) {
           if (await tryHandleRegionIntent(sidecarId, userText, ctrl)) {
             console.log(`[ambient-ui] region-intent fast path took ${Date.now() - cycleStart}ms (waiting for capture…)`);
+            return;
+          }
+          // Learned phrase first: a taught trigger must replay even when its
+          // action would otherwise read like a settings or panel ask.
+          if (await tryHandleLearnedCommandIntent(sidecarId, userText, ctrl)) {
+            console.log(`[ambient-ui] learned-command fast path took ${Date.now() - cycleStart}ms`);
+            return;
+          }
+          if (await tryHandleWatchIntent(sidecarId, userText, ctrl)) {
+            console.log(`[ambient-ui] watch-intent fast path took ${Date.now() - cycleStart}ms`);
+            return;
+          }
+          if (await tryHandleDictationIntent(sidecarId, userText, ctrl)) {
+            console.log(`[ambient-ui] dictation-intent fast path took ${Date.now() - cycleStart}ms`);
             return;
           }
         }
@@ -4204,6 +4416,44 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             return;
           }
           console.log(`[ambient-ui] user said (${transcript.length} chars)`);
+
+          // The mode's own verbs outrank the insertion itself — otherwise
+          // "stop dictation" would be typed into the app and the person
+          // would have no way back. (Start is not reachable this way,
+          // since a session only completes when a summon is open.)
+          const spokenIntent = matchDictationIntent(transcript);
+          if (spokenIntent === 'stop') {
+            dictation.stop(session.sidecarId);
+            await speakConfirmation(session.sidecarId, 'Dictation off. Back to normal turns.', ctrl);
+            clearSummon(session.sidecarId, ctrl);
+            return;
+          }
+
+          // Dictation intercept — a summon while dictation is armed types the
+          // transcript where the person was working and ends the cycle. No
+          // model call; the transcript IS the payload. The target window is
+          // the one frozen at summon time (summonFocus), re-focused first so
+          // the pebble bubble itself never becomes the destination; without a
+          // snapshot the current focused window takes the text, which is the
+          // right answer for insert-where-I-asked too.
+          if (dictation.isActive(session.sidecarId)) {
+            try {
+              const recall = summonFocus.get(session.sidecarId);
+              if (recall !== undefined) {
+                await sidecarManager.dispatchRPC(session.sidecarId, 'focus_window', { pid: recall });
+                await new Promise<void>((r) => setTimeout(r, 150));
+              }
+              await sidecarManager.dispatchRPC(session.sidecarId, 'type_text', { text: transcript });
+              summonFocus.delete(session.sidecarId);
+              await speakConfirmation(session.sidecarId, 'Inserted.', ctrl);
+              console.log(`[ambient-ui] dictation inserted ${transcript.length} chars into pid ${recall ?? '(focused)'}`);
+            } catch (err) {
+              console.warn('[ambient-ui] dictation insert failed:', err);
+              await speakConfirmation(session.sidecarId, "Couldn't insert — the machine may have lost its desktop connection.", ctrl);
+            }
+            clearSummon(session.sidecarId, ctrl);
+            return;
+          }
 
           await runResponseCycle(session.sidecarId, transcript, ctrl);
           clearSummon(session.sidecarId, ctrl);

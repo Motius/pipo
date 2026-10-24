@@ -57,6 +57,7 @@ ${c.bold('Commands:')}
   ${c.cyan('revoke')}    Revoke an enrolled device by sid
   ${c.cyan('export')}    Export user data as a tar archive (export [--out <path>|-] [--full])
   ${c.cyan('restore')}   Restore user data from an export archive (restore <archive|->)
+  ${c.cyan('budget')}    Show what this install actually spent (budget [--days N] [--json])
   ${c.cyan('version')}   Print version number
   ${c.cyan('help')}      Show this help message
 
@@ -93,6 +94,7 @@ ${c.bold('Examples:')}
   pipo enroll <name> --rotate Re-enroll invalidating all previous tokens
   pipo sidecars list --json   List devices (machine-readable)
   pipo revoke <sid>           Revoke a device's access
+  pipo budget --days 7        What pipo's LLM calls cost in tokens/time
   pipo doctor                 Check if everything is working
 `);
 }
@@ -676,6 +678,10 @@ switch (command) {
   case 'restore': {
     const { cmdRestore } = await import('../src/cli/backup.ts');
     process.exit(await cmdRestore(commandArgs));
+  }
+  case 'budget': {
+    const { cmdBudget } = await import('../src/cli/budget.ts');
+    process.exit(await cmdBudget(commandArgs));
   }
   case 'autostart': {
     const { runAutostartCommand } = await import('../src/cli/autostart-command.ts');

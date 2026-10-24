@@ -211,6 +211,15 @@ export type RunSubAgentOptions = {
   onTurn?: (state: SubAgentCheckpoint) => void;
   /** Continue a run from its saved state instead of starting one. */
   resume?: SubAgentResume;
+  /**
+   * Drain pending steering messages, drained before every provider call.
+   * The person steers a RUNNING task (task-manager.steerTask) instead of
+   * killing and relaunching it; each drained message enters the transcript
+   * as a user turn, so it reaches the model at the next loop boundary —
+   * the same injection point orchestration loops use for injected asks.
+   * Absent: nobody is steering this run, and the loop costs nothing extra.
+   */
+  pollSteer?: () => string[];
 };
 
 /**
@@ -600,6 +609,7 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
     governedTools,
     onTurn,
     resume,
+    pollSteer,
   } = opts;
 
   // Build authority context if engine provided
@@ -875,6 +885,24 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
     // Tool execution loop
     for (let iteration = startIteration; iteration < maxIterations; iteration++) {
       fence();
+      // Steering injection — the ONLY place a running sub-agent hears from
+      // the person while it works. Drained here, at the provider-call
+      // boundary, so a steer can never split a tool batch mid-turn: the
+      // model sees the current tool results plus the steer in its next
+      // provider call together. A steer that arrives while tool calls are
+      // dispatching waits for the boundary; one that arrives during the
+      // provider call itself lands next iteration. Each message is a real
+      // user turn (`agent.addMessage` keeps the INSTANCE history in step
+      // with the local buffer), prefixed so the model can tell steering
+      // from the original task.
+      const steer = pollSteer?.() ?? [];
+      for (const note of steer) {
+        agent.addMessage('user', note);
+        messages.push({
+          role: 'user',
+          content: `[Steering, sent by the person while this task runs — honor it together with the original task. If it changes the goal, say so in your final answer.] ${note}`,
+        });
+      }
       const llmResponse: LLMResponse = await llmManager.chatTier('medium', 'sub_agent', messages, { tools });
       fence();
       // The model has now been shown every image in the transcript (#709).

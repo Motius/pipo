@@ -51,9 +51,27 @@ const EXPECTED: Record<string, OutsideReach> = {
   capture_screen: 'fetch',       // an image cannot be delimiter-framed
   desktop_screenshot: 'fetch',   // likewise
   list_directory: 'fetch',       // filenames are attacker-authored; model picks the path
+  // The `followup` parameter is the aiming, not the watch rows: the model can
+  // attach a prompt of its own and watcher-service runs that text as an
+  // unattended 'user'-origin turn when the watch fires (the daemon's
+  // onFollowup) -- the `commitments` shape, recorded in
+  // NOT_REPLAY_DESPITE_APPEARANCES in authority-classes.ts. watch/list/cancel
+  // alone would be `replay`; the worst action decides the whole tool.
+  manage_watchers: 'fetch',
 
   // replay -- stored text of mixed provenance, but not aimable outside
   manage_skills: 'replay',
+  // The zero-LLM fast-path store: our own teach/list/forget confirmations
+  // plus a listing of stored trigger phrases (the person's and earlier
+  // models' words). `teachRefuses()` keeps every stored action inside
+  // read/write data -- a phrase whose action reaches a browser, command,
+  // messaging, payment or settings surface falls back to the governed turn
+  // at replay time, so the replay a row enables has no wider reach than a
+  // read/write call the model could make directly. Not aimable, and the
+  // drain path (see the NOT_REPLAY note in authority-classes.ts) is why
+  // manage_watchers is NOT here with them.
+  learn_command: 'replay',
+  manage_learned_commands: 'replay',
   // Remote-authored strings (hostname, os, capabilities, each unavailable
   // capability's `reason`) straight off the sidecar's register frame. Not
   // aimable, so not `fetch` -- but emphatically not `inert`, and it must not

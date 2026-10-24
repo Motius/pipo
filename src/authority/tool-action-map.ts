@@ -75,6 +75,21 @@ export const TOOL_ACTION_MAP: Readonly<Record<string, ActionCategory>> = Object.
   record_skill: 'control_app',
   manage_skills: 'read_data',
 
+  // Learned commands. learn_command writes one phrase row; the replay it
+  // enables is NOT gated here because a replay never runs as this tool: the
+  // fast path re-classifies the underlying skill/tool live at replay time and
+  // refuses anything whose impact is external or destructive (see
+  // src/agents/learned-command-runner.ts decideReplay). Teaching a phrase for
+  // such an action is refused in the tool itself. manage_learned_commands is
+  // a read except forget, which its gate raises to delete_data.
+  learn_command: 'write_data',
+  manage_learned_commands: 'read_data',
+
+  // Watchers. Creating or cancelling a watch row is a local write; the polls
+  // the watch performs are reads (list_windows / get_clipboard) that go
+  // through the sidecar path directly, outside this tool.
+  manage_watchers: 'write_data',
+
   // Lists connected sidecars. Reached read_data only via the default at the
   // bottom of getActionForTool; spelled out so builtin-tool-coverage.test.ts
   // stays at zero unmapped tools.

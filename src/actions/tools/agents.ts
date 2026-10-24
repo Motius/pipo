@@ -231,18 +231,19 @@ export function createManageAgentsTool(deps: AgentToolDeps): ToolDefinition {
       '  assign    — Send a task to an existing agent (async, returns task_id)',
       '  status    — Check agent or task status',
       '  collect   — Get full result of a completed task',
+      '  steer     — Send a mid-run instruction to a RUNNING task (task_id + message): correct its aim without killing the work it has already done',
       '  list      — Show all active agents and tasks',
       '  terminate — Shut down an agent',
       '',
       'Available specialists: ' + Array.from(deps.specialists.keys()).join(', '),
       '',
-      'Workflow: spawn → assign → status/collect → terminate',
+      'Workflow: spawn → assign → status/steer/collect → terminate',
     ].join('\n'),
     category: 'delegation',
     parameters: {
       action: {
         type: 'string',
-        description: 'The action: spawn, assign, status, collect, list, terminate',
+        description: 'The action: spawn, assign, status, collect, steer, list, terminate',
         required: true,
       },
       specialist: {
@@ -257,7 +258,12 @@ export function createManageAgentsTool(deps: AgentToolDeps): ToolDefinition {
       },
       task_id: {
         type: 'string',
-        description: 'Task ID (for status, collect)',
+        description: 'Task ID (for status, collect, steer)',
+        required: false,
+      },
+      message: {
+        type: 'string',
+        description: 'The steering instruction (required for steer). Should be a correction or refinement of the running task, e.g. "skip the second table, the person only needs the first" or "the API changed, use /v2 endpoints".',
         required: false,
       },
       task: {
@@ -283,12 +289,14 @@ export function createManageAgentsTool(deps: AgentToolDeps): ToolDefinition {
           return handleStatus(deps, params);
         case 'collect':
           return handleCollect(deps, params);
+        case 'steer':
+          return handleSteer(deps, params);
         case 'list':
           return handleList(deps);
         case 'terminate':
           return handleTerminate(deps, params);
         default:
-          return `Error: Unknown action "${action}". Use: spawn, assign, status, collect, list, terminate`;
+          return `Error: Unknown action "${action}". Use: spawn, assign, status, collect, steer, list, terminate`;
       }
     },
   };
@@ -359,6 +367,35 @@ function handleStatus(deps: AgentToolDeps, params: Record<string, unknown>): str
 
   // No ID given — return summary
   return handleList(deps);
+}
+
+/**
+ * Steer a running task — queue a person/model instruction that the
+ * sub-agent reads at its next provider call without any restart. The
+ * returned JSON reports the outcome so the caller can tell the person
+ * the truth: "queued" is not "done".
+ */
+function handleSteer(deps: AgentToolDeps, params: Record<string, unknown>): string {
+  const taskId = params.task_id as string | undefined;
+  if (!taskId) return 'Error: "task_id" is required for steer';
+  const message = typeof params.message === 'string' ? params.message : '';
+  if (!message.trim()) return 'Error: "message" is required for steer — say what should change about the running task.';
+
+  const outcome = deps.taskManager.steerTask(taskId, message);
+  switch (outcome) {
+    case 'queued':
+      return JSON.stringify({
+        task_id: taskId,
+        steered: true,
+        message: `Steering queued: the task will read it before its next step. It does not restart anything — the agent folds the instruction into the work it has already done.`,
+      });
+    case 'unknown':
+      return `Error: Task "${taskId}" not found. Use action "list" to see task IDs.`;
+    case 'completed':
+      return `Error: That task already completed — steering it is pointless. Use "collect" to read the result, or "assign" to run a follow-up task.`;
+    case 'failed':
+      return `Error: That task already failed. Its result says why — use "collect".`;
+  }
 }
 
 function handleCollect(deps: AgentToolDeps, params: Record<string, unknown>): string {

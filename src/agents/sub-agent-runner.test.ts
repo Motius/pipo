@@ -422,3 +422,52 @@ describe('a tool that returns an image (#709)', () => {
     expect(shotResult).not.toContain('earlier step');
   });
 });
+
+describe('steering a running sub-agent', () => {
+  /** Scripted turns like `recordingLlm`, but local: records each provider call's transcript. */
+  function steeringLlm(turns: LLMToolCall[][]) {
+    const sent: unknown[] = [];
+    let call = 0;
+    return { sent, manager: { chatTier: async (_t: string, _p: string, messages: unknown[]) => {
+      sent.push(JSON.parse(JSON.stringify(messages)));
+      const turn = turns[call++];
+      return turn
+        ? { content: '', finish_reason: 'tool_use', tool_calls: turn, usage: { input_tokens: 1, output_tokens: 1 } }
+        : { content: 'steered completion', finish_reason: 'end_turn', tool_calls: [], usage: { input_tokens: 1, output_tokens: 1 } };
+    } } as any };
+  }
+
+  test('a drained steer enters the transcript as a user turn before the next provider call', async () => {
+    const model = steeringLlm([[read('c1')]]);
+    // One steer at the first boundary (before call 0 — the fresh start), none after.
+    let drainedOnce = false;
+    const instance = agent();
+    const result = await runSubAgent({
+      agent: instance, task: 'do the thing', context: '', llmManager: model.manager,
+      toolRegistry: registry().r, maxIterations: 3,
+      pollSteer: () => {
+        if (drainedOnce) return [];
+        drainedOnce = true;
+        return ['focus only on the second table'];
+      },
+    });
+    expect(result.terminationReason).toBe('completed');
+    // The FIRST provider call already carries the steer: injection happens at
+    // the loop boundary, before the model answers, not retroactively.
+    expect(JSON.stringify(model.sent[0])).toContain('focus only on the second table');
+    // And ONLY once: the second call keeps the note in history but drainers
+    // that return [] (an empty channel) must not re-inject.
+    expect(JSON.stringify(model.sent[0]).match(/focus only on the second table/g)).toHaveLength(1);
+  });
+
+  test('an empty channel stays silent — the transcript gains nothing', async () => {
+    const model = steeringLlm([[read('c1')]]);
+    const result = await runSubAgent({
+      agent: agent(), task: 'do the thing', context: '', llmManager: model.manager,
+      toolRegistry: registry().r, maxIterations: 3,
+      pollSteer: () => [],
+    });
+    expect(result.terminationReason).toBe('completed');
+    expect(JSON.stringify(model.sent)).not.toContain('[Steering');
+  });
+});

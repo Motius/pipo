@@ -69,6 +69,14 @@ export class TaskCapacityError extends Error {
 export class AgentTaskManager {
   private tasks = new Map<string, AsyncTask>();
   private listeners = new Set<TaskLifecycleListener>();
+  /**
+   * Steering notes waiting to be handed to a running sub-agent, keyed by
+   * task ID. Written by steerTask(); drained (and cleared) by the
+   * `pollSteer` closure handed to runSubAgent at launch, at the runner's
+   * tool-turn boundary. Entries for finished tasks are dropped on
+   * completion, so a steer raced against the finish never resurrects.
+   */
+  private pendingSteer = new Map<string, string[]>();
 
   /** `runSubAgentFn` is a test seam; production gets the real runner. */
   constructor(private readonly runSubAgentFn: typeof runSubAgent = runSubAgent) {}
@@ -145,8 +153,25 @@ export class AgentTaskManager {
       toolRegistry,
       onProgress,
       toolFilterProviders,
+      /**
+       * The steer channel: the runner drains this at every provider-call
+       * boundary. It reads and clears the per-task slot, so a pending note
+       * is delivered exactly once, even if the loop cadence is slow — the
+       * runner re-invokes this each iteration until the queue is empty.
+       */
+      pollSteer: () => {
+        const pending = this.pendingSteer.get(taskId);
+        if (!pending || pending.length === 0) return [];
+        this.pendingSteer.set(taskId, []);
+        return pending;
+      },
       ...(authority ?? {}),
     }).then((result) => {
+      // A steer that raced the finish is dropped with the slot: its person
+      // gets steered nothing, but a queued slot can never resurface on a
+      // LATER task for the same agent (task IDs are unique, but the slot
+      // is memory all the same).
+      this.pendingSteer.delete(taskId);
       asyncTask.status = 'completed';
       asyncTask.completedAt = Date.now();
       asyncTask.result = result;
@@ -154,6 +179,7 @@ export class AgentTaskManager {
       this.emit('complete', asyncTask);
       onComplete?.(asyncTask);
     }).catch((err) => {
+      this.pendingSteer.delete(taskId);
       asyncTask.status = 'failed';
       asyncTask.completedAt = Date.now();
       asyncTask.result = {
@@ -177,6 +203,37 @@ export class AgentTaskManager {
    */
   getTask(taskId: string): AsyncTask | undefined {
     return this.tasks.get(taskId);
+  }
+
+  /**
+   * Hand a mid-run instruction to a RUNNING background sub-agent.
+   *
+   * Why queue instead of abort-and-relaunch: the sub-agent may be deep in
+   * useful work (research fetched, files partially written), and the person
+   * steering usually wants a correction folded INTO that work, not a restart
+   * that throws it away. The note is delivered by the runner at its next
+   * tool-turn boundary, so nothing interrupts a in-flight tool batch — a
+   * `rm -rf` is not held in abeyance by this, and steering is deliberately
+   * NOT an authority event: it says nothing about what the agent may do,
+   * only what it should aim at.
+   *
+   * Returns
+   *   'queued'    — the note reaches the sub-agent's next provider call.
+   *   'unknown'   — no such task ID.
+   *   'completed' / 'failed' — the run already ended; the caller gets the
+   *                 honest answer and nothing is buffered.
+   */
+  steerTask(taskId: string, message: string): 'queued' | 'unknown' | 'completed' | 'failed' {
+    const trimmed = message.trim();
+    if (!trimmed) return 'unknown';
+    const task = this.tasks.get(taskId);
+    if (!task) return 'unknown';
+    if (task.status !== 'running') return task.status;
+    const slot = this.pendingSteer.get(taskId) ?? [];
+    slot.push(trimmed);
+    this.pendingSteer.set(taskId, slot);
+    console.log(`[TaskManager] Steer queued for task ${taskId.slice(0, 8)}: ${trimmed.slice(0, 80)}`);
+    return 'queued';
   }
 
   /**

@@ -98,6 +98,21 @@ const REPLAY_TOOLS: ReadonlySet<string> = new Set([
   // chooses nothing, so it is not a substitution route -- but it is emphatically
   // not `inert`, and it must not sit in a floor that no input can remove.
   'list_sidecars',
+  // The zero-LLM fast-path store. `learn_command` writes one row (trigger
+  // phrase → one stored skill, or one builtin call with FIXED arguments) and
+  // answers with our own confirmation plus a listing of the stored phrases;
+  // `manage_learned_commands` lists those rows and forgets them. Same shape
+  // as `manage_skills`: stored mixed-provenance text, no URL, no path, no
+  // free-text prompt parameter. The unattended replay a row enables is
+  // deliberately not aiming at anything -- `teachRefuses()` keeps every
+  // stored action inside read/write data (a phrase whose action touches
+  // browser, commands, messaging, payments or settings falls back to the
+  // governed turn at replay time), and what a replay runs is one stored call
+  // with fixed arguments the model could have made directly, so binding it
+  // adds no aiming power. Revisit if a learned action is ever allowed to
+  // carry a prompt instead of arguments.
+  'learn_command',
+  'manage_learned_commands',
 ]);
 
 /**
@@ -115,7 +130,7 @@ export const SYNTHETIC_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Two tools that LOOK like `replay` and are deliberately NOT.
+ * Tools that LOOK like `replay` and are deliberately NOT.
  *
  * They fall through to the `fetch` default; this set exists only so the
  * reasoning is recorded where someone would otherwise "tidy" them into
@@ -148,10 +163,23 @@ export const SYNTHETIC_TOOLS: ReadonlySet<string> = new Set([
  *     URL is a legal `topic`. Classifying it on the current absence of a
  *     worker would make the safety of this filter depend on a deletion
  *     nothing enforces, so it is `fetch` and costs 859 bytes.
+ *
+ *   manage_watchers
+ *     The `watch`, `list` and `cancel` actions read and write one stored row
+ *     each and would be `replay` on the `manage_skills` reasoning. But the
+ *     model may attach a `followup` PROMPT of its own, and watcher-service
+ *     hands that text to `runResponseCycle` with 'user' origin when the watch
+ *     fires (`daemon/index.ts` onFollowup) -- free text executed with no
+ *     human turn in between, which is exactly the `commitments` shape. A
+ *     watch whose match already holds fires within its poll cadence, so the
+ *     model can self-schedule the turn. If a future design makes the
+ *     followup voice-only, or runs it as a draft the person must confirm,
+ *     this tool drops back to `replay` with the rows it only reads.
  */
 const NOT_REPLAY_DESPITE_APPEARANCES: ReadonlySet<string> = new Set([
   'commitments',
   'research_queue',
+  'manage_watchers',
 ]);
 
 /**

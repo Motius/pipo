@@ -56,8 +56,10 @@ describe('createBrowserTools', () => {
     ]);
   });
 
-  test('BUILTIN_TOOLS = NON_BROWSER_TOOLS + 10 browser + 9 desktop + 2 ui + 3 skill tools', () => {
-    expect(BUILTIN_TOOLS).toHaveLength(NON_BROWSER_TOOLS.length + 10 + 9 + 2 + 3);
+  test('BUILTIN_TOOLS = NON_BROWSER_TOOLS + 10 browser + 9 desktop + 2 ui + 3 skill + 3 fast-path tools', () => {
+    // The fast-path terms are the zero-LLM surfaces: 2 learned-command
+    // tools (learn_command, manage_learned_commands) plus 1 watcher tool.
+    expect(BUILTIN_TOOLS).toHaveLength(NON_BROWSER_TOOLS.length + 10 + 9 + 2 + 3 + 3);
   });
 });
 

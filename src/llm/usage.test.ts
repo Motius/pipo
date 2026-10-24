@@ -260,3 +260,76 @@ describe('recordUsage resilience', () => {
     expect(String(warnings[0]![0])).toContain('Failed to record usage');
   });
 });
+
+describe('getBudgetReport', () => {
+  beforeEach(() => {
+    closeDb();
+    const db = initDatabase(':memory:');
+    setUsageDatabase(() => db);
+    seed();
+
+    // Same backdating as the queryUsage describe: the seed's last row is a
+    // week+ old so the 7-day window excludes exactly that one.
+    const now = Date.now();
+    const offsets = [0, 60_000, 120_000, 180_000, 240_000, 8 * 86400000];
+    for (let i = 0; i < offsets.length; i++) {
+      db.run(`UPDATE llm_usage SET ts = ? WHERE id = ?`, [now - offsets[i]!, i + 1]);
+    }
+  });
+
+  it('totals the window, splits spend by subsystem and model, and rates the ask', async () => {
+    const { getBudgetReport } = await import('./usage.ts');
+    const r = getBudgetReport(7);
+    expect(r.available).toBe(true);
+    expect(r.calls).toBe(5);                       // the 8-day-old row is out
+    expect(r.errors).toBe(1);
+    expect(r.input_tokens).toBe(100 + 500 + 200 + 250 + 110);
+    expect(r.output_tokens).toBe(50 + 200 + 80 + 100 + 55);
+    expect(r.cache_read_input_tokens).toBe(60 + 300);
+    expect(r.avg_latency_ms).toBe(Math.round((800 + 2400 + 5000 + 4800 + 700) / 5));
+    // Ask medians come from clean chat rows only. The seed has none � the
+    // honest shape for that window is null, not a zero pretending nothing
+    // ever ran a chat.
+    expect(r.ask).toBeNull();
+    // Spend order: highest in+out first; claude-sonnet (700 total tokens) over llama3.
+    expect(r.by_subsystem[0]!.key).toBe('chat_orchestrator');
+    expect(r.by_provider_model[0]!.key).toBe('anthropic/claude-sonnet');
+  });
+
+  it('the ask medians summarize recent non-error chat rows', async () => {
+    const { getBudgetReport, recordUsage } = await import('./usage.ts');
+    // Latencies 300, 700, 900 -> median 700. Inputs 400, 600, 1000 -> 600.
+    for (const s of (
+      [
+        { latency: 900, in: 1000, out: 200 },
+        { latency: 300, in: 400, out: 100 },
+        { latency: 700, in: 600, out: 150 },
+        { latency: 10_000, in: 5000, out: 100, err: 'rate_limit' },
+        { latency: 2_000, in: 100, out: 1, subsystem: 'voice_intent' },
+      ] as Array<{ latency: number; in: number; out: number; err?: string; subsystem?: string }>
+    )) {
+      recordUsage({
+        tier: 'conversation', resolved_tier: 'conversation',
+        subsystem: s.subsystem ?? 'chat',
+        provider: 'openai', model: 'gpt-x',
+        input_tokens: s.in, output_tokens: s.out, latency_ms: s.latency,
+        error_code: s.err,
+      });
+    }
+    const r = getBudgetReport(7);
+    expect(r.ask).not.toBeNull();
+    expect(r.ask!.sampled).toBe(3);
+    expect(r.ask!.median_latency_ms).toBe(700);
+    expect(r.ask!.median_input_tokens).toBe(600);
+    expect(r.ask!.median_output_tokens).toBe(150);
+  });
+
+  it('is unavailable when no ledger is wired, without throwing', async () => {
+    setUsageDatabase(() => null);
+    const { getBudgetReport } = await import('./usage.ts');
+    const r = getBudgetReport(7);
+    expect(r.available).toBe(false);
+    expect(r.calls).toBe(0);
+    expect(r.by_subsystem).toEqual([]);
+  });
+});

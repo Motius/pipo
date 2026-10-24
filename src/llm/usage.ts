@@ -374,3 +374,141 @@ export function listUsageDistinctValues(): {
     return empty;
   }
 }
+
+// -- Cost/budget report --------------------------------------------------
+//
+// Local ground truth for "what is pipo costing me" � the counterpart of the
+// hosted /api/llm/budget meter, which only a hosted install has. Everything
+// here is computed from llm_usage rows only: no provider keys, no config
+// values, nothing secret. Prices are deliberately ABSENT: without dated
+// per-token price evidence (the same standard src/workflows/evaluation
+// holds), an invented $ figure is a lie, so the report speaks in tokens,
+// calls and time and lets the reader multiply.
+
+export type BudgetReportRow = {
+  key: string;
+  extra: string;           // model name for provider rows; '' otherwise
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_latency_ms: number;
+  errors: number;
+};
+
+export type BudgetReport = {
+  /** False when no usage DB is wired (CLI outside a configured home, tests). */
+  available: boolean;
+  window_days: number;
+  calls: number;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_latency_ms: number;
+  avg_latency_ms: number | null;       // null when calls === 0
+  /** Median per-call cost of a CHAT ask, from recent non-error chat rows. */
+  ask: {
+    sampled: number;
+    median_latency_ms: number;
+    median_input_tokens: number;
+    median_output_tokens: number;
+  } | null;                            // null when no chat rows in the window
+  /** Higher-spend features first. */
+  by_subsystem: BudgetReportRow[];
+  by_provider_model: BudgetReportRow[];
+};
+
+/** The chat rows the ask medians summarize. Capped: a long-running daemon */
+/** can accumulate hundreds of thousands of rows; the median of the most */
+/** recent 2000 answers "what does a typical ask cost now", which is the */
+/** question this number exists for. */
+const ASK_SAMPLE_LIMIT = 2000;
+
+const median = (values: number[]): number | null => {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid]! : Math.round((sorted[mid - 1]! + sorted[mid]!) / 2);
+};
+
+/**
+ * The full local cost picture over `daysBack`. Synchronous like the rest of
+ * this module; aggregation in SQL, medians in JS (SQLite has no median, and
+ * ORDER BY in a CTE for a percentile is where queries stop being readable).
+ */
+export function getBudgetReport(daysBack: number = 7): BudgetReport {
+  const db = resolveDb();
+  const empty = (over: Partial<BudgetReport> = {}): BudgetReport => ({
+    available: false, window_days: daysBack, calls: 0, errors: 0,
+    input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    total_latency_ms: 0, avg_latency_ms: null, ask: null, by_subsystem: [], by_provider_model: [],
+    ...over,
+  });
+  if (!db) return empty();
+
+  const sinceMs = Date.now() - daysBack * 24 * 60 * 60 * 1000;
+  try {
+    const rollup = (keyExpr: string, extraExpr: string, groupExpr: string) =>
+      db.query<{ key: string; extra: string; calls: number; input_tokens: number; output_tokens: number;
+        total_latency_ms: number; errors: number }, [number]>(
+        `SELECT ${keyExpr} as key,
+           ${extraExpr} as extra,
+           COUNT(*) as calls,
+           COALESCE(SUM(input_tokens), 0) as input_tokens,
+           COALESCE(SUM(output_tokens), 0) as output_tokens,
+           COALESCE(SUM(latency_ms), 0) as total_latency_ms,
+           SUM(CASE WHEN error_code IS NOT NULL THEN 1 ELSE 0 END) as errors
+         FROM llm_usage
+         WHERE ts >= ?
+         GROUP BY ${groupExpr}
+         ORDER BY input_tokens + output_tokens DESC, calls DESC`,
+      ).all(sinceMs);
+
+    const bySubsystem = rollup('subsystem', "''", 'subsystem');
+    const byProviderModel = rollup('provider', 'model', 'provider, model')
+      .map((r) => ({ ...r, key: r.extra ? `${r.key}/${r.extra}` : r.key }));
+
+    const chatRows = db.query<Pick<UsageRawRow, 'latency_ms' | 'input_tokens' | 'output_tokens'>, [number]>(
+      `SELECT latency_ms, input_tokens, output_tokens
+       FROM llm_usage
+       WHERE ts >= ? AND subsystem = 'chat' AND error_code IS NULL
+       ORDER BY ts DESC
+       LIMIT ${ASK_SAMPLE_LIMIT}`,
+    ).all(sinceMs);
+
+    const totals = db.query<UsageQueryTotals, [number]>(
+      `SELECT COUNT(*) as calls,
+         COALESCE(SUM(input_tokens), 0) as input_tokens,
+         COALESCE(SUM(output_tokens), 0) as output_tokens,
+         COALESCE(SUM(cache_read_input_tokens), 0) as cache_read_input_tokens,
+         COALESCE(SUM(cache_creation_input_tokens), 0) as cache_creation_input_tokens,
+         COALESCE(SUM(latency_ms), 0) as total_latency_ms,
+         SUM(CASE WHEN error_code IS NOT NULL THEN 1 ELSE 0 END) as errors
+       FROM llm_usage WHERE ts >= ?`,
+    ).get(sinceMs)!;
+
+    return empty({
+      available: true,
+      calls: totals.calls,
+      errors: totals.errors ?? 0,
+      input_tokens: totals.input_tokens,
+      output_tokens: totals.output_tokens,
+      cache_read_input_tokens: totals.cache_read_input_tokens,
+      cache_creation_input_tokens: totals.cache_creation_input_tokens,
+      total_latency_ms: totals.total_latency_ms,
+      avg_latency_ms: totals.calls > 0 ? Math.round(totals.total_latency_ms / totals.calls) : null,
+      ask: chatRows.length > 0 ? {
+        sampled: chatRows.length,
+        median_latency_ms: median(chatRows.map((r) => r.latency_ms)) ?? 0,
+        median_input_tokens: median(chatRows.map((r) => r.input_tokens)) ?? 0,
+        median_output_tokens: median(chatRows.map((r) => r.output_tokens)) ?? 0,
+      } : null,
+      by_subsystem: bySubsystem,
+      by_provider_model: byProviderModel,
+    });
+  } catch (err) {
+    console.warn('[LLMUsage] budget report failed:', err);
+    return empty();
+  }
+}

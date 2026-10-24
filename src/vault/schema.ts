@@ -2,6 +2,8 @@ import { Database } from "bun:sqlite";
 import { ensureSuggestionSchema } from './suggestion-schema.ts';
 import { ensureGoalEventSchema } from './goal-event-schema.ts';
 import { ensureFactSchema } from './fact-schema.ts';
+import { ensureLearnedCommandsSchema } from './learned-commands.ts';
+import { ensureWatcherSchema } from './watchers.ts';
 
 let dbInstance: Database | null = null;
 
@@ -107,6 +109,8 @@ function backfillPlannedWork(db: Database): void {
  * Create all database tables and indexes
  */
 function createTables(db: Database): void {
+  ensureLearnedCommandsSchema(db);
+  ensureWatcherSchema(db);
   // Entities table: people, places, projects, tools, concepts
   db.run(`
     CREATE TABLE IF NOT EXISTS entities (

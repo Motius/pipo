@@ -33,6 +33,8 @@ import { captureViaPrivateFile } from '../app-control/capture-file.ts';
 import { sanitizedEnv } from '../../util/subprocess-env.ts';
 import { UI_TOOLS } from './ui.ts';
 import { SKILL_TOOLS } from './skills.ts';
+import { LEARNED_COMMAND_TOOLS } from './learned-commands.ts';
+import { WATCHER_TOOLS } from './watchers.ts';
 
 const terminal = new TerminalExecutor({ timeout: 30000 });
 
@@ -1776,6 +1778,8 @@ export const BUILTIN_TOOLS: ToolDefinition[] = [
   ...DESKTOP_TOOLS,
   ...UI_TOOLS,
   ...SKILL_TOOLS,
+  ...LEARNED_COMMAND_TOOLS,
+  ...WATCHER_TOOLS,
 ];
 
 /**
