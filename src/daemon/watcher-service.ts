@@ -61,7 +61,7 @@ export function extractWindowTitles(raw: string): string[] {
 }
 
 export class WatcherService {
-  private timer: ReturnType<typeof setInterval> | null;
+  private timer: ReturnType<typeof setInterval> | null = null;
   private readonly checkedAt = new Map<string, number>();
   private readonly inFlight = new Set<string>();
 

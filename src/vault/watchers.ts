@@ -103,7 +103,7 @@ function rowToWatcher(row: WatcherRow): Watcher {
     createdBy: row.created_by,
     status: row.status as WatcherStatus,
     resultNote: row.result_note,
-    firedAt: row.fired_at ?? undefined,
+    firedAt: row.fired_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -159,8 +159,8 @@ export function createWatcher(input: CreateWatcher): Watcher {
   getDb().run(`
     INSERT INTO watchers (id, kind, predicate, sidecar_id, poll_ms, expires_at, followup, created_by, status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-  `, id, input.kind, JSON.stringify({ match, regex: regex || undefined }), input.sidecarId, poll, now + ttl,
-  input.followup ?? null, input.createdBy ?? 'tool', now, now);
+  `, [id, input.kind, JSON.stringify({ match, regex: regex || undefined }), input.sidecarId, poll, now + ttl,
+  input.followup ?? null, input.createdBy ?? 'tool', now, now]);
   return getWatcher(id)!;
 }
 
@@ -181,7 +181,7 @@ export function terminalWatchers(now = Date.now()): Watcher[] {
   for (const w of rows) {
     getDb().run(`
       UPDATE watchers SET status = 'expired', updated_at = ? WHERE id = ?
-    `, now, w.id);
+    `, [now, w.id]);
   }
   return rows;
 }
@@ -193,15 +193,14 @@ export function fireWatcher(id: string, resultNote: string): Watcher | undefined
     UPDATE watchers
     SET status = 'fired', result_note = ?, fired_at = ?, updated_at = ?
     WHERE id = ? AND status = 'active'
-  `, resultNote, now, now, id);
+  `, [resultNote, now, now, id]);
   return getWatcher(id);
 }
 
 export function cancelWatcher(id: string): boolean {
   const res = getDb().run(
     `UPDATE watchers SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'active'`,
-    Date.now(),
-    id,
+    [Date.now(), id],
   );
   return res.changes > 0;
 }

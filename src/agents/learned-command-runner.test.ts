@@ -42,7 +42,7 @@ describe('learned-command replay decisions', () => {
     const cmd = upsertLearnedCommand({ trigger: 'open spotify', action: { type: 'skill', skill: 'open-spotify' } });
     const d = decideReplay(cmd);
     expect(d.kind).toBe('free');
-    expect(d.summary).toContain('open-spotify');
+    if (d.kind === 'free') expect(d.summary).toContain('open-spotify');
   });
 
   test('a skill whose classifier sees a business effect falls over', () => {
@@ -73,7 +73,7 @@ describe('learned-command replay decisions', () => {
     getDb().prepare('DELETE FROM skills WHERE id = ?').run(row.id);
     const d = decideReplay(getLearnedCommandByTrigger('evolve layout')!);
     expect(d.kind).toBe('fallover');
-    expect(d.reason).toContain('no longer exists');
+    if (d.kind === 'fallover') expect(d.reason).toContain('no longer exists');
   });
 
   test('replayLearnedCommand runs the recorded builtin tool and counts the attempt', async () => {

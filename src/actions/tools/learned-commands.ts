@@ -164,10 +164,6 @@ export const manageLearnedCommandsTool: ToolDefinition = {
         : 'Forget a learned phrase',
     };
   },
-  parameters: {
-    action: { type: 'string', description: '"list" or "forget".', required: true, enum: ['list', 'forget'] },
-    trigger: { type: 'string', description: 'The phrase to forget (required for "forget").', required: false },
-  },
   execute: async (params) => {
     const action = typeof params.action === 'string' ? params.action : '';
     if (action === 'forget') {

@@ -3752,7 +3752,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             });
             await speakConfirmation(sidecarId, `Watching for a window that says ${subject}. I'll tell you when it shows up. Checking every ${Math.round(w.pollMs / 1000)} seconds, costs nothing.`, ctrl);
           }
-          console.log('[ambient-ui] watch created via fast path:', kind, kind === 'clipboard' ? `clipboard "${clipMatch?.[1]}"` : `window "${windowMatch?.[1]}"`);
+          const createdKind: 'clipboard' | 'window_title' = clipMatch ? 'clipboard' : 'window_title';
+          const createdDetail = createdKind === 'clipboard'
+            ? `clipboard "${clipMatch?.[1]}"`
+            : `window "${windowMatch?.[1]}"`;
+          console.log('[ambient-ui] watch created via fast path:', createdKind, createdDetail);
         } catch (err) {
           console.warn('[ambient-ui] watch-intent create failed:', err);
           await speakConfirmation(sidecarId, "I couldn't start that watch — check the log. Say e.g. tell me when Codex is done.", ctrl);

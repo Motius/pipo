@@ -79,7 +79,7 @@ function rowToCommand(row: LearnedRow): LearnedCommand {
     createdBy: row.created_by,
     runCount: row.run_count,
     successCount: row.success_count,
-    lastRunAt: row.last_run_at ?? undefined,
+    lastRunAt: row.last_run_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -140,14 +140,14 @@ export function upsertLearnedCommand(input: UpsertLearnedCommand): LearnedComman
       UPDATE learned_commands
       SET command_json = ?, target = ?, created_by = ?, updated_at = ?
       WHERE id = ?
-    `, actionJson, input.target ?? null, input.createdBy ?? 'tool', now, existing.id);
+    `, [actionJson, input.target ?? null, input.createdBy ?? 'tool', now, existing.id]);
     return getLearnedCommandById(existing.id)!;
   }
   const id = generateId();
   db.run(`
     INSERT INTO learned_commands (id, phrase, command_json, target, created_by, run_count, success_count, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
-  `, id, trigger, actionJson, input.target ?? null, input.createdBy ?? 'tool', now, now);
+  `, [id, trigger, actionJson, input.target ?? null, input.createdBy ?? 'tool', now, now]);
   return getLearnedCommandById(id)!;
 }
 
