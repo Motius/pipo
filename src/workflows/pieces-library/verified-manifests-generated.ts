@@ -17,7 +17,7 @@ export interface VerifiedManifest {
 
 export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
   "claude": {
-    version: "0.7.0",
+    version: "0.8.0",
     actions: [
       {"name":"ask_claude","classification":"READ","props":["image","maxTokens","model","prompt","roles","systemPrompt","temperature","thinkingMode","thinkingModeParams"]},
       {"name":"cancel_message_batch","classification":"WRITE","props":["messageBatchId"]},
@@ -25,7 +25,7 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
       {"name":"create_message_batch","classification":"WRITE","props":["requests"]},
       {"name":"custom_api_call","classification":"WRITE","props":["body","body_type","failsafe","followRedirects","headers","method","queryParams","response_is_binary","timeout","url"]},
       {"name":"delete_message_batch","classification":"DESTRUCTIVE","props":["messageBatchId"]},
-      {"name":"extract-structured-data","classification":"READ","props":["image","maxTokens","mode","model","prompt","schema","text"]},
+      {"name":"extract-structured-data","classification":"READ","props":["image","maxTokens","mode","model","prompt","schema","sourceInfo","text"]},
       {"name":"get_message_batch","classification":"READ","props":["messageBatchId"]},
       {"name":"get_message_batch_results","classification":"READ","props":["maxResults","messageBatchId"]},
       {"name":"get_model","classification":"READ","props":["modelId"]},
@@ -34,7 +34,7 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
     ],
   },
   "discord": {
-    version: "0.7.0",
+    version: "0.8.2",
     actions: [
       {"name":"add_role_to_member","classification":"WRITE","props":["guild_id","role_id","user_id"]},
       {"name":"ban_guild_member","classification":"DESTRUCTIVE","props":["ban_reason","guild_id","user_id"]},
@@ -165,7 +165,7 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
     ],
   },
   "google-calendar": {
-    version: "0.12.0",
+    version: "0.13.3",
     actions: [
       {"name":"create_google_calendar_event","classification":"WRITE","props":["attendees","calendar_id","colorId","create_meet_link","description","end_date_time","guests_can_invite_others","guests_can_modify","guests_can_see_other_guests","location","send_notifications","start_date_time","title"]},
       {"name":"create_quick_event","classification":"WRITE","props":["calendar_id","send_updates","text"]},
@@ -195,7 +195,7 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
     ],
   },
   "google-drive": {
-    version: "0.11.0",
+    version: "0.13.1",
     actions: [
       {"name":"create_new_gdrive_file","classification":"WRITE","props":["fileName","fileType","include_team_drives","parentFolder","text"]},
       {"name":"create_new_gdrive_folder","classification":"WRITE","props":["folderName","include_team_drives","parentFolder"]},
@@ -253,7 +253,7 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
     ],
   },
   "notion": {
-    version: "0.7.3",
+    version: "0.8.3",
     actions: [
       {"name":"add_comment","classification":"WRITE","props":["comment_text","page_id"]},
       {"name":"append_to_page","classification":"WRITE","props":["content","pageId"]},
@@ -291,15 +291,15 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
       {"name":"notion-find-database-item","classification":"SEARCH","props":["database_id","filterDatabaseFields","filter_hint"]},
       {"name":"restore_database_item","classification":"WRITE","props":["archived_item_id","database_id"]},
       {"name":"retrieve_database","classification":"READ","props":["database_id"]},
-      {"name":"update_database_item","classification":"WRITE","props":["databaseFields","database_id","database_item_id"]},
+      {"name":"update_database_item","classification":"WRITE","props":["changes_info","databaseFields","database_id","database_item_id"]},
     ],
   },
   "openai": {
-    version: "0.12.0",
+    version: "0.13.2",
     actions: [
       {"name":"analyze_sentiment","classification":"READ","props":["model","text"]},
-      {"name":"ask_assistant","classification":"WRITE","props":["assistant","memoryKey","prompt"]},
-      {"name":"ask_chatgpt","classification":"READ","props":["frequencyPenalty","maxTokens","memoryKey","model","presencePenalty","prompt","roles","temperature","topP"]},
+      {"name":"ask_assistant","classification":"WRITE","props":["assistant","deprecationNotice","memoryKey","prompt"]},
+      {"name":"ask_chatgpt","classification":"READ","props":["frequencyPenalty","maxTokens","memoryInfo","memoryKey","model","presencePenalty","prompt","roles","temperature","topP"]},
       {"name":"classify_text","classification":"READ","props":["input","model"]},
       {"name":"create_embedding","classification":"READ","props":["dimensions","input","model","user"]},
       {"name":"custom_api_call","classification":"WRITE","props":["body","body_type","failsafe","followRedirects","headers","method","queryParams","response_is_binary","timeout","url"]},
@@ -319,7 +319,7 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
     ],
   },
   "slack": {
-    version: "0.21.0",
+    version: "0.23.1",
     actions: [
       {"name":"custom_api_call","classification":"WRITE","props":["body","body_type","failsafe","followRedirects","headers","method","queryParams","response_is_binary","timeout","url","useUserToken"]},
       {"name":"delete-message","classification":"DESTRUCTIVE","props":["channel","info","onlyBotChannels","ts"]},
@@ -336,8 +336,8 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
       {"name":"list_users","classification":"SEARCH","props":["includeBots","includeDisabled"]},
       {"name":"listUsers","classification":"SEARCH","props":["includeBots","includeDisabled"]},
       {"name":"markdownToSlackFormat","classification":"READ","props":["markdown"]},
-      {"name":"request_action_direct_message","classification":"WRITE","props":["actions","mentionOriginFlow","profilePicture","text","userId","username"]},
-      {"name":"request_action_message","classification":"WRITE","props":["actions","channel","info","mentionOriginFlow","onlyBotChannels","profilePicture","replyBroadcast","text","threadTs","username"]},
+      {"name":"request_action_direct_message","classification":"WRITE","props":["actions","blocks","mentionOriginFlow","profilePicture","text","userId","username"]},
+      {"name":"request_action_message","classification":"WRITE","props":["actions","blocks","channel","info","mentionOriginFlow","onlyBotChannels","profilePicture","replyBroadcast","text","threadTs","username"]},
       {"name":"request_approval_direct_message","classification":"WRITE","props":["mentionOriginFlow","profilePicture","text","userId","username"]},
       {"name":"request_approval_message","classification":"WRITE","props":["channel","info","mentionOriginFlow","onlyBotChannels","profilePicture","text","username"]},
       {"name":"retrieveThreadMessages","classification":"READ","props":["channel","cursor","info","onlyBotChannels","threadTs"]},
@@ -389,9 +389,9 @@ export const VERIFIED_MANIFESTS: Record<string, VerifiedManifest> = {
       {"name":"slack-find-user-by-email","classification":"READ","props":["email"]},
       {"name":"slack-find-user-by-handle","classification":"SEARCH","props":["handle"]},
       {"name":"slack-set-user-status","classification":"WRITE","props":["emoji","expiration","text"]},
-      {"name":"slack-update-profile","classification":"WRITE","props":["email","firstName","lastName","userId"]},
+      {"name":"slack-update-profile","classification":"WRITE","props":["email","empty_fields_info","firstName","lastName","userId"]},
       {"name":"update_group_users","classification":"WRITE","props":["appendUsers","handle","userIds"]},
-      {"name":"update_profile","classification":"WRITE","props":["email","firstName","lastName","userId"]},
+      {"name":"update_profile","classification":"WRITE","props":["email","empty_fields_info","firstName","lastName","userId"]},
       {"name":"updateMessage","classification":"WRITE","props":["blocks","channel","info","mentionOriginFlow","onlyBotChannels","text","ts"]},
       {"name":"uploadFile","classification":"WRITE","props":["channel","file","filename","onlyBotChannels","title"]},
     ],
