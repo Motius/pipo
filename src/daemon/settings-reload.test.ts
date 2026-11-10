@@ -170,7 +170,10 @@ describe('settings-reload', () => {
   test('reloadAll is stable: a second run with no DB change reports nothing changed', async () => {
     const config = freshConfig();
     const coordinator = new SettingsReloadCoordinator(config);
-    setSetting('cfg.tts', JSON.stringify({ enabled: true, provider: 'edge' }));
+    // The row must DIFFER from the stock default (which now ships enabled,
+    // provider 'edge', voice 'en-GB-SoniaNeural') or there is no change to
+    // pick up: flip the voice.
+    setSetting('cfg.tts', JSON.stringify({ enabled: true, provider: 'edge', voice: 'en-GB-RyanNeural' }));
 
     const first = await coordinator.reloadAll();
     expect(first.changed).toContain('tts');
