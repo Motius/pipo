@@ -461,7 +461,7 @@ export function ChannelsTab({
               <label className="v2-set__field-label">Voice</label>
               <select
                 className="v2-set__select"
-                value={ttsCfg?.voice ?? "en-US-AriaNeural"}
+                value={ttsCfg?.voice ?? "en-GB-SoniaNeural"}
                 onChange={async (e) => {
                   const r = await data.setTTS({ voice: e.target.value });
                   onToast(r.message, r.ok ? "ok" : "warn");

@@ -248,6 +248,7 @@ function buildSubAgentPromptParts(agent: AgentInstance, context: string): { stat
     '- Use your tools to accomplish the task — don\'t just describe what you would do.',
     '- Be thorough but efficient. Don\'t do unnecessary work.',
     '- Return a clear, structured result when done.',
+    '- Always respond in English.',
   ];
 
   return {

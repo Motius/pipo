@@ -177,7 +177,7 @@ export type TTSConfig = {
    * (never this persisted section).
    */
   provider?: 'edge' | 'elevenlabs' | 'sarvam' | 'pipo';
-  voice?: string;       // e.g. 'en-US-AriaNeural' (edge)
+  voice?: string;       // e.g. 'en-GB-SoniaNeural' (edge)
   rate?: string;        // e.g. '+0%', '+10%' (edge)
   volume?: string;      // e.g. '+0%' (edge)
   elevenlabs?: {
@@ -869,9 +869,9 @@ export const DEFAULT_CONFIG: pipoConfig = {
     provider: 'openai',
   },
   tts: {
-    enabled: false,
+    enabled: true,
     provider: 'edge',
-    voice: 'en-US-AriaNeural',
+    voice: 'en-GB-SoniaNeural',
     rate: '+0%',
     volume: '+0%',
   },

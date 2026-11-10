@@ -411,7 +411,7 @@ export class EdgeTTSProvider implements TTSProvider {
   private rate: string;
   private volume: string;
 
-  constructor(voice = 'en-US-AriaNeural', rate = '+0%', volume = '+0%') {
+  constructor(voice = 'en-GB-SoniaNeural', rate = '+0%', volume = '+0%') {
     this.voice = voice;
     this.rate = rate;
     this.volume = volume;
@@ -717,7 +717,7 @@ export function createTTSProvider(
   if (config.provider === 'pipo') {
     if (!hosted?.baseUrl || !hosted?.apiKey) return null;
     // Reuse a configured voice only when it isn't an Edge neural name:
-    // cfg.tts.voice defaults to 'en-US-AriaNeural' (Edge-specific), which the
+    // cfg.tts.voice defaults to 'en-GB-SoniaNeural' (Edge-specific), which the
     // OpenAI-compatible proxy would reject — those fall back to 'alloy'.
     const voice = config.voice && !/Neural$/i.test(config.voice) ? config.voice : undefined;
     return new pipoTTS(hosted.baseUrl, hosted.apiKey, voice ?? 'alloy');

@@ -76,6 +76,15 @@ export function buildSystemPromptParts(role: RoleDefinition, context?: PromptCon
   sections.push(`You are ${role.name}. ${role.description}`);
   sections.push('');
 
+  // Language — product-wide policy: pipo always answers in English.
+  sections.push('# Language');
+  sections.push(
+    'Always respond in English, whichever language the user writes in. ' +
+      'Use natural British English — British spellings (colour, organise, realise) ' +
+      'and everyday British phrasing — never a caricature or forced slang.'
+  );
+  sections.push('');
+
   // Responsibilities
   sections.push('# Responsibilities');
   for (const responsibility of role.responsibilities) {

@@ -827,6 +827,7 @@ export class AgentService implements Service, IAgentService {
       `You are ${name}, the user's conversational assistant.`,
       traits ? `Core traits: ${traits}.` : '',
       'Be concise, natural, and direct. Anticipate needs without being intrusive.',
+      'Always respond in English, in natural British English.',
     ].filter(Boolean).join(' ');
   }
 
@@ -895,6 +896,8 @@ export class AgentService implements Service, IAgentService {
     return [
       `You are ${name}${userName ? `, ${userName}'s personal AI assistant` : ', a personal AI assistant'}, in a live, real-time voice conversation.`,
       'Speak naturally and conversationally, the way a person talks out loud.',
+      'Speak with a natural British accent and everyday British phrasing — never a caricature or stage accent.',
+      'Always respond in English.',
       traits ? `Your character: ${traits}.` : '',
       'You can take real actions with your tools whenever the user asks.',
       `Current time: ${new Date().toISOString()}.`,

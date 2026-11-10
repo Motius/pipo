@@ -199,9 +199,9 @@ authority:
 
 # Text-to-Speech (voice output)
 tts:
-  enabled: false
+  enabled: true              # pipo speaks replies aloud by default
   provider: "edge"            # "edge" (free) or "elevenlabs" (API key required)
-  voice: "en-US-AriaNeural"  # Microsoft Edge TTS voice
+  voice: "en-GB-SoniaNeural"  # Microsoft Edge TTS voice (natural British accent)
   rate: "+0%"                 # Speaking rate: "-20%" (slow) to "+30%" (fast)
   volume: "+0%"               # Volume adjustment
   # ElevenLabs (uncomment to use)

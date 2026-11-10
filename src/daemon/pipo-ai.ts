@@ -266,6 +266,17 @@ function storedProviderChoice(stored: unknown): boolean {
 }
 
 /**
+ * True when the stored row carries an explicit `enabled` boolean — the
+ * voice-command enable writes one without a provider. Distinguishes "the
+ * user switched speech on" from "the stock default happens to be on" for
+ * the hosted TTS binding view below.
+ */
+function storedRecordsEnabled(stored: unknown): boolean {
+  return typeof stored === 'object' && stored !== null && !Array.isArray(stored)
+    && typeof (stored as Record<string, unknown>).enabled === 'boolean';
+}
+
+/**
  * The BINDING view of cfg.stt: hosted installs where the user never chose an
  * STT provider default to the included pipo AI transcription.
  *
@@ -419,15 +430,24 @@ export function effectiveSttForBinding(
  * section reading 'edge' cannot distinguish "explicitly chose Edge" from
  * "never chose" — only a `provider` recorded in the stored `cfg.tts` DB row
  * counts as choice (any dashboard TTS save writes one, so an explicit Edge
- * selection sticks). `enabled` is passed through untouched — the hosted
- * default never switches speech on, it only picks who speaks once the user
- * turns it on.
+ * selection sticks). `enabled` needs the same intent-vs-default discipline:
+ * the stock default ships enabled (self-hosted pipo speaks via the free Edge
+ * voices), but a hosted install must not start talking through the paid
+ * proxy on the strength of a default alone — so the hosted view forces
+ * speech OFF unless the stored row records an explicit `enabled` (the
+ * voice-command enable writes one). The hosted default never switches
+ * speech ON; it only picks who speaks once the user does.
  */
 export function effectiveTtsForBinding(
   config: pipoConfig,
   loadStored: (section: 'stt' | 'tts') => unknown = loadUserSection,
 ): TTSConfig | undefined {
   if (!haspipoAi(config)) return config.tts;
-  if (storedProviderChoice(loadStored('tts'))) return config.tts;
-  return { ...(config.tts ?? { enabled: false }), provider: 'pipo' };
+  const stored = loadStored('tts');
+  if (storedProviderChoice(stored)) return config.tts;
+  return {
+    ...(config.tts ?? { enabled: false }),
+    provider: 'pipo',
+    enabled: storedRecordsEnabled(stored) ? (config.tts?.enabled ?? false) : false,
+  };
 }

@@ -874,7 +874,7 @@ export function useSettingsData() {
           {
             enabled: input.enabled ?? ttsCfg?.enabled ?? false,
             provider: input.provider ?? ttsCfg?.provider ?? "edge",
-            voice: input.voice ?? ttsCfg?.voice ?? "en-US-AriaNeural",
+            voice: input.voice ?? ttsCfg?.voice ?? "en-GB-SoniaNeural",
             rate: input.rate ?? ttsCfg?.rate ?? "+0%",
             ...(input.elevenlabs ? { elevenlabs: input.elevenlabs } : {}),
             ...(input.sarvam ? { sarvam: input.sarvam } : {}),

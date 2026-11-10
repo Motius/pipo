@@ -4730,7 +4730,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         : null;
       if (ttsProvider) {
         wsService.setTTSProvider(ttsProvider);
-        console.log(`[Daemon] TTS enabled: ${ttsBinding?.provider ?? 'edge'} (${pipoConfig.tts.voice ?? 'en-US-AriaNeural'})`);
+        console.log(`[Daemon] TTS enabled: ${ttsBinding?.provider ?? 'edge'} (${pipoConfig.tts.voice ?? 'en-GB-SoniaNeural'})`);
       }
     }
 

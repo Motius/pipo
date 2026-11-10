@@ -2871,10 +2871,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         // persisted cfg.tts row stays pure user intent, no key material.
         const effective = effectiveTtsForBinding(ctx.config);
         return json({
-          enabled: tts?.enabled ?? false,
+          // The binding view's enabled, not the raw merged section: on a
+          // hosted install with no recorded choice the view forces speech
+          // off, and the dashboard toggle must show that reality.
+          enabled: effective?.enabled ?? tts?.enabled ?? false,
           provider: effective?.provider ?? tts?.provider ?? 'edge',
           pipo_available: haspipoAi(ctx.config),
-          voice: tts?.voice ?? 'en-US-AriaNeural',
+          voice: tts?.voice ?? 'en-GB-SoniaNeural',
           rate: tts?.rate ?? '+0%',
           volume: tts?.volume ?? '+0%',
           elevenlabs: tts?.elevenlabs ? {
@@ -3144,7 +3147,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
               cfg.voice = body.voice;
             }
           } else {
-            cfg.voice = body.voice || 'en-US-AriaNeural';
+            cfg.voice = body.voice || 'en-GB-SoniaNeural';
           }
           const { createTTSProvider } = await import('../comms/voice.ts');
           const provider = createTTSProvider(cfg as never, pipoVoiceCredentials(ctx.config));

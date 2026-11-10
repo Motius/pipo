@@ -427,6 +427,9 @@ describe('effectiveTtsForBinding (hosted TTS default, explicit Edge respected)',
     const config = hosted();
     const view = effectiveTtsForBinding(config, noRow)!;
     expect(JSON.stringify(view)).not.toContain('sk-uj-abc123');
-    expect(view).toEqual({ ...config.tts!, provider: 'pipo' });
+    // enabled: false is forced here — see the no-row test above. The stock
+    // default is enabled, but a hosted install without a recorded choice
+    // stays silent.
+    expect(view).toEqual({ ...config.tts!, provider: 'pipo', enabled: false });
   });
 });
