@@ -143,6 +143,15 @@ secret management; Pipo does not provision those services for you.
 
 ## 📦 Installation
 
+### Desktop installer (Windows & macOS)
+
+The desktop sidecar — the Pebble companion with tray, overlay, and hotkeys — ships as a signed native installer. Stable download URLs (always the latest published installer):
+
+- **Windows:** [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe)
+- **macOS:** [Install-pipo.dmg](https://github.com/Motius/pipo/releases/download/installer-latest/Install-pipo.dmg)
+
+Install, enroll the device from the dashboard (**Settings → Sidecar**), and it self-updates from npm whenever your brain ships a newer paired version (sha512 + signature checked before anything runs). The brain itself runs on Linux, macOS, or Windows via WSL2/Docker — pick one of the paths below.
+
 ### One-liner (recommended)
 
 ```bash
@@ -323,6 +332,8 @@ This means you can run the daemon on an always-on server and still interact with
 
 ### 1. Install the sidecar
 
+**Easiest — the desktop installer:** download [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe) (Windows) or [Install-pipo.dmg](https://github.com/Motius/pipo/releases/download/installer-latest/Install-pipo.dmg) (macOS) from the rolling [`installer-latest`](https://github.com/Motius/pipo/releases/tag/installer-latest) release. It installs, signs, and auto-starts the sidecar.
+
 **Via bun:**
 
 ```bash
@@ -380,6 +391,16 @@ The sidecar updates itself to the version your brain ships with (never to anythi
 - A sidecar installed with bun or npm is updated with that package manager. If it cannot be updated automatically, you get the exact command to run instead (`bun add -g @pipo/sidecar@X.Y.Z`, or the installer from [GitHub Releases](https://github.com/Motius/pipo/releases/tag/installer-latest)).
 
 If a sidecar is too old for the brain (**Update required**), the brain refuses the connection; the sidecar stays running, shows its update prompt (or a desktop notification on Linux) and tries the brain again every 30 minutes. Local development builds report `dev` and are never updated or blocked.
+
+#### Cutting a release (maintainers)
+
+Publishing a release is a tag push. Bump `package.json` (and `sidecar/installer/VERSION` only when the installer changes), commit, then:
+
+```bash
+git tag v4.1.0 && git push origin v4.1.0
+```
+
+The tag triggers [release-exec.yml](.github/workflows/release-exec.yml): it validates the tag, builds and signs everything, then — behind the `release` environment's required reviewers — publishes `@pipo/brain` and `@pipo/sidecar` to npm, the GitHub release, and Docker. From there updates propagate on their own: sidecars self-update to the paired version (see above), brains update with `pipo update`, and Docker hosts pull the new image. Rehearse the whole pipeline without publishing via a dry run (Actions → release-exec → Run workflow, `dry_run` on). The desktop installer cuts separately: bump `sidecar/installer/VERSION` and push an `installer-vX.Y.Z` tag, which refreshes the rolling [`installer-latest`](https://github.com/Motius/pipo/releases/tag/installer-latest) assets.
 
 ---
 
