@@ -347,8 +347,25 @@ func runWizard(registryURL string, noLaunch, autostartDefault bool) int {
 	}
 
 	r := newWizardRun(wizardDeps{
-		fetchLatest: func() (*pkgRelease, error) { return fetchLatestRelease(registryURL) },
-		detect:      detectInstalled,
+		fetchLatest: func() (*pkgRelease, error) {
+			// When a bundled sidecar payload is embedded (Windows
+			// release builds), skip the npm registry entirely —
+			// the plan phase shows the bundled version, and
+			// performInstall's bundled fast lane handles the
+			// actual install. Without this, the wizard's plan
+			// phase would 404 against the npm registry and show
+			// "could not reach the npm registry" before the user
+			// ever sees the Install button.
+			if b, ok := bundledPayload(); ok {
+				return &pkgRelease{
+					Name:    "@pipo/sidecar (bundled)",
+					Version: b.Version,
+					SHA512:  b.SHA512,
+				}, nil
+			}
+			return fetchLatestRelease(registryURL)
+		},
+		detect: detectInstalled,
 		install: func(progress progressFn) installOutcome {
 			return performInstall(registryURL, false, progress)
 		},

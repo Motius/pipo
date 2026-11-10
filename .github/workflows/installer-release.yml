@@ -94,14 +94,196 @@ jobs:
             echo "Installer v${VERSION} is not yet released — building."
           fi
 
+  # ─── Windows sidecar: mingw cross-build (no OIDC) ───────────────
+  # Builds the sidecar binary for win32-x64 so it can be bundled inside the
+  # installer via go:embed. This makes the installer self-contained — it no
+  # longer needs the npm `@pipo/sidecar-win32-x64` package to exist, which
+  # sidesteps the npm `@pipo` scope Trusted Publishing gap that would
+  # otherwise 404 and dead-end the install.
+  #
+  # Split from signing (#779, #682): mingw and the Go module graph run here,
+  # in a job that cannot mint an OIDC token, so a compromised toolchain or
+  # module cannot ask Workload Identity Federation for a token and have KMS
+  # sign anything. The binary crosses to sign-sidecar-windows with its digest
+  # as a job output.
+  build-sidecar-windows:
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          cache: false
+          go-version-file: sidecar/go.mod
+          cache-dependency-path: sidecar/go.sum
+
+      - name: Install mingw-w64
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+
+      - name: Build sidecar (win32-x64 cross-compile)
+        working-directory: sidecar
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          SETUP: windows-cross
+          OUT: pipo.exe
+          SIGNING_PUBLISHER_CN: ${{ vars.SIGNING_PUBLISHER_CN }}
+        run: ../.github/scripts/build-sidecar.sh
+
+      - name: Digest
+        id: digest
+        working-directory: sidecar
+        run: echo "sha256=$(sha256sum pipo.exe | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned sidecar
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-sidecar-win32-x64
+          path: sidecar/pipo.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─── Windows sidecar: Authenticode via Cloud KMS ────────────────
+  # Signs the sidecar binary, then packs it into an npm-style .tgz (the same
+  # format update.Extract expects) and computes the base64 sha512 the
+  # installer will pin at build time. The tarball is what build-windows
+  # embeds via go:embed.
+  sign-sidecar-windows:
+    needs: [resolve, build-sidecar-windows]
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+      sidecar_version: ${{ steps.version.outputs.version }}
+      tarball_sha512: ${{ steps.pack.outputs.sha512 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-sidecar-win32-x64
+          path: sidecar
+
+      - name: Verify the sidecar
+        working-directory: sidecar
+        env:
+          SHA256: ${{ needs.build-sidecar-windows.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::build-sidecar-windows reported no digest"; exit 1; }
+          echo "${SHA256}  pipo.exe" | sha256sum -c -
+
+      - name: Install osslsigncode
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y osslsigncode
+
+      - name: Windows signing readiness
+        id: winsign
+        env:
+          GCP_KMS_KEYRING: ${{ vars.GCP_KMS_KEYRING }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GCP_KMS_KEYRING}" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Windows signing is not configured (GCP_KMS_KEYRING unset) — the bundled sidecar will be unsigned (Windows SmartScreen will block it at runtime)."
+          elif [ ! -f sidecar/packaging/windows/codesign-chain.pem ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GCP_KMS_KEYRING is set but codesign-chain.pem is missing — the bundled sidecar will be unsigned."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to Google Cloud
+        id: gcp-auth
+        if: steps.winsign.outputs.ready == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SIGNING_SERVICE_ACCOUNT }}
+          token_format: "access_token"
+          create_credentials_file: false
+
+      - name: Sign sidecar (Cloud KMS)
+        if: steps.winsign.outputs.ready == 'true'
+        working-directory: sidecar
+        env:
+          GCP_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
+          GCP_KMS_KEYRING: ${{ vars.GCP_KMS_KEYRING }}
+          GCP_KMS_KEY_ALIAS: ${{ vars.GCP_KMS_KEY_ALIAS }}
+          SIGNING_PUBLISHER_CN: ${{ vars.SIGNING_PUBLISHER_CN }}
+          SIGN_REQUIRE_TRUSTED_CHAIN: "1"
+        run: scripts/sign-windows.sh pipo.exe
+
+      - name: Read sidecar version
+        id: version
+        run: echo "version=$(cat sidecar/VERSION)" >> "$GITHUB_OUTPUT"
+
+      # Pack the signed sidecar into the npm-style .tgz that update.Extract
+      # unpacks: package/bin/pipo.exe. This is the same format the npm
+      # registry would serve for @pipo/sidecar-win32-x64.
+      - name: Pack sidecar tarball
+        id: pack
+        working-directory: sidecar
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkg/package/bin
+          cp pipo.exe /tmp/pkg/package/bin/
+          chmod +x /tmp/pkg/package/bin/pipo.exe
+          # Minimal package.json — update.Extract only reads package/bin/**,
+          # but include it for completeness (a future npm publish path would
+          # use the real one from sidecar/npm/win32-x64/package.json).
+          cat > /tmp/pkg/package/package.json <<EOF
+          {"name":"@pipo/sidecar-win32-x64","version":"$(cat VERSION)","description":"pipo sidecar binary for Windows x64 (bundled)","os":["win32"],"cpu":["x64"],"files":["bin"]}
+          EOF
+          tar -C /tmp/pkg -czf payload-win32-x64.tgz package
+          # Base64 sha512 — the format update.Download expects (dist.integrity
+          # without the "sha512-" prefix).
+          sha512_b64="$(openssl dgst -sha512 -binary payload-win32-x64.tgz | base64 -w0)"
+          echo "sha512=${sha512_b64}" >> "$GITHUB_OUTPUT"
+          echo "Packed payload-win32-x64.tgz ($(wc -c < payload-win32-x64.tgz) bytes, sha512=${sha512_b64:0:16}…)"
+
+      - name: Digest
+        id: digest
+        working-directory: sidecar
+        run: echo "sha256=$(sha256sum payload-win32-x64.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed sidecar tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sidecar-tarball-win32-x64
+          path: sidecar/payload-win32-x64.tgz
+          if-no-files-found: error
+          retention-days: 1
+
   # ─── Windows: mingw cross-build (no OIDC) ───────────────────────
   # Split from signing (#779), as #682 split the sidecar: mingw, `make
   # manifest-installer` and the Go module graph run here, in a job that
   # cannot mint an OIDC token, so a compromised toolchain or module cannot ask
   # Workload Identity Federation for a token and have KMS sign anything. The
   # binary crosses to sign-windows with its digest as a job output.
+  #
+  # Downloads the signed sidecar tarball from sign-sidecar-windows and embeds
+  # it via go:embed (sidecar/installer/payload-win32-x64.tgz) so the installer
+  # is self-contained — no npm registry round-trip at install time.
   build-windows:
-    needs: resolve
+    needs: [resolve, sign-sidecar-windows]
     if: needs.resolve.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -126,6 +308,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
+      # Place the signed sidecar tarball where //go:embed expects it. The
+      # placeholder committed to the repo is overwritten by the real payload.
+      - name: Download signed sidecar tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sidecar-tarball-win32-x64
+          path: sidecar/installer
+
+      - name: Verify the sidecar tarball
+        working-directory: sidecar/installer
+        env:
+          SHA256: ${{ needs.sign-sidecar-windows.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sign-sidecar-windows reported no tarball digest"; exit 1; }
+          echo "${SHA256}  payload-win32-x64.tgz" | sha256sum -c -
+          # Confirm it's a real tarball (not the placeholder): the placeholder
+          # is under 200 bytes; the real payload is several MB.
+          size="$(wc -c < payload-win32-x64.tgz)"
+          [ "$size" -gt 4096 ] || { echo "::error::payload-win32-x64.tgz is only $size bytes — the embed would be treated as a placeholder"; exit 1; }
+
       - name: Build installer
         working-directory: sidecar
         env:
@@ -136,6 +339,10 @@ jobs:
           # chain validity alone would accept ANY signed exe. Set it together
           # with the signing credentials; empty means chain-only + a warning.
           SIGNING_PUBLISHER_CN: ${{ vars.SIGNING_PUBLISHER_CN }}
+          # The bundled sidecar's version + sha512, stamped into the installer
+          # binary via -ldflags so the installer knows what it's carrying.
+          BUNDLED_SIDECAR_VERSION: ${{ needs.sign-sidecar-windows.outputs.sidecar_version }}
+          BUNDLED_SIDECAR_SHA512: ${{ needs.sign-sidecar-windows.outputs.tarball_sha512 }}
         run: |
           set -euo pipefail
           export CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++
@@ -149,6 +356,10 @@ jobs:
           # to the linker.
           LDFLAGS="-s -w -H windowsgui -X main.installerVersion=$(cat installer/VERSION)"
           LDFLAGS="$LDFLAGS -X 'github.com/pipo/sidecar/internal/update.expectedPublisherCN=${SIGNING_PUBLISHER_CN}'"
+          # Stamp the bundled sidecar version + sha512 so the installer's
+          # bundledPayload() returns real data instead of nil.
+          LDFLAGS="$LDFLAGS -X main.bundledVersion=${BUNDLED_SIDECAR_VERSION}"
+          LDFLAGS="$LDFLAGS -X main.bundledSHA512=${BUNDLED_SIDECAR_SHA512}"
           # -trimpath keeps -ldflags out of the embedded build info, so the
           # check below sees the pin only when the -X target really exists.
           go build -trimpath -ldflags "$LDFLAGS" -o pipo-Setup.exe ./installer/
@@ -159,6 +370,14 @@ jobs:
             echo "::error::publisher pin '${SIGNING_PUBLISHER_CN}' is not present in pipo-Setup.exe — check the -ldflags quoting"
             exit 1
           fi
+          # Confirm the bundled version was stamped (empty = the fast lane
+          # would not activate, and the installer would fall through to npm
+          # — which is the bug we're fixing).
+          if ! grep -qF "${BUNDLED_SIDECAR_VERSION}" /tmp/installer-strings.txt; then
+            echo "::error::bundled sidecar version '${BUNDLED_SIDECAR_VERSION}' is not present in pipo-Setup.exe — the go:embed or -ldflags failed"
+            exit 1
+          fi
+          echo "Installer built with bundled sidecar v${BUNDLED_SIDECAR_VERSION} ($(wc -c < installer/payload-win32-x64.tgz) bytes embedded)"
 
       - name: Digest
         id: digest

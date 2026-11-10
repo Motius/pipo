@@ -4,6 +4,9 @@ package main
 // Every failure maps to one of the frozen exit codes in main.go.
 
 import (
+	"crypto/sha512"
+	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -51,9 +54,24 @@ type installOutcome struct {
 // performInstall runs resolve → detect → download → verify → stop → swap →
 // register. It never launches the sidecar — callers own that (console mode
 // respects --no-launch; the wizard launches from its Done page).
+//
+// When a bundled sidecar payload is embedded (Windows release builds), the
+// resolve/download/verify-signature steps are short-circuited: the embedded
+// tarball is written locally, sha512-verified against the build-time pin, and
+// unpacked. The installer's own Authenticode signature already anchors
+// provenance, so per-payload signature verification is skipped on this path.
 func performInstall(registryURL string, silent bool, progress progressFn) installOutcome {
 	fail := func(code int, err error) installOutcome {
 		return installOutcome{Code: code, Err: err}
+	}
+
+	// ── Bundled payload fast lane ──────────────────────────────
+	// When the installer embeds a signed sidecar tarball (Windows release
+	// builds), skip the npm registry entirely. This sidesteps the npm
+	// `@pipo` scope Trusted Publishing requirement that would otherwise
+	// 404 and dead-end the install.
+	if bundled, ok := bundledPayload(); ok {
+		return performBundledInstall(bundled, silent, progress, fail)
 	}
 
 	progress("resolve", "Checking the latest sidecar version…")
@@ -191,6 +209,134 @@ func runInstall(registryURL string, silent, noLaunch, autostartOn bool) int {
 // already current) installed nothing and must not touch it either.
 func shouldApplyAutostart(out installOutcome) bool {
 	return !out.NpmManaged && !out.UpToDate && out.Inst.Version == ""
+}
+
+// performBundledInstall installs from an embedded sidecar payload, bypassing
+// the npm registry. Mirrors performInstall's shape but skips the network
+// fetch (the tarball is already in memory) and the per-payload signature
+// verification (the installer binary's own signature anchors provenance; the
+// sha512 pin baked in at build time proves the tarball was not swapped).
+func performBundledInstall(b *bundledInfo, silent bool, progress progressFn, fail func(int, error) installOutcome) installOutcome {
+	progress("resolve", "Preparing the bundled sidecar…")
+	rel := &pkgRelease{
+		Name:    "@pipo/sidecar (bundled)",
+		Version: b.Version,
+		SHA512:  b.SHA512,
+	}
+
+	inst, err := detectInstalled()
+	if err != nil {
+		return fail(exitOther, fmt.Errorf("could not inspect the existing installation: %w", err))
+	}
+	out := installOutcome{Code: exitOK, Rel: rel, Inst: inst}
+	switch {
+	case inst.PackageManager != "":
+		out.NpmManaged = true
+		return out
+	case inst.Version != "" && !versionLess(inst.Version, rel.Version):
+		out.UpToDate = true
+		out.InstallDir = inst.InstallDir
+		return out
+	}
+
+	workDir, err := os.MkdirTemp("", "pipo-installer-*")
+	if err != nil {
+		return fail(exitFilesystem, fmt.Errorf("could not create a work directory: %w", err))
+	}
+	defer os.RemoveAll(workDir)
+
+	// Write the embedded tarball to disk so update.Extract (which reads a
+	// file path) can unpack it. update.Download would normally stream from
+	// the registry and hash while writing; here we hash the in-memory copy
+	// against the build-time pin instead.
+	progress("verify", "Verifying the bundled payload…")
+	tgzPath, err := writeBundledTarball(b, workDir)
+	if err != nil {
+		return fail(exitVerification, err)
+	}
+
+	staged := filepath.Join(workDir, "staged")
+	if err := update.Extract(tgzPath, staged); err != nil {
+		var rej update.PayloadRejectedError
+		if errors.As(err, &rej) {
+			return fail(exitVerification, fmt.Errorf("payload rejected: %w", err))
+		}
+		return fail(exitFilesystem, fmt.Errorf("could not unpack the payload: %w", err))
+	}
+	stagedBin := filepath.Join(staged, "bin")
+	if err := update.CheckPayloadLayout(stagedBin, rel.Version); err != nil {
+		return fail(exitVerification, err)
+	}
+	// VerifyPayloadSignature is intentionally skipped for the bundled path:
+	// the tarball is embedded in the installer binary, whose own
+	// Authenticode signature (verified by Windows before the installer
+	// runs) already proves the payload was not tampered with after the
+	// installer was built. The sha512 check in writeBundledTarball proves
+	// it was not corrupted in transit from the build to the embed step.
+
+	progress("install", "Stopping the running sidecar…")
+	if err := stopRunningSidecar(inst, silent); err != nil {
+		return fail(exitStopFailed, fmt.Errorf("could not stop the running sidecar: %w", err))
+	}
+
+	installDir := inst.InstallDir
+	if installDir == "" {
+		if installDir, err = installDirDefault(); err != nil {
+			return fail(exitFilesystem, fmt.Errorf("no writable install location: %w", err))
+		}
+	}
+	progress("install", fmt.Sprintf("Installing to %s…", installDir))
+	if err := update.Swap(stagedBin, installDir); err != nil {
+		return fail(exitFilesystem, fmt.Errorf("install failed: %w", err))
+	}
+	if err := update.CleanupOld(installDir); err != nil {
+		logf("warning: could not remove the previous copy: %v", err)
+	}
+	out.InstallDir = installDir
+
+	if got, err := update.InstalledBinaryVersion(installDir); err != nil {
+		logf("warning: post-install version check failed: %v", err)
+	} else if got != rel.Version {
+		logf("warning: installed binary reports %q, expected %q", got, rel.Version)
+	}
+
+	if err := registerInstall(installDir, rel.Version); err != nil {
+		logf("warning: system registration incomplete: %v", err)
+	}
+	return out
+}
+
+// writeBundledTarball writes the embedded tarball to workDir/payload.tgz and
+// verifies its sha512 against the build-time pin. The pin is the security
+// anchor for the bundled path: it proves the bytes embedded at build time are
+// the same bytes being installed, so a corrupt or swapped embed is caught
+// before unpack.
+func writeBundledTarball(b *bundledInfo, workDir string) (string, error) {
+	want, err := base64.StdEncoding.DecodeString(b.SHA512)
+	if err != nil {
+		return "", fmt.Errorf("bundled integrity value is not valid base64: %w", err)
+	}
+	h := sha512.New()
+	if _, err := h.Write(b.Tarball); err != nil {
+		return "", fmt.Errorf("could not hash the bundled payload: %w", err)
+	}
+	got := h.Sum(nil)
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return "", fmt.Errorf("sha512 mismatch for the bundled payload — refusing to install")
+	}
+	dst := filepath.Join(workDir, "payload.tgz")
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(b.Tarball); err != nil {
+		f.Close()
+		return "", fmt.Errorf("could not stage the bundled payload: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return dst, nil
 }
 
 // setupHandoffAllowed gates passing --setup to the installed sidecar: older

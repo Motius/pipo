@@ -18,6 +18,11 @@ npm/linux-x64/bin/
 npm/linux-arm64/bin/
 npm/win32-x64/bin/
 *.tgz
+# Exception: the placeholder committed for go:embed in the Windows installer.
+# The installer-release workflow overwrites this with the real signed sidecar
+# tarball before `go build`; the placeholder is committed so a fresh clone can
+# build the installer without the workflow having run.
+!installer/payload-win32-x64.tgz
 
 # Tester binaries (built by make test)
 tester/bin/tester_*
