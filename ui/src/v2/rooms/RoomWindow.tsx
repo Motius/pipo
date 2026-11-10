@@ -8,6 +8,7 @@ const ROOM_TITLE: Record<RoomKey, string> = {
   workflows: "Workflows",
   memory: "Memory",
   tools: "Tools",
+  skills: "Skills",
   agents: "Agents",
   agent_strip: "Agent Strip",
   authority: "Authority",

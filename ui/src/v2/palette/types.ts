@@ -30,6 +30,7 @@ export type PaletteResult = {
 export type PaletteNavEntry = {
   key:
     | "tools"
+    | "skills"
     | "logs"
     | "agents"
     | "workflows"
@@ -52,6 +53,7 @@ export const ROOM_NAV_ENTRIES: PaletteNavEntry[] = [
   { key: "agents", label: "Agents", hint: "Roster, status, last run" },
   { key: "authority", label: "Authority", hint: "Scopes, allowlists, approvals" },
   { key: "tools", label: "Tools", hint: "Catalog + capability flags" },
+  { key: "skills", label: "Skills", hint: "Vault procedures + SKILL.md reader" },
   { key: "logs", label: "Logs", hint: "Filterable event stream" },
   { key: "calendar", label: "Calendar", hint: "This week + commitments" },
   { key: "goals", label: "Goals", hint: "OKR hierarchy + scoring" },
@@ -72,6 +74,7 @@ export function navKeyToObjectType(
   | "workflow"
   | "memory"
   | "tool"
+  | "skill"
   | "agent"
   | "authority"
   | "log"
@@ -89,6 +92,8 @@ export function navKeyToObjectType(
       return "agent";
     case "logs":
       return "log";
+    case "skills":
+      return "skill";
     case "tools":
       return "tool";
     default:

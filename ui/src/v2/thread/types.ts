@@ -19,6 +19,7 @@ export type ObjectType =
   | "workflow"
   | "memory"
   | "tool"
+  | "skill"
   | "agent"
   | "authority"
   | "log"

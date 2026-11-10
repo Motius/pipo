@@ -62,7 +62,7 @@ export function TopBar({
   onToggleNotifications?: () => void;
 }) {
   const route = useV2Route();
-  const [theme, toggleTheme] = useTheme();
+  const [theme, toggleTheme, themeLabel] = useTheme();
   const isNow = route.kind !== "room";
   const title = route.kind === "room" ? ROOM_TITLES[route.key] ?? route.key : "Now";
   const daemon = DAEMON[connection];
@@ -96,10 +96,10 @@ export function TopBar({
         <button
           className="rs-chip"
           onClick={() => toggleTheme()}
-          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-          title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+          aria-label={`Theme: ${theme}. Click for the next theme`}
+          title={`Theme: ${theme} — click to cycle (dark → console → light)`}
         >
-          {theme === "dark" ? "● dark" : "○ light"}
+          {themeLabel}
         </button>
 
         <button className="rs-chip" onClick={onOpenPalette} aria-label="Quick open">{modKey("K")}</button>

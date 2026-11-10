@@ -4,13 +4,40 @@
    Light and dark are both first-class — set data-theme on <html>, or use
    .plate / .plate.dk for a locally-themed subtree.
 
+   data-theme="console" (added 2026-11) ports the FounderOS "Console" design
+   language onto the same token names: matte teal-black ground (#050b0c),
+   a single mint signal (#00ffab), and the Geist type family for Sans/Mono.
+   It is an optional third theme — light/dark champagne remain the default.
+
    Legacy riso names (--paper, --accent, --font-sans, --r-*, ...) are kept as
    compat aliases that resolve THROUGH the theme vars, so un-migrated v2
    surfaces re-palette automatically. Strip them per-surface as rooms migrate
    (Phase 6). Source of truth: REBRAND_ROADMAP.md. */
 
+/* ── Geist (console theme) ── bundled from ui/public/fonts, SIL OFL 1.1 —
+   see ui/public/fonts/OFL-Geist.txt. Variable fonts, weight 100-900. The
+   faces are only FETCHED when the console theme's --sans/--mono reference
+   them; light/dark keep the system stack and load nothing. The url() is a
+   build-time-resolvable relative path so `bun build` copies the files into
+   dist as hashed assets; the daemon also serves ui/public directly, so dev
+   loads resolve either way. */
+@font-face {
+  font-family: 'Geist';
+  src: url('../../public/fonts/Geist-variable.ttf') format('truetype-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('../../public/fonts/GeistMono-variable.ttf') format('truetype-variations');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
-  /* ── type (theme-independent) ── */
+  /* ── type (theme-independent; the console theme overrides both) ── */
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 
@@ -75,6 +102,36 @@
   --sh-sm: 0 1px 2px rgba(0,0,0,.4);
   --sh-md: 0 10px 24px -10px rgba(0,0,0,.6);
   --sh-lg: 0 22px 48px -18px rgba(0,0,0,.7);
+}
+
+/* ════════════════ CONSOLE (FounderOS port, optional) ════════════════
+   The FounderOS "Console" colorway on pipo's token names: matte teal-black
+   ground, mint signal (#00ffab) as the only attention chroma, ramp blue for
+   "running", amber for "awaiting yes". Every var the dark block defines is
+   re-defined here, so nothing falls through to the light theme. Geist rides
+   along via the --sans/--mono overrides; tabular numerals keep columns true. */
+:root[data-theme="console"] {
+  color-scheme: dark;
+  --bg: #050B0C; --raise: #0C1514; --panel: #0A1312; --panel2: #132019;
+  --rule: #1D2B27; --rule2: #14201C;
+  --ink: #E9F0ED; --ink2: #93A19D; --ink3: #66766F; --faint: #4D5A55;
+  --listen-tx: #4DFFC4; --speak-tx: #8FB4F6; --hold-tx: #F2B33D; --ok-tx: #3FD968;
+  --sh-sm: 0 1px 2px rgba(0,0,0,.45);
+  --sh-md: 0 10px 24px -10px rgba(0,0,0,.6);
+  --sh-lg: 0 22px 48px -18px rgba(0,0,0,.7);
+
+  /* Geist leads; system faces stay as fallbacks so a blocked font file
+     degrades gracefully instead of rendering serif. */
+  --sans: 'Geist', -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --mono: 'Geist Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Ink on a mint fill (buttons that hard-select the signal). */
+  --accent-ink: #04241A;
+}
+
+/* Mint selection tint, console-only (the global one is champagne-keyed). */
+:root[data-theme="console"] ::selection {
+  background: rgba(0, 255, 171, 0.22);
 }
 
 /* ════════════════ COMPAT ALIASES — legacy riso names → Monochrome Lab.

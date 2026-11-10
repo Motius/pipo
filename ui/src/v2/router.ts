@@ -22,6 +22,7 @@ export type RoomKey =
   | "workflows"
   | "memory"
   | "tools"
+  | "skills"
   | "agents"
   | "agent_strip"
   | "authority"
@@ -50,6 +51,7 @@ export const ROOM_KEYS: ReadonlySet<RoomKey> = new Set([
   "workflows",
   "memory",
   "tools",
+  "skills",
   "agents",
   "agent_strip",
   "authority",

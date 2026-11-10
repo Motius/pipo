@@ -7,6 +7,10 @@ const ToolsRoom = React.lazy(() =>
   import("./tools/ToolsRoom").then((m) => ({ default: m.ToolsRoom })),
 );
 
+const SkillsRoom = React.lazy(() =>
+  import("./skills/SkillsRoom").then((m) => ({ default: m.SkillsRoom })),
+);
+
 const LogsRoom = React.lazy(() =>
   import("./logs/LogsRoom").then((m) => ({ default: m.LogsRoom })),
 );
@@ -71,6 +75,7 @@ type LazyRoomEntry = {
  */
 const LAZY_ROOMS: Partial<Record<RoomKey, LazyRoomEntry>> = {
   tools: { Component: ToolsRoom, title: "Tools", loadingDesc: "Fetching tool catalog…" },
+  skills: { Component: SkillsRoom, title: "Skills", loadingDesc: "Loading skill library…" },
   logs: { Component: LogsRoom, title: "Logs", loadingDesc: "Loading event stream…" },
   agents: { Component: AgentsRoom, title: "Agents", loadingDesc: "Loading roster…" },
   workflows: { Component: WorkflowsRoom, title: "Workflows", loadingDesc: "Loading workflow editor…" },
@@ -141,6 +146,13 @@ const ROOM_META: Record<RoomKey, RoomMeta> = {
     phaseTag: "Phase 6.1 — Tools Room",
     description:
       "The full catalog of builtin and sidecar-routed tools, with capability flags (read / write / external / destructive) and per-tool detail.",
+  },
+  skills: {
+    title: "Skills",
+    subtitle: "vault procedures · SKILL.md reader",
+    phaseTag: "Skills Room",
+    description:
+      "Every stored skill as a Domain/Group hierarchy and a searchable library. Open any card to read its generated SKILL.md, or describe a new skill to draft one.",
   },
   logs: {
     title: "Logs",

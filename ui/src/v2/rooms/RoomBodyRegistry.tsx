@@ -1,6 +1,7 @@
 import React from "react";
 import type { RoomKey } from "../router";
 import { ToolsRoomBody } from "./tools/ToolsRoom";
+import { SkillsRoomBody } from "./skills/SkillsRoom";
 import { LogsRoomBody } from "./logs/LogsRoom";
 import { AgentsRoomBody } from "./agents/AgentsRoom";
 import { AgentStripRoomBody } from "./agentStrip/AgentStripRoom";
@@ -29,6 +30,7 @@ export type RoomBodyComponent = React.ComponentType<{ mode: RoomBodyMode }>;
 
 const REGISTRY: Partial<Record<RoomKey, RoomBodyComponent>> = {
   tools: ToolsRoomBody,
+  skills: SkillsRoomBody,
   logs: LogsRoomBody,
   agents: AgentsRoomBody,
   agent_strip: AgentStripRoomBody,

@@ -1,0 +1,14 @@
+Geist and Geist Mono variable fonts
+Copyright (c) 2024 Vercel, Inc.
+
+Licensed under the SIL Open Font License, Version 1.1 with Reserved Font Name "Geist".
+Full license text: https://openfontlicense.org/open-font-license-official-text/
+
+The fonts are bundled unchanged from the upstream Geist release
+(https://github.com/vercel/geist-font). Files:
+
+  Geist-variable.ttf      (Geist[wght].ttf, weight axis 100-900)
+  GeistMono-variable.ttf  (GeistMono[wght].ttf, weight axis 100-900)
+
+The fonts are used by the "console" dashboard theme only; the default
+themes keep the system font stack.

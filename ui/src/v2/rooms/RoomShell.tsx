@@ -9,6 +9,7 @@ const ROOM_KEYS = new Set<RoomKey>([
   "workflows",
   "memory",
   "tools",
+  "skills",
   "agents",
   "authority",
   "logs",

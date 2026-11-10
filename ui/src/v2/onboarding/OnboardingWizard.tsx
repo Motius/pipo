@@ -182,10 +182,13 @@ export function OnboardingWizard({
   const configuredThisSession = startKey === "welcome";
 
   // welcome
-  const [theme, setTheme] = useState<"light" | "dark">(
-    () => (document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light"),
+  const [theme, setTheme] = useState<"light" | "dark" | "console">(
+    () => {
+      const t = document.documentElement.getAttribute("data-theme");
+      return t === "dark" || t === "console" ? t : "light";
+    },
   );
-  const applyTheme = (t: "light" | "dark") => {
+  const applyTheme = (t: "light" | "dark" | "console") => {
     setTheme(t);
     document.documentElement.setAttribute("data-theme", t);
     try { localStorage.setItem("pipo-theme", t); } catch { /* ignore */ }
@@ -926,6 +929,7 @@ export function OnboardingWizard({
             <div className="obw-themeseg">
               <button className={theme === "light" ? "on" : ""} onClick={() => applyTheme("light")}>Light</button>
               <button className={theme === "dark" ? "on" : ""} onClick={() => applyTheme("dark")}>Dark</button>
+              <button className={theme === "console" ? "on" : ""} onClick={() => applyTheme("console")}>Console</button>
             </div>
             <button className="obw-btn obw-btn-pri" style={{ minWidth: 208, marginTop: 8 }} onClick={next}>Set up pipo</button>
             <button className="obw-skip" disabled={busy} onClick={skipAll}>I’ll do this later</button>

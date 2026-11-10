@@ -11,6 +11,7 @@ import type { HealthMonitor } from './health.ts';
 import { applyApprovalDecision, applyExecutionResolution } from './approval-decision.ts';
 import { executionState } from '../authority/approval.ts';
 import { createWorkItemRoutes } from '../goals/work-item-routes.ts';
+import { createSkillRoutes } from './api-skills-routes.ts';
 import { isPermissionName, readSystemPermissions, requestSystemPermission } from './system-permissions.ts';
 import { PANEL_SESSION_COOKIE } from '../sidecar/panel-sessions.ts';
 import { SIDECAR_LATEST_VERSION } from '../sidecar/compat.ts';
@@ -389,6 +390,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
   return {
     ...createOpportunityRoutes(json),
+    ...createSkillRoutes(json),
     // --- Health ---
     '/api/health': {
       GET: () => json(ctx.healthMonitor.getHealth()),

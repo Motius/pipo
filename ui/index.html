@@ -8,11 +8,12 @@
   <link rel="apple-touch-icon" href="./public/assets/pipo-agent-icon.png" />
   <script>
         /* Theme bootstrap — set before paint to avoid a flash. Premium dark
-           graphite is the default; an explicit light choice remains available. */
+           graphite is the default; the FounderOS "console" port and an
+           explicit light choice remain available. */
     (function () {
       try {
         var t = localStorage.getItem('pipo-theme');
-        if (t !== 'light' && t !== 'dark') {
+        if (t !== 'light' && t !== 'dark' && t !== 'console') {
           t = 'dark';
         }
         document.documentElement.setAttribute('data-theme', t);

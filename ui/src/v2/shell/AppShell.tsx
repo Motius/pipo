@@ -55,6 +55,8 @@ function objectTypeToRoomKey(t: ObjectType): RoomKey {
       return "logs";
     case "tool":
       return "tools";
+    case "skill":
+      return "skills";
     case "memory":
     case "authority":
     case "calendar":

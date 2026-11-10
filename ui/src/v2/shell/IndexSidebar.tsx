@@ -36,6 +36,7 @@ const ROWS: Row[] = [
   { kind: "heading", label: "build" },
   { kind: "room", key: "workspaces", label: "Workspaces" },
   { kind: "room", key: "tools", label: "Tools" },
+  { kind: "room", key: "skills", label: "Skills" },
   { kind: "room", key: "settings", label: "Settings", kbd: modKey("9"), spaced: true },
 ];
 
@@ -49,7 +50,7 @@ const CLUSTERS: { id: string; ic: string; label: string; lead: RoomKey | "now"; 
   { id: "guard", ic: "▣", label: "Guard", lead: "authority", rooms: [
     { key: "authority", label: "Authority" }, { key: "logs", label: "Logs" }, { key: "usage", label: "Usage" } ] },
   { id: "build", ic: "⌗", label: "Build", lead: "workspaces", rooms: [
-    { key: "workspaces", label: "Workspaces" }, { key: "tools", label: "Tools" } ] },
+    { key: "workspaces", label: "Workspaces" }, { key: "tools", label: "Tools" }, { key: "skills", label: "Skills" } ] },
   { id: "sys", ic: "⚙", label: "Sys", lead: "settings", rooms: [{ key: "settings", label: "Settings" }] },
 ];
 
