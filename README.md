@@ -154,6 +154,8 @@ Install, enroll the device from the dashboard (**Settings → Sidecar**), and it
 
 ### One-liner (recommended)
 
+**macOS / Linux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
 ```
@@ -165,6 +167,14 @@ pipo start
 ```
 
 The install script sets up Bun, clones the repo, and links the `pipo` CLI. Then finish setup in your browser at `http://localhost:1846`.
+
+**Windows** (PowerShell — installs the brain inside WSL2 for you; offers to set WSL up if it is missing):
+
+```powershell
+irm https://raw.githubusercontent.com/Motius/pipo/main/install.ps1 | iex
+```
+
+> **Do not run the bash one-liner in PowerShell.** `curl` there is an alias for `Invoke-WebRequest` (no `-fsSL`), and even `curl.exe … | bash` breaks: PowerShell re-encodes piped text with CRLF line endings, which corrupts the script before bash parses it (the cryptic `invalid option name pipefail` error). The `install.ps1` bootstrap downloads `install.sh` to a temp file byte-safe and runs it inside WSL. For the native desktop sidecar, grab [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe) — see [Desktop installer](#desktop-installer-windows--macos).
 
 ### bun (manual)
 
@@ -181,7 +191,7 @@ The first time you run `pipo start`, the daemon boots in setup mode and the dash
 
 > **Restart after first-time setup:** The daemon constructs background services (heartbeat, commitments, awareness) at boot, gated on setup having already been completed. Once you finish setup in the dashboard, those services don't activate until the next start — the dashboard shows a banner reminding you. Run `pipo restart` (or stop/start) to bring them online. This will go away in a follow-up that constructs the services in-process at setup completion.
 
-> **Windows note:** The Pipo daemon does not run natively on Windows. Use WSL2 for a Bun installation or Docker Desktop for Windows. The Windows desktop sidecar remains supported separately. The dashboard and core workflow engine do not require a native desktop sidecar.
+> **Windows note:** The Pipo daemon does not run natively on Windows — it runs inside WSL2. The [install.ps1 one-liner](#one-liner-recommended) sets that up for you (WSL2, Bun, repo, CLI), or use Docker Desktop for Windows. The Windows desktop sidecar remains supported separately via [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe). The dashboard and core workflow engine do not require a native desktop sidecar.
 
 ### Docker
 

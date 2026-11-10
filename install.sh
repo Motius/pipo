@@ -1,10 +1,24 @@
 #!/usr/bin/env bash
+# Re-exec under bash when invoked as `sh install.sh` — dash (and other
+# POSIX shells) lack `set -o pipefail` and abort here. Only bash/zsh reach
+# the rest of the file.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 # ── P.I.P.O. Installer ──────────────────────────────────────────
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
+#
+#   On WINDOWS do not run that line in PowerShell: `curl` there aliases to
+#   Invoke-WebRequest, and PowerShell re-encodes piped script text with CRLF
+#   line endings, which corrupts this file before bash parses it. Use the
+#   PowerShell bootstrap instead — it downloads this script byte-safe and
+#   runs it inside WSL2:
+#
+#     irm https://raw.githubusercontent.com/Motius/pipo/main/install.ps1 | iex
 #
 # What this does:
 #   1. Detects your OS (macOS / Linux / WSL)
