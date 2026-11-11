@@ -27,18 +27,21 @@ package main
 
 // bundledInfo describes an embedded sidecar payload.
 type bundledInfo struct {
-	// Version is the sidecar version baked in at build time (from
-	// sidecar/VERSION). Empty means no payload was embedded.
-	Version string
-	// Tarball is the npm-style .tgz (package/bin/pipo.exe).
-	Tarball []byte
-	// SHA512 is the base64-encoded sha512 of Tarball, baked in at build
-	// time. update.Download would normally get this from the registry's
-	// dist.integrity; for the bundled path we stamp it via -ldflags.
-	SHA512 string
+        // Version is the sidecar version baked in at build time (from
+        // sidecar/VERSION). Empty means no payload was embedded.
+        Version string
+        // Tarball is the npm-style .tgz (package/bin/pipo.exe).
+        Tarball []byte
+        // SHA512 is the base64-encoded sha512 of Tarball, baked in at build
+        // time. update.Download would normally get this from the registry's
+        // dist.integrity; for the bundled path we stamp it via -ldflags.
+        SHA512 string
 }
 
-// bundledPayload returns the embedded sidecar payload, or nil when no real
-// payload was embedded (local dev builds, non-windows/amd64 builds). The
-// per-platform files below override this stub.
-func bundledPayload() (*bundledInfo, bool) { return nil, false }
+// bundledPayload itself is declared per-platform:
+//
+//      bundled_windows_amd64.go  //go:build windows && amd64   — real embed
+//      bundled_other.go          //go:build !(windows && amd64) — nil stub
+//
+// Keeping the declarations out of this file avoids a redeclaration error
+// on windows/amd64, where both would otherwise be compiled together.
