@@ -237,7 +237,7 @@
   color: var(--ink2);
   background: var(--panel);
   border: 1px solid var(--rule);
-  border-radius: 6px 1px 6px 6px;
+  border-radius: 6px;
   padding: 3px 8px;
 }
 

@@ -970,7 +970,10 @@ export async function runSubAgent(opts: RunSubAgentOptions): Promise<SubAgentRes
 export function createScopedToolRegistry(allowedCategories: string[]): ToolRegistry {
   const registry = new ToolRegistry();
   for (const tool of BUILTIN_TOOLS) {
-    if (allowedCategories.includes(tool.category)) {
+    // A role may name individual tools, not only whole categories (#1314):
+    // the computer-operator specialist names browser_navigate and desktop_click
+    // without owning either full category.
+    if (allowedCategories.includes(tool.category) || allowedCategories.includes(tool.name)) {
       registry.register(tool);
     }
   }

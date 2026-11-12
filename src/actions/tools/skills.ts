@@ -28,6 +28,7 @@
 
 import type { ToolDefinition, ToolGate } from './registry.ts';
 import { getSidecarManager, autoTargetForCapability } from './sidecar-route.ts';
+import { DESKTOP_DISABLED_CODE, desktopDisabledError, isDesktopDisabledError, isDesktopEnabled } from './desktop-guard.ts';
 import { captureSurface } from '../../structural/surface.ts';
 import { checkNavigationUrl } from '../browser/url-policy.ts';
 import { runSkill, type SkillRuntimeDeps } from '../../skills/runtime.ts';
@@ -74,8 +75,15 @@ function liveDeps(explicitTarget?: string): SkillRuntimeDeps {
     return t;
   };
 
+  // Checked at every desktop step, not only when the run starts: a switch
+  // turned off mid-run stops the steps that have not been sent yet (#905).
+  const desktopStep = (): void => {
+    if (!isDesktopEnabled()) throw desktopDisabledError('may_have_occurred');
+  };
+
   return {
     snapshot: async (kind) => {
+      if (kind !== 'browser') desktopStep();
       const { surface } = await captureSurface({ kind, target: targetFor(kind), full: false });
       return { nodes: surface.nodes, title: surface.root.title };
     },
@@ -92,6 +100,7 @@ function liveDeps(explicitTarget?: string): SkillRuntimeDeps {
         }
         return;
       }
+      desktopStep();
       await manager.dispatchRPC(id, 'click_element', { element_id: sessionId, action, value }, RPC_TIMEOUT);
     },
     raw: async (kind, action, value) => {
@@ -112,11 +121,13 @@ function liveDeps(explicitTarget?: string): SkillRuntimeDeps {
         if (kind === 'browser') {
           await manager.dispatchRPC(sidecarIdFor(targetFor('browser')), 'browser_press_key', { key: value }, RPC_TIMEOUT);
         } else {
+          desktopStep();
           await manager.dispatchRPC(sidecarIdFor(targetFor('desktop')), 'press_keys', { keys: value }, RPC_TIMEOUT);
         }
         return;
       }
       if (action === 'launch_app') {
+        desktopStep();
         await manager.dispatchRPC(sidecarIdFor(targetFor('desktop')), 'launch_app', { executable: value }, RPC_TIMEOUT);
         return;
       }
@@ -150,6 +161,24 @@ function skillSurface(skill: Skill): 'browser' | 'desktop' | 'mixed' {
 }
 
 /**
+ * Whether replaying this skill would send anything to the desktop, decided the
+ * way liveDeps routes it rather than by the steps' labels: launch_app always
+ * goes to the desktop and navigate always to the browser (though a navigate's
+ * postcondition is read on the surface it names); every other acting step
+ * follows its surface (#905).
+ */
+function skillReachesDesktop(skill: Skill): boolean {
+  return skill.steps.some((st) => {
+    if (st.action === 'wait') return false;
+    // The action is the browser's, but its postcondition reads are taken on
+    // the step's surface, which a navigate can name as the desktop.
+    if (st.action === 'navigate') return !!st.postcondition && stepSurface(st) !== 'browser';
+    if (st.action === 'launch_app') return true;
+    return stepSurface(st) !== 'browser';
+  });
+}
+
+/**
  * A failure is thrown as a typed outcome (#478), never returned as an error
  * string: a workflow step must fail when a skill cannot run or stops part
  * way, and the chat path renders the same message as a tool result.
@@ -162,7 +191,7 @@ function integrityNote(s: Skill): string {
   if (s.integrity === 'ok') return '';
   return s.integrity === 'unsigned'
     ? ' [not runnable: stored before signing; delete and record again]'
-    : ' [not runnable: content changed outside pipo; delete and record again]';
+    : ' [not runnable: content changed outside Ignatius; delete and record again]';
 }
 
 export const runSkillTool: ToolDefinition = {
@@ -170,6 +199,12 @@ export const runSkillTool: ToolDefinition = {
   description:
     'Execute a stored skill (a verified, parameterized procedure) by name. The runtime performs and verifies each step for you; you do not click through it yourself. Each run is checked against your authority for the most consequential step it contains (for example a click on Send is treated as sending email), so it can require the user\'s approval or be denied. Use manage_skills action="list" to see available skills and their parameters. Prefer a skill over manual ui_act steps when one matches the task.',
   category: 'ui',
+  // A skill with any desktop step drives the desktop (#905). An unknown name
+  // is not: execute refuses it as SKILL_NOT_FOUND.
+  usesDesktop: (params) => {
+    const skill = typeof params.name === 'string' ? getSkillByName(params.name) : null;
+    return !!skill && skillReachesDesktop(skill);
+  },
   parameters: {
     name: { type: 'string', description: 'The skill name (from the skill index / manage_skills list).', required: true },
     params: { type: 'object', description: 'Parameter values for the skill, e.g. { "to": "a@b.com", "body": "hi" }.', required: false },
@@ -218,6 +253,13 @@ export const runSkillTool: ToolDefinition = {
       result = await runSkill(skill, args, deps);
     } catch (err) {
       recordSkillRun(skill.id, false);
+      // Turned off part way (#905): the switch's own code, so the caller sees
+      // why, with a message that does not claim nothing ran.
+      if (isDesktopDisabledError(err)) {
+        fail({ status: 'error', code: DESKTOP_DISABLED_CODE, effect: 'may_have_occurred',
+          message: `Error: skill "${name}" stopped part way because desktop control was turned off (desktop.enabled: false). `
+            + 'Steps before that may already have happened; read what changed before acting again, and do NOT retry.' });
+      }
       // The runtime only throws from inside a step, so something may have run.
       fail({ status: 'error', code: 'SKILL_RUN_ERROR', effect: 'may_have_occurred', message: `Error running skill "${name}": ${err instanceof Error ? err.message : String(err)}` });
     }
@@ -279,7 +321,7 @@ export const manageSkillsTool: ToolDefinition = {
     // to impersonate, which quoting mid-sentence could not promise (a
     // look-alike quote is not escaped). Everything before it is a number or
     // the card's own words.
-    const shown = (value: unknown) => forCard(value) || '(a name made only of invisible characters)';
+    const shown = (value: unknown) => forCard(value) || '(a name made only of invisible or formatting characters)';
     const name = typeof params.name === 'string' ? params.name.trim() : '';
     const skill = name ? getSkillByName(name) : null;
     const intent = skill
@@ -315,9 +357,29 @@ export const manageSkillsTool: ToolDefinition = {
 };
 
 const RECORDING_INTENT =
-  'Start recording a skill: pipo watches your clicks and typing in every app until you stop it or 10 minutes pass';
+  'Start recording a skill: Ignatius watches your clicks and typing in every app until you stop it or 10 minutes pass';
 
 let capTimer: ReturnType<typeof setTimeout> | null = null;
+/** The sidecar whose input hooks the live recording installed. */
+let recordingSidecarId: string | null = null;
+
+/**
+ * desktop.enabled was turned off (#905): a recording that is running stops
+ * now, its input hooks come off the sidecar, and what it captured is thrown
+ * away rather than left for record_skill stop to compile. Returns whether a
+ * recording was running. Safe to call at any time.
+ */
+export function endRecordingForDesktopOff(): boolean {
+  const recorder = getRecorder();
+  const wasRecording = recorder.isRecording();
+  if (wasRecording) recorder.end('stop');
+  recorder.takePending();
+  clearCap();
+  const sidecarId = recordingSidecarId;
+  recordingSidecarId = null;
+  if (wasRecording && sidecarId) void stopSidecarRecording(sidecarId);
+  return wasRecording;
+}
 
 function clearCap(): void {
   if (capTimer) clearTimeout(capTimer);
@@ -335,6 +397,7 @@ export function onRecordingStopped(reason: string): void {
   const mapped: RecordingEndReason = reason === 'cap' ? 'cap' : reason === 'rpc' ? 'stop' : 'sidecar';
   getRecorder().end(mapped);
   clearCap();
+  recordingSidecarId = null;
 }
 
 export const recordSkillTool: ToolDefinition = {
@@ -342,6 +405,9 @@ export const recordSkillTool: ToolDefinition = {
   description:
     'Learn a new skill by watching the user do a task once. action="start" asks the user to confirm on a card; recording begins only when they approve it, and it stops on its own after 10 minutes. The user then performs the task while you wait. action="stop" with a name compiles what was demonstrated into a reusable, parameterized skill. Typed text becomes a parameter whose default is what the user typed, so the skill runs as demonstrated with no values; passwords and other secrets are redacted and must be supplied at run time. A name that already exists is never overwritten: pick a new name, or delete the old skill first with manage_skills.',
   category: 'ui',
+  // Starting installs input hooks on the user's desktop (#905). Stopping only
+  // ends and compiles a recording, so it stays available.
+  usesDesktop: (params) => params.action === 'start',
   parameters: {
     action: { type: 'string', description: 'start or stop.', required: true, enum: ['start', 'stop'] },
     name: { type: 'string', description: 'On stop: the name to save the skill under (kebab-case, e.g. "gmail-compose").', required: false },
@@ -369,9 +435,11 @@ export const recordSkillTool: ToolDefinition = {
       }
       const id = `rec-${Math.random().toString(36).slice(2, 10)}`;
       recorder.start(id, Date.now(), RECORDING_MAX_MS);
+      recordingSidecarId = sidecarId;
       clearCap();
       capTimer = setTimeout(() => {
         recorder.end('cap');
+        recordingSidecarId = null;
         void stopSidecarRecording(sidecarId);
       }, RECORDING_MAX_MS);
       capTimer.unref?.();
@@ -381,6 +449,7 @@ export const recordSkillTool: ToolDefinition = {
     if (action === 'stop') {
       const session = recorder.end('stop');
       clearCap();
+      recordingSidecarId = null;
       if (manager && target) await stopSidecarRecording(sidecarIdFor(target));
       if (!session) return 'Nothing is recording and nothing is pending.';
       const ended = session.endReason === 'cap' ? ' (the recording had already stopped at the time limit)' : '';

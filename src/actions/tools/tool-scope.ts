@@ -207,6 +207,7 @@
  */
 
 import type { ToolDefinition } from './registry.ts';
+import { withoutDisabledDesktopTools } from './desktop-guard.ts';
 import { NOT_RUN_MARKER } from './tool-relevance/ledger.ts';
 
 export type TurnToolScope = {
@@ -360,8 +361,12 @@ export function toolsInScope(
   all: readonly ToolDefinition[],
   scope: TurnToolScope | null | undefined,
 ): readonly ToolDefinition[] {
-  if (!scope || scope.withheld.size === 0) return all;
-  return all.filter((tool) => toolInScope(scope, tool.name));
+  // Also the one place the always-desktop tools drop out while
+  // `desktop.enabled` is false (#905, desktop-guard.ts): nothing
+  // downstream may offer, list or admit a tool that would only be refused.
+  const available = withoutDisabledDesktopTools(all);
+  if (!scope || scope.withheld.size === 0) return available;
+  return available.filter((tool) => toolInScope(scope, tool.name));
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { ContentBlock } from '../../llm/provider.ts';
 import { checkpointExecution } from '../execution-scope.ts';
+import { assertDesktopAllowed } from './desktop-guard.ts';
 import { ActionOutcomeError } from '../action-outcome.ts';
 import { WorkflowCancellationError } from '../../workflows/runtime/cancellation-error.ts';
 
@@ -75,6 +76,15 @@ export type ToolDefinition = {
   category: string;
   parameters: Record<string, ToolParameter>;
   execute: (params: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * Trusted declaration, never accepted from model input: this tool reaches the
+   * user's desktop (a window list, a UI tree, a screen capture, input, or the
+   * clipboard), so
+   * `desktop.enabled: false` refuses it (#905, desktop-guard.ts). `true` for
+   * every call, or a cheap check of one call's arguments that must not act.
+   * Category `desktop` implies `true`.
+   */
+  usesDesktop?: true | ((params: Record<string, unknown>) => boolean);
   /** Trusted adapter declaration, never accepted from workflow/model input. */
   workflowEffect?: {
     category: import('../../roles/authority').ActionCategory;
@@ -214,6 +224,12 @@ export class ToolRegistry {
     // Outside the try: a cancellation fence is not a tool failure, and
     // rewrapping it would hide its type from the callers that map it.
     checkpointExecution();
+
+    // Outside the try too: the desktop switch's refusal is a typed verdict
+    // (ActionOutcomeError), not a tool failure to rewrap (#905). Runs before
+    // any approval card and before the tool itself, on every dispatch path
+    // that goes through the registry.
+    assertDesktopAllowed(tool, params);
 
     try {
       return await tool.execute(params);

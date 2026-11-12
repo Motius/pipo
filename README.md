@@ -1,31 +1,31 @@
 <div align="center">
 
-# PIPO
+# IGNATIUS
 
 ### Your company workflow brain
 
 **AI for judgement. Code for repetition.**
 
-[![CI](https://github.com/Motius/pipo/actions/workflows/test.yml/badge.svg)](https://github.com/Motius/pipo/actions/workflows/test.yml)
+[![CI](https://github.com/motius/pipo/actions/workflows/test.yml/badge.svg)](https://github.com/motius/pipo/actions/workflows/test.yml)
 [![Runtime](https://img.shields.io/badge/runtime-Bun-%23f9f1e1)](https://bun.sh)
 [![License](https://img.shields.io/badge/license-RSALv2-blue)](LICENSE)
 [![Website](https://img.shields.io/static/v1?label=website&message=pipo-ke.com&color=black)](https://pipo-ke.com)
 
 _An autonomous workflow daemon with desktop awareness, multi-agent delegation, visual workflows, and explicit authority controls._
 
-Pipo is more than a chatbot with tools. It is a persistent daemon that can understand context and act within the authority limits you define. Run the daemon locally, in Docker, or on an approved host, then connect sidecars on the machines where desktop access is needed.
+Ignatius is more than a chatbot with tools. It is a persistent daemon that can understand context and act within the authority limits you define. Run the daemon locally, in Docker, or on an approved host, then connect sidecars on the machines where desktop access is needed.
 
 </div>
 
 > **Project guide:** installation, operations, security, scaling, verification, and release guidance are available in [`docs/PIPO_OPERATIONS_GUIDE.md`](docs/PIPO_OPERATIONS_GUIDE.md).
 
-<!-- Add the final product screenshot or demo GIF here when the Motius media asset is approved. -->
+<!-- Add the final product screenshot or demo GIF here when the motius media asset is approved. -->
 
 ---
 
 ## Contents
 
-- [What makes Pipo different](#-what-makes-pipo-different)
+- [What makes Ignatius different](#-what-makes-pipo-different)
 - [Quick start](#-quick-start)
 - [Ambient mode](#-ambient-mode)
 - [Use cases](#-use-cases)
@@ -64,7 +64,7 @@ Pipo is more than a chatbot with tools. It is a persistent daemon that can under
 ## ⚡ Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/motius/pipo/main/install.sh | bash
 pipo start -d                   # Start as background daemon
 ```
 
@@ -111,7 +111,7 @@ If you do not want to manage a server, run the Docker image on an approved
 managed container host. The provider must support persistent volumes, WebSocket
 connections, HTTPS termination, and outbound connections to the model providers
 you configure. Follow the provider's instructions for DNS, TLS, backups, and
-secret management; Pipo does not provision those services for you.
+secret management; Ignatius does not provision those services for you.
 
 ---
 
@@ -147,8 +147,8 @@ secret management; Pipo does not provision those services for you.
 
 The desktop sidecar — the Pebble companion with tray, overlay, and hotkeys — ships as a signed native installer. Stable download URLs (always the latest published installer):
 
-- **Windows:** [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe)
-- **macOS:** [Install-pipo.dmg](https://github.com/Motius/pipo/releases/download/installer-latest/Install-pipo.dmg)
+- **Windows:** [pipo-Setup.exe](https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe)
+- **macOS:** [Install-pipo.dmg](https://github.com/motius/pipo/releases/download/installer-latest/Install-pipo.dmg)
 
 Install, enroll the device from the dashboard (**Settings → Sidecar**), and it self-updates from npm whenever your brain ships a newer paired version (sha512 + signature checked before anything runs). The brain itself runs on Linux, macOS, or Windows via WSL2/Docker — pick one of the paths below.
 
@@ -157,7 +157,7 @@ Install, enroll the device from the dashboard (**Settings → Sidecar**), and it
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/motius/pipo/main/install.sh | bash
 ```
 
 After opening a new terminal, run:
@@ -171,15 +171,15 @@ The install script sets up Bun, clones the repo, and links the `pipo` CLI. Then 
 **Windows** (PowerShell — installs the brain inside WSL2 for you; offers to set WSL up if it is missing):
 
 ```powershell
-irm https://raw.githubusercontent.com/Motius/pipo/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/motius/pipo/main/install.ps1 | iex
 ```
 
-> **Do not run the bash one-liner in PowerShell.** `curl` there is an alias for `Invoke-WebRequest` (no `-fsSL`), and even `curl.exe … | bash` breaks: PowerShell re-encodes piped text with CRLF line endings, which corrupts the script before bash parses it (the cryptic `invalid option name pipefail` error). The `install.ps1` bootstrap downloads `install.sh` to a temp file byte-safe and runs it inside WSL. For the native desktop sidecar, grab [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe) — see [Desktop installer](#desktop-installer-windows--macos).
+> **Do not run the bash one-liner in PowerShell.** `curl` there is an alias for `Invoke-WebRequest` (no `-fsSL`), and even `curl.exe … | bash` breaks: PowerShell re-encodes piped text with CRLF line endings, which corrupts the script before bash parses it (the cryptic `invalid option name pipefail` error). The `install.ps1` bootstrap downloads `install.sh` to a temp file byte-safe and runs it inside WSL. For the native desktop sidecar, grab [pipo-Setup.exe](https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe) — see [Desktop installer](#desktop-installer-windows--macos).
 
 ### bun (manual)
 
 ```bash
-git clone https://github.com/Motius/pipo.git ~/.pipo/daemon
+git clone https://github.com/motius/pipo.git ~/.pipo/daemon
 cd ~/.pipo/daemon
 bun install
 bun run build:ui
@@ -191,7 +191,7 @@ The first time you run `pipo start`, the daemon boots in setup mode and the dash
 
 > **Restart after first-time setup:** The daemon constructs background services (heartbeat, commitments, awareness) at boot, gated on setup having already been completed. Once you finish setup in the dashboard, those services don't activate until the next start — the dashboard shows a banner reminding you. Run `pipo restart` (or stop/start) to bring them online. This will go away in a follow-up that constructs the services in-process at setup completion.
 
-> **Windows note:** The Pipo daemon does not run natively on Windows — it runs inside WSL2. The [install.ps1 one-liner](#one-liner-recommended) sets that up for you (WSL2, Bun, repo, CLI), or use Docker Desktop for Windows. The Windows desktop sidecar remains supported separately via [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe). The dashboard and core workflow engine do not require a native desktop sidecar.
+> **Windows note:** The Ignatius daemon does not run natively on Windows — it runs inside WSL2. The [install.ps1 one-liner](#one-liner-recommended) sets that up for you (WSL2, Bun, repo, CLI), or use Docker Desktop for Windows. The Windows desktop sidecar remains supported separately via [pipo-Setup.exe](https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe). The dashboard and core workflow engine do not require a native desktop sidecar.
 
 ### Docker
 
@@ -201,10 +201,10 @@ Run pipo on any OS with a single command — no Bun or dependencies required. In
 docker run -d --name pipo \
   -p 1846:1846 \
   -v pipo-data:/data \
-  ghcr.io/Motius/pipo:latest
+  ghcr.io/motius/pipo:latest
 ```
 
-The image is available on [GHCR](https://ghcr.io/Motius/pipo). Non-LLM configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume. LLM providers, API keys, and model routing are configured from the settings dashboard (open http://localhost:1846 after first boot) and stored in the database + encrypted keychain - they are not set via env vars or `config.yaml`.
+The image is available on [GHCR](https://ghcr.io/motius/pipo). Non-LLM configuration can be provided via environment variables or by mounting a `config.yaml` into the `/data` volume. LLM providers, API keys, and model routing are configured from the settings dashboard (open http://localhost:1846 after first boot) and stored in the database + encrypted keychain - they are not set via env vars or `config.yaml`.
 
 > **Note:** Docker runs in an isolated container, so the daemon inside it cannot access your host desktop, browser, or clipboard directly. You must still install the [sidecar](#sidecar-setup) on each machine where you want pipo to have desktop awareness and automation capabilities.
 
@@ -342,7 +342,7 @@ This means you can run the daemon on an always-on server and still interact with
 
 ### 1. Install the sidecar
 
-**Easiest — the desktop installer:** download [pipo-Setup.exe](https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe) (Windows) or [Install-pipo.dmg](https://github.com/Motius/pipo/releases/download/installer-latest/Install-pipo.dmg) (macOS) from the rolling [`installer-latest`](https://github.com/Motius/pipo/releases/tag/installer-latest) release. It installs, signs, and auto-starts the sidecar.
+**Easiest — the desktop installer:** download [pipo-Setup.exe](https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe) (Windows) or [Install-pipo.dmg](https://github.com/motius/pipo/releases/download/installer-latest/Install-pipo.dmg) (macOS) from the rolling [`installer-latest`](https://github.com/motius/pipo/releases/tag/installer-latest) release. It installs, signs, and auto-starts the sidecar.
 
 **Via bun:**
 
@@ -350,7 +350,7 @@ This means you can run the daemon on an always-on server and still interact with
 bun install -g @pipo/sidecar
 ```
 
-**Or download the binary** from [GitHub Releases](https://github.com/Motius/pipo/releases) for your platform (macOS, Linux, Windows).
+**Or download the binary** from [GitHub Releases](https://github.com/motius/pipo/releases) for your platform (macOS, Linux, Windows).
 
 ### 2. Enroll in the dashboard
 
@@ -398,7 +398,7 @@ The sidecar updates itself to the version your brain ships with (never to anythi
 - **At startup**, if an update is available, the sidecar shows a prompt: _Update now_, _Later_, or _Skip this version_ (Windows and macOS).
 - **While running**, the tray menu gets an _Update to vX.Y.Z_ item, and the dashboard shows a _sidecar update_ hint in the top bar and an _Update_ button in **Settings -> Sidecar**. On Windows and macOS these open the same prompt on that machine; on Linux the dashboard installs the update directly after asking you.
 - The update is downloaded from npm, checked (sha512, plus the code signature on Windows and macOS) and swapped in place, and the sidecar restarts in a few seconds; the brain keeps working meanwhile. If the new version keeps failing to start, the previous one is restored.
-- A sidecar installed with bun or npm is updated with that package manager. If it cannot be updated automatically, you get the exact command to run instead (`bun add -g @pipo/sidecar@X.Y.Z`, or the installer from [GitHub Releases](https://github.com/Motius/pipo/releases/tag/installer-latest)).
+- A sidecar installed with bun or npm is updated with that package manager. If it cannot be updated automatically, you get the exact command to run instead (`bun add -g @pipo/sidecar@X.Y.Z`, or the installer from [GitHub Releases](https://github.com/motius/pipo/releases/tag/installer-latest)).
 
 If a sidecar is too old for the brain (**Update required**), the brain refuses the connection; the sidecar stays running, shows its update prompt (or a desktop notification on Linux) and tries the brain again every 30 minutes. Local development builds report `dev` and are never updated or blocked.
 
@@ -410,7 +410,7 @@ Publishing a release is a tag push. Bump `package.json` (and `sidecar/installer/
 git tag v4.1.0 && git push origin v4.1.0
 ```
 
-The tag triggers [release-exec.yml](.github/workflows/release-exec.yml): it validates the tag, builds and signs everything, then — behind the `release` environment's required reviewers — publishes `@pipo/brain` and `@pipo/sidecar` to npm, the GitHub release, and Docker. From there updates propagate on their own: sidecars self-update to the paired version (see above), brains update with `pipo update`, and Docker hosts pull the new image. Rehearse the whole pipeline without publishing via a dry run (Actions → release-exec → Run workflow, `dry_run` on). The desktop installer cuts separately: bump `sidecar/installer/VERSION` and push an `installer-vX.Y.Z` tag, which refreshes the rolling [`installer-latest`](https://github.com/Motius/pipo/releases/tag/installer-latest) assets.
+The tag triggers [release-exec.yml](.github/workflows/release-exec.yml): it validates the tag, builds and signs everything, then — behind the `release` environment's required reviewers — publishes `@pipo/brain` and `@pipo/sidecar` to npm, the GitHub release, and Docker. From there updates propagate on their own: sidecars self-update to the paired version (see above), brains update with `pipo update`, and Docker hosts pull the new image. Rehearse the whole pipeline without publishing via a dry run (Actions → release-exec → Run workflow, `dry_run` on). The desktop installer cuts separately: bump `sidecar/installer/VERSION` and push an `installer-vX.Y.Z` tag, which refreshes the rolling [`installer-latest`](https://github.com/motius/pipo/releases/tag/installer-latest) assets.
 
 ---
 
@@ -570,7 +570,7 @@ Workflows (contributor reading order):
 ## 💬 Community
 
 - [Website](https://pipo-ke.com) — Project homepage and documentation
-- [GitHub Issues](https://github.com/Motius/pipo/issues) — Bug reports and feature requests
+- [GitHub Issues](https://github.com/motius/pipo/issues) — Bug reports and feature requests
 
 ---
 

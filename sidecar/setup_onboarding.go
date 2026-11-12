@@ -189,7 +189,7 @@ const onboardingWindowHTML = `<!doctype html>
 <div class="pagebody" tabindex="-1">
   <div class="hero">
     <span class="bdrop" id="pebble"><span class="in"></span><span class="ring"></span></span>
-    <h1>Welcome to <span class="word"><span class="u">use</span>pipo</span></h1>
+    <h1>Welcome to <span class="word">Ignatius</span></h1>
   </div>
   <p class="sub" id="intro">pipo needs a few permissions to see, hear, and notify on this machine. Grant each one below — rows turn green as you go. You can change any of this later in System Settings.</p>
 

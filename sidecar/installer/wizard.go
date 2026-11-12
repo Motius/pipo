@@ -53,7 +53,7 @@ type wizardState struct {
 	// AutostartDefault seeds the wizard's checkbox (--no-autostart clears it).
 	AutostartDefault bool `json:"autostart_default"`
 	// NoLaunch mirrors --no-launch. The buttons that would start pipo only
-	// close the window then, so they must not say "Launch pipo".
+	// close the window then, so they must not say "Launch Ignatius".
 	NoLaunch bool `json:"no_launch"`
 }
 
@@ -486,7 +486,7 @@ const wizardHTML = `<!doctype html>
 <div class="pagebody" tabindex="-1">
   <div class="hero">
     <span class="bdrop" id="pebble"><span class="in"></span><span class="ring"></span></span>
-    <h1><span class="word"><span class="u">use</span>pipo</span> sidecar</h1>
+    <h1><span class="word">Ignatius</span> sidecar</h1>
   </div>
   <p class="sub" id="subtitle">Checking for the latest sidecar…</p>
 
@@ -546,7 +546,7 @@ const wizardHTML = `<!doctype html>
     var pebble = el('pebble');
     var main = el('btnMain');
     var cancel = el('btnCancel');
-    // Where pipo lives after it starts. It has no Dock/taskbar presence and
+    // Where Ignatius lives after it starts. It has no Dock/taskbar presence and
     // no persistent window — only a menu-bar (macOS) / system-tray (Windows)
     // icon — so a done screen that doesn't say this reads as "nothing happened".
     var homeSpot = st.platform === 'darwin' ? 'the menu bar, at the top-right of your screen'
@@ -617,16 +617,16 @@ const wizardHTML = `<!doctype html>
       } else if (st.no_launch) {
         el('subtitle').textContent =
           (st.up_to_date ? 'Already up to date.' : st.first_install ? 'Installed.' : 'Updated.') +
-          ' Start pipo from ' + startSpot + ' when you want it.';
+          ' Start Ignatius from ' + startSpot + ' when you want it.';
         main.textContent = 'Close';
         main.onclick = function () { window.closeInstaller(true); };
       } else {
-        el('subtitle').textContent = st.up_to_date ? 'Already up to date. pipo lives in ' + homeSpot + '.'
+        el('subtitle').textContent = st.up_to_date ? 'Already up to date. Ignatius lives in ' + homeSpot + '.'
           : (st.platform === 'darwin' && st.first_install)
             ? 'Installed. pipo will ask for its permissions, then live in ' + homeSpot + '.'
-            : st.first_install ? 'Installed. pipo lives in ' + homeSpot + '.'
-              : 'Updated. pipo lives in ' + homeSpot + '.';
-        main.textContent = 'Launch pipo';
+            : st.first_install ? 'Installed. Ignatius lives in ' + homeSpot + '.'
+              : 'Updated. Ignatius lives in ' + homeSpot + '.';
+        main.textContent = 'Launch Ignatius';
         main.onclick = function () { window.launchAndClose(); };
       }
       return;
@@ -639,22 +639,22 @@ const wizardHTML = `<!doctype html>
       main.textContent = 'Close';
       main.onclick = function () { window.closeInstaller(true); };
     } else if (st.up_to_date && st.no_launch) {
-      el('subtitle').textContent = 'You already have the latest sidecar. Start pipo from ' + startSpot + ' when you want it.';
+      el('subtitle').textContent = 'You already have the latest sidecar. Start Ignatius from ' + startSpot + ' when you want it.';
       main.textContent = 'Close';
       main.onclick = function () { window.closeInstaller(true); };
     } else if (st.up_to_date) {
       // Menu-bar-only app: a user who re-ran the installer to "get pipo
       // back" needs a way to start it, not just a dead-end Close. Launch it.
       el('subtitle').textContent = 'You already have the latest sidecar — it runs in ' + homeSpot + '.';
-      main.textContent = 'Launch pipo';
+      main.textContent = 'Launch Ignatius';
       main.onclick = function () { window.launchAndClose(); };
     } else {
       // The panel row is where "there is an update" is announced; saying it
       // again here would leave the two lines of the screen agreeing with each
       // other instead of telling the user two things.
       el('subtitle').textContent = st.installed
-        ? 'This updates the pipo sidecar on this machine.'
-        : 'This installs the pipo sidecar on this machine.';
+        ? 'This updates the Ignatius sidecar on this machine.'
+        : 'This installs the Ignatius sidecar on this machine.';
       main.textContent = st.installed ? 'Update' : 'Install';
       main.onclick = function () { window.startInstall(el('autostart').checked); };
     }

@@ -28,7 +28,7 @@
 }
 .rk-toolrow:hover { background: var(--panel2); }
 .rk-toolrow--sel { background: var(--panel2); box-shadow: inset 2px 0 0 var(--ink); }
-.rk-toolrow__icon { width: 24px; height: 24px; border-radius: 7px 1px 7px 7px; background: var(--panel); border: 1px solid var(--rule); display: flex; align-items: center; justify-content: center; color: var(--ink3); margin-top: 1px; }
+.rk-toolrow__icon { width: 24px; height: 24px; border-radius: 7px; background: var(--panel); border: 1px solid var(--rule); display: flex; align-items: center; justify-content: center; color: var(--ink3); margin-top: 1px; }
 .rk-toolrow__body { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .rk-toolrow__head { display: flex; align-items: center; gap: 8px; }
 .rk-toolrow__name { font-family: var(--mono); font-size: 12px; color: var(--ink); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

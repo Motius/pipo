@@ -83,7 +83,7 @@ export function VoiceRail({
         <div className="v2-rail__identity">
           <PandaCompanion state={state} size={82} />
           <div className="v2-rail__identity-copy">
-            <strong>Pipo</strong>
+            <strong>Ignatius</strong>
             <span>{state === "idle" ? "Here when you need a second mind." : HINT[state]}</span>
           </div>
         </div>

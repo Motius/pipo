@@ -238,6 +238,6 @@ body.pebble-dev-backdrop::before {
 }
 .thread-hint kbd {
   font-family: var(--mono); background: var(--panel);
-  border: 1px solid var(--rule); border-radius: 5px 1px 5px 5px;
+  border: 1px solid var(--rule); border-radius: 5px;
   padding: 1px 4px; font-size: 9.5px; color: var(--ink2); margin: 0 1px;
 }

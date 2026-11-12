@@ -246,7 +246,7 @@ static void pipoTrayRebuild(const char* header, int waiting, int paused, int mut
             [menu addItem:[NSMenuItem separatorItem]];
         }
 
-        pipoAddCheck(menu, @"Pause pipo", @selector(onPause:), paused);
+        pipoAddCheck(menu, @"Pause Ignatius", @selector(onPause:), paused);
         pipoAddCheck(menu, @"Mute microphone", @selector(onMute:), muted);
         [menu addItem:[NSMenuItem separatorItem]];
 

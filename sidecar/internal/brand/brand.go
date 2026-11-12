@@ -30,7 +30,7 @@ const TokensCSS = `
     --sh-md:0 2px 6px rgba(20,30,45,.06),0 10px 24px -10px rgba(20,30,45,.18);
     --sans:-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
     --mono:'IBM Plex Mono', ui-monospace, "SF Mono", Menlo, monospace;
-    --corner:14px 3px 14px 14px; --corner-sm:9px 2px 9px 9px;
+    --corner:14px; --corner-sm:9px;
     --ease:cubic-bezier(.2,.7,.2,1);
   }
   @media (prefers-color-scheme: dark) {
@@ -59,7 +59,7 @@ const TokensCSS = `
 //
 // states via s-think / s-done / s-err on .bdrop; size via inline width/height.
 //
-//	<span class="word"><span class="u">use</span>pipo</span>
+//	<span class="word">Ignatius</span>
 const PebbleCSS = `
   .bdrop {
     display: block; position: relative;

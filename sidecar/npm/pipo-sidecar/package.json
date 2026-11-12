@@ -4,7 +4,7 @@
   "description": "pipo sidecar client -- connects to the brain and executes RPC requests locally",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Motius/pipo.git",
+    "url": "git+https://github.com/motius/pipo.git",
     "directory": "sidecar/npm/pipo-sidecar"
   },
   "bin": {

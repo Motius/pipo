@@ -1,8 +1,8 @@
-# Pipo vs. Atticus (atticus-mac)
+# Ignatius vs. Atticus (atticus-mac)
 
 Atticus (https://github.com/SaarthurR/atticus-mac) is a macOS menu-bar voice
 assistant built on a Claude plan with a Python "brain" and a Swift front end.
-Pipo is a server-first workflow daemon with sidecars. The two overlap on the
+Ignatius is a server-first workflow daemon with sidecars. The two overlap on the
 "talk to your machine" surface; this document maps every Atticus headline
 feature against pipo's current state, honestly, and lists what only pipo does.
 
@@ -13,7 +13,7 @@ surface (meeting copilot).
 
 ## Feature-by-feature
 
-| # | Atticus feature | Pipo | How pipo does it |
+| # | Atticus feature | Ignatius | How pipo does it |
 | - | --------------- | ---- | ---------------- |
 | 1 | **Learns** — ask once, replay with no AI ("When I say focus mode…") | **Shipped** | `learn_command` stores a phrase → action reference in the vault. Spoken (or typed) again, a daemon fast path replays it with zero LLM calls. Safety: the free/governed decision is re-read from live skill/tool state at replay time (`decideReplay`), so a phrase whose steps reach email, payments, deletes or settings falls back to the normal approval-card turn — a stored phrase is never a bypass. Fallover answers honestly ("I'll handle it with the normal flow instead"), the way Atticus's ask-first does. |
 | 2 | **Watch for me** — "tell me when Codex is done", checks every 5 s with no AI | **Shipped** | `manage_watchers` + voice fast path create a one-row watch (window title or clipboard) pinned to a sidecar. A per-watcher cadence loop (default 5 s) reads via existing sidecar RPCs — nothing in the loop costs tokens. Fires once, expires (default 8 h), notifies on the dashboard + pebble, and can hand a recorded follow-up back as a fresh turn. "Stop watching" cancels by voice. |
@@ -27,9 +27,9 @@ surface (meeting copilot).
 | 10 | Background agents with live chips and restart-on-crash | **Exceeded** | Per-task checkpoints survive daemon restarts; paused/resumable runs with governed tool dispatch; dashboard agents room with full history. Atticus-style "always allow for this task" maps to pipo's session grants. |
 | 11 | Named agents — save reusable specialists | **Same shape** | Persistent agents `spawn → assign → status → collect → terminate` with specialist roles; steering (item 4) now covers the mid-flight correction. |
 | 12 | Routines — "every weekday at 8, summarize my calendar" | **Exceeded** | The visual workflow engine: multi-step graphs with cron, webhook, screen-event, file, git and email triggers, retry, fallback, self-healing, YAML import/export. A routine is the degenerate case. |
-| 13 | **Point & draw on screen** — mark something, or have Atticus annotate it | **Partial** | Pipo answers from region captures and screenshots, and streams screens into the dashboard — but has no annotation overlay that draws boxes/arrows/labels on the desktop. Open gap. |
+| 13 | **Point & draw on screen** — mark something, or have Atticus annotate it | **Partial** | Ignatius answers from region captures and screenshots, and streams screens into the dashboard — but has no annotation overlay that draws boxes/arrows/labels on the desktop. Open gap. |
 | 14 | **Meeting Copilot** — live transcripts, recaps, action items | **Gap** | No equivalent surface in pipo today. The awareness pipeline captures screen context, not live-call transcription. |
-| 15 | Instant commands — open apps, window layout, music, web search with no AI | **Partial** | Pipo has the same zero-LLM boundary for taught commands (item 1), dictation and watcher verbs; free-form window/music control still routes through the model with fast-path shortcuts on the dashboard. The taught-command path can hold any repetitive ordering, but pipo does not ship a pre-seeded instant-command library. |
+| 15 | Instant commands — open apps, window layout, music, web search with no AI | **Partial** | Ignatius has the same zero-LLM boundary for taught commands (item 1), dictation and watcher verbs; free-form window/music control still routes through the model with fast-path shortcuts on the dashboard. The taught-command path can hold any repetitive ordering, but pipo does not ship a pre-seeded instant-command library. |
 
 ## What only pipo does
 

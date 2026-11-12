@@ -4,7 +4,7 @@
   "description": "pipo sidecar binary for Linux x64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Motius/pipo.git",
+    "url": "git+https://github.com/motius/pipo.git",
     "directory": "sidecar/npm/linux-x64"
   },
   "os": ["linux"],

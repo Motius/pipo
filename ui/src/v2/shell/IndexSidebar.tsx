@@ -156,7 +156,7 @@ export function IndexSidebar({
       <div className="rs-full">
         <div className="rs-brand">
           <div className="lg"><div className="r" /></div>
-          <span className="w"><span>use</span>pipo</span>
+          <span className="w">Ignatius</span>
         </div>
         {ROWS.map((row, i) => {
           if (row.kind === "heading") return <div className="rs-gh" key={`h${i}`}>{row.label}</div>;

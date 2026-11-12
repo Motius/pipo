@@ -96,7 +96,7 @@
 .jboot .st-pillars .ldrop { width: 3em; height: 3em; animation: jb-formdrop 1s var(--ease-out, ease) both; }
 .jboot .st-pillars .ldrop .in { background: radial-gradient(circle at 50% 40%, #fff, #E6EAEF 70%); animation: jb-brS 2.6s var(--ease-out, ease) infinite; }
 .jboot .st-pillars .ldrop .ring { animation: jb-spin 3.6s linear infinite; opacity: 0.9; }
-.jboot .st-pillars .pmark { position: absolute; font-family: var(--mono); font-size: 0.52em; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); padding: 0.3em 0.55em; border: 1px solid var(--rule); border-radius: 6px 1px 6px 6px; opacity: 0.4; animation: jb-pmark 4.6s var(--ease-out, ease) infinite; }
+.jboot .st-pillars .pmark { position: absolute; font-family: var(--mono); font-size: 0.52em; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); padding: 0.3em 0.55em; border: 1px solid var(--rule); border-radius: 6px; opacity: 0.4; animation: jb-pmark 4.6s var(--ease-out, ease) infinite; }
 .jboot .st-pillars .m-mem { top: 0; left: 50%; transform: translateX(-50%); --c: var(--listen); animation-delay: 0s; }
 .jboot .st-pillars .m-awr { top: 50%; right: 0; transform: translateY(-50%); --c: var(--speak); animation-delay: 0.7s; }
 .jboot .st-pillars .m-act { bottom: 0; left: 50%; transform: translateX(-50%); --c: var(--hold); animation-delay: 1.4s; }

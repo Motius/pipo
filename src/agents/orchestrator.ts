@@ -7,7 +7,8 @@ import type { Tier } from '../llm/tiers.ts';
 import { AgentInstance, canSpawnChildren } from './agent.ts';
 import { AgentHierarchy } from './hierarchy.ts';
 import { ToolRegistry, type ToolDefinition, isToolResult } from '../actions/tools/registry.ts';
-import { toolDefToLLMTool } from '../actions/tools/builtin.ts';
+import { toolDefToLLMTool, BUILTIN_TOOLS } from '../actions/tools/builtin.ts';
+import { actingAgent } from './acting-agent.ts';
 import type { ActionCategory } from '../roles/authority.ts';
 import type { AuthorityEngine, AuthorityProfile } from '../authority/engine.ts';
 import { markUntrustedToolResult, markUntrustedToolBlocks, markUntrustedToolFailure, isTaintSourceTool, splitToolReturn, toolReturnText } from '../roles/untrusted.ts';
@@ -156,6 +157,15 @@ const MAX_NO_WORK_NUDGES = 2;
 export type TaskCallResult =
   | { kind: 'completed'; text: string; conversation: LLMMessage[] }
   | { kind: 'paused'; question: string; conversation: LLMMessage[] };
+
+/**
+ * Whether a role's tool entry -- a category or, since #1314, one tool by
+ * name -- is within `entries`: the same entry, or a named tool whose
+ * category `entries` allows.
+ */
+function withinToolEntries(entries: readonly string[], entry: string): boolean {
+  return entries.includes(entry) || BUILTIN_TOOLS.some((t) => t.name === entry && entries.includes(t.category));
+}
 
 export class AgentOrchestrator {
   private hierarchy: AgentHierarchy;
@@ -414,6 +424,54 @@ export class AgentOrchestrator {
   /**
    * Spawn a sub-agent under a parent
    */
+  /**
+   * Why the acting sub-agent may not direct `agentId` (give it a task), or
+   * null when it may (#1014). It may direct only an agent it could have
+   * started itself: one below its level, with no tool it lacks and every tool
+   * it is denied also denied. Otherwise a task it wrote would run with more
+   * authority than it has. Null when no sub-agent is acting.
+   */
+  delegationShortfall(agentId: string): string | null {
+    const target = this.hierarchy.getAgent(agentId);
+    const caller = this.actingCaller('spawn_agent', target?.agent.role.id ?? agentId);
+    if (!caller || !target) return null;
+    const mine = caller.agent.agent.authority;
+    const theirs = target.agent.authority;
+    const extra = theirs.allowed_tools.filter((t) => !withinToolEntries(mine.allowed_tools, t));
+    const undenied = mine.denied_tools.filter((t) => !theirs.denied_tools.includes(t));
+    if (theirs.max_authority_level < mine.max_authority_level && extra.length === 0 && undenied.length === 0) return null;
+    const why = theirs.max_authority_level >= mine.max_authority_level
+      ? `level ${theirs.max_authority_level}, not below ${mine.max_authority_level}`
+      : extra.length > 0 ? `the tools ${extra.join(', ')}` : `the tools ${undenied.join(', ')} it is denied`;
+    return `${target.agent.role.name} has more authority than ${caller.agent.agent.role.name}, the agent asking (${why}); `
+      + 'a sub-agent can only give tasks to agents it could have started itself.';
+  }
+
+  /**
+   * The sub-agent whose tool call is running, as the lifecycle sinks read it
+   * (#1014): ambient context entered by runAsActingAgent in runSubAgent.
+   * Absent (primary, dashboard, voice, an approved card) means null.
+   */
+  private actingCaller(action: string, subject: string): { agent: AgentInstance } | null {
+    const acting = actingAgent();
+    if (!acting) return null;
+    // Fail closed: an act asked for by a call that has returned, or by an
+    // agent that is gone, is nobody's. Never the primary's.
+    const agent = acting.settled ? undefined : this.hierarchy.getAgent(acting.agentId);
+    if (!agent) {
+      try {
+        this.auditTrail?.log({ agent_id: acting.agentId, agent_name: 'sub-agent',
+          tool_name: `${action}(${subject})`, action_category: action, authority_decision: 'denied', executed: false } as never);
+      } catch (err) {
+        console.warn(`[Lifecycle] could not audit ${action}(${subject}):`, err instanceof Error ? err.message : err);
+      }
+      throw new Error(acting.settled
+        ? 'The tool call that asked for this has already finished, so nothing was done.'
+        : 'The agent that asked for this is no longer running, so nothing was done.');
+    }
+    return { agent };
+  }
+
   spawnSubAgent(
     parentId: string,
     role: RoleDefinition,
@@ -462,9 +520,9 @@ export class AgentOrchestrator {
         role.authority_level,
         parent.agent.authority.max_authority_level - 1
       ),
-      allowed_tools: role.tools.filter((tool) =>
-        parent.agent.authority.allowed_tools.includes(tool)
-      ),
+      // An entry is a category or, since #1314, one tool by name: a named
+      // tool is within a bound that allows it by name or allows its category.
+      allowed_tools: role.tools.filter((tool) => withinToolEntries(parent.agent.authority.allowed_tools, tool)),
       denied_tools: parent.agent.authority.denied_tools,
       max_token_budget: Math.floor(parent.agent.authority.max_token_budget / 2),
       can_spawn_children: canSpawnChildren(role),

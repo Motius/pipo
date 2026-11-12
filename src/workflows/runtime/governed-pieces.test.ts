@@ -465,7 +465,7 @@ const PIECES: Array<{
     input: { model: 'claude-opus-4', prompt: 'summarise the vault' },
     target: { prompt: 'summarise the vault' }, severe: ['custom_api_call', 'delete_data'] },
   { id: 'github', action: 'github_create_issue', category: 'write_data',
-    input: { repository: { owner: 'Motius', repo: 'pipo' }, title: 'Flaky test' },
+    input: { repository: { owner: 'motius', repo: 'pipo' }, title: 'Flaky test' },
     target: { title: 'Flaky test' }, severe: ['delete_branch', 'delete_data'], read: 'find_issue' },
   { id: 'google-calendar', action: 'google_calendar_create_event', category: 'write_data',
     input: { calendar_id: 'primary', title: 'Design review' }, target: { calendar_id: 'primary' },

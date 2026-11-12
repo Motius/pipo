@@ -58,19 +58,19 @@ Webhook resume rechecks the run after reading the request body.
 Checked open PRs on 2026-09-15; none of these dependencies was merged into this
 branch:
 
-- A1, [#459](https://github.com/Motius/pipo/pull/459),
+- A1, [#459](https://github.com/motius/pipo/pull/459),
   `ba7251ed2c14fd5183a362c0a02b7500d7a0c5a2`: its policy checkpoint already
   rejects STOPPED runs and CANCELED jobs. Keep its run/step/execution-path,
   target, arguments, version and provenance checks when resolving imports and
   route calls. Keep both Authority and cancellation checkpoints in TTS.
   Its workflow-effect repository remains the single effect receipt store.
-- Retry safety, [#460](https://github.com/Motius/pipo/pull/460),
+- Retry safety, [#460](https://github.com/motius/pipo/pull/460),
   `9f05377eddfaf816552097534d7e0839b295db5d`: retain the shared single-attempt
   policy, entry guards, PAUSED result and nullable finish time. Handler sample
   capture must skip both PAUSED and canceled runs. In its invalid-continuation
   test, canceling the RESUME now cancels the original active job and yields
   STOPPED, rather than generic FAILED.
-- Today, [#450](https://github.com/Motius/pipo/pull/450),
+- Today, [#450](https://github.com/motius/pipo/pull/450),
   `48e0cc7777744ef8f8bda8274e4010557ef4cdee`: replace its older running-job
   cancellation behavior with this transaction and signal. Preserve its other
   orphan/work-item reconciliation. Update its claimed-job cancellation test

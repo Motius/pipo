@@ -63,7 +63,7 @@ const (
 	failureCooldown = 15 * time.Second
 	// installerDownloadURL is where a native install that cannot update
 	// itself gets the current installer.
-	installerDownloadURL = "https://github.com/Motius/pipo/releases/tag/installer-latest"
+	installerDownloadURL = "https://github.com/motius/pipo/releases/tag/installer-latest"
 )
 
 // UpdateState is the updater's latest progress, as reported to the brain.

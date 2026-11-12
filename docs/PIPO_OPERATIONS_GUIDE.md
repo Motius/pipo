@@ -1,15 +1,15 @@
-# Pipo — Migration, Operations, Scaling & Go-to-Market Guide
+# Ignatius — Migration, Operations, Scaling & Go-to-Market Guide
 
-**Repository:** `https://github.com/Motius/pipo.git`  
+**Repository:** `https://github.com/motius/pipo.git`  
 **Upstream source:** the public upstream repository supplied for this migration  
 **Migration workspace:** `/home/ubuntu/pipo-clone`  
 **Prepared:** 7 October 2026
 
 ## Executive summary
 
-Pipo is a clean rebrand and product-surface migration of the upstream always-on autonomous AI daemon. The repository now uses the Pipo identity throughout source code, package metadata, CLI commands, config directories, UI copy, documentation, sidecar packaging, Docker metadata, workflow pieces, tests, filenames, and generated UI assets. The dashboard and ambient pebble use the premium Pipo aesthetic established for the earlier website: dark graphite surfaces, warm signal orange, restrained mint execution states, electric green completion states, system-sans typography, IBM Plex Mono for technical labels, crisp borders, and a round signal pebble.
+Ignatius is a clean rebrand and product-surface migration of the upstream always-on autonomous AI daemon. The repository now uses the Ignatius identity throughout source code, package metadata, CLI commands, config directories, UI copy, documentation, sidecar packaging, Docker metadata, workflow pieces, tests, filenames, and generated UI assets. The dashboard and ambient pebble use the premium Ignatius aesthetic established for the earlier website: dark graphite surfaces, warm signal orange, restrained mint execution states, electric green completion states, system-sans typography, IBM Plex Mono for technical labels, crisp borders, and a round signal pebble.
 
-This package is a source checkout prepared for local development and controlled publication. The local Git remote is set to `https://github.com/Motius/pipo.git`; no remote push or release publication was performed from this workspace.
+This package is a source checkout prepared for local development and controlled publication. The local Git remote is set to `https://github.com/motius/pipo.git`; no remote push or release publication was performed from this workspace.
 
 ## What is included
 
@@ -17,9 +17,9 @@ The source tree retains the upstream product’s actual application surface rath
 
 - **Bun/TypeScript daemon:** persistent process, CLI lifecycle, configuration, LLM routing, voice, awareness, authority, goals, workflows, integrations, storage, and WebSocket communication.
 - **React dashboard:** the v2 shell, rooms, command palette, thread/composer, workflow editor, agents, settings, billing surfaces, onboarding, notifications, and responsive product UI.
-- **Ambient UI:** cursor-following round Pipo pebble, voice states, talk bubble, background-task rail, hotkeys, and reduced-motion behavior.
+- **Ambient UI:** cursor-following round Ignatius pebble, voice states, talk bubble, background-task rail, hotkeys, and reduced-motion behavior.
 - **Go sidecar:** desktop awareness and automation companion, custom titlebar, platform packaging, autostart, browser/webview integration, and token enrollment.
-- **Workflow pieces:** Pipo-native agent, ask, context, notify, regex, test, tool, trigger, and validate pieces plus the engine build pipeline.
+- **Workflow pieces:** Ignatius-native agent, ask, context, notify, regex, test, tool, trigger, and validate pieces plus the engine build pipeline.
 - **Operational documentation:** installation, configuration, self-hosting, sidecar setup, provider integrations, telemetry, security, privacy-oriented controls, and development references.
 
 ## How to get the ZIP
@@ -37,11 +37,11 @@ For a team-owned repository, the preferred long-term path is to publish the chec
 git remote -v
 git status --short
 git add -A
-git commit -m "Rebrand the upstream daemon as Pipo"
+git commit -m "Rebrand the upstream daemon as Ignatius"
 git push -u origin pipo-rebrand:main
 ```
 
-Do not push until the Motius repository access, ownership, branch policy, license posture, and package namespace decisions are confirmed.
+Do not push until the motius repository access, ownership, branch policy, license posture, and package namespace decisions are confirmed.
 
 ## Local requirements
 
@@ -114,7 +114,7 @@ docker run -d --name pipo \
   pipo:local
 ```
 
-Open `http://localhost:1846` and complete setup. The daemon container does not automatically control the host desktop, clipboard, or browser. Install and enroll a Pipo sidecar on each computer where desktop awareness or native automation is needed.
+Open `http://localhost:1846` and complete setup. The daemon container does not automatically control the host desktop, clipboard, or browser. Install and enroll a Ignatius sidecar on each computer where desktop awareness or native automation is needed.
 
 For production, place TLS and authentication at a reverse proxy, restrict the dashboard to trusted networks, use a dedicated data volume, rotate credentials, and send logs to a managed sink. Never expose a setup-mode daemon directly to the public internet.
 
@@ -148,7 +148,7 @@ For a clean uninstall, stop the daemon, remove its autostart definition, uninsta
 
 ## Sidecar management
 
-A sidecar runs on a laptop or desktop and connects back to the Pipo daemon. Use one daemon as the authority and enroll separate sidecars for separate computers. Treat each sidecar token as a credential:
+A sidecar runs on a laptop or desktop and connects back to the Ignatius daemon. Use one daemon as the authority and enroll separate sidecars for separate computers. Treat each sidecar token as a credential:
 
 1. Build or install the sidecar for the target platform.
 2. Start the daemon and open the sidecar enrollment page.
@@ -198,7 +198,7 @@ Move database and object storage to managed services before horizontal replicati
 
 ### Engineering additions
 
-- Contract tests for every Pipo-native workflow piece.
+- Contract tests for every Ignatius-native workflow piece.
 - Cross-platform CI for Bun, macOS, Linux, WSL, and Go sidecar builds.
 - Release signing and provenance attestations.
 - SBOM generation and dependency vulnerability monitoring.
@@ -208,7 +208,7 @@ Move database and object storage to managed services before horizontal replicati
 
 ### Brand and design additions
 
-- Replace the placeholder favicon with the final Pipo mark across dashboard, installer, docs, and release assets.
+- Replace the placeholder favicon with the final Ignatius mark across dashboard, installer, docs, and release assets.
 - Keep dark graphite as the default; expose light mode as an intentional alternate, not an accidental system flash.
 - Use orange only for product signal and action emphasis; reserve green for confirmed completion.
 - Preserve the round pebble silhouette across React, native sidecar, installer, and marketing surfaces.
@@ -228,13 +228,13 @@ The following checks were run in the migration workspace:
 | Focused CLI/WebSocket/log tests | Passed except one host-specific systemd-analyze warning case |
 | Full upstream test suite | Started and produced extensive passing output, but the sandbox prompt window terminated the long run before a final aggregate summary |
 
-The one focused failure was environmental: `systemd-analyze` returned a warning from the sandbox’s unrelated `/etc/systemd/system/envd.service` about deprecated `CPUShares`, while the generated Pipo unit itself was valid. Re-run the full suite on a normal development host for a final aggregate result.
+The one focused failure was environmental: `systemd-analyze` returned a warning from the sandbox’s unrelated `/etc/systemd/system/envd.service` about deprecated `CPUShares`, while the generated Ignatius unit itself was valid. Re-run the full suite on a normal development host for a final aggregate result.
 
 ## Marketing and launch plan
 
 ### Positioning
 
-Lead with the concise promise: **Pipo is your company workflow brain — AI for judgement, code for repetition.** The differentiator is not a chat box with tools; it is a persistent, permission-aware system that can observe context, reason about work, and execute repeatable workflows across connected machines.
+Lead with the concise promise: **Ignatius is your company workflow brain — AI for judgement, code for repetition.** The differentiator is not a chat box with tools; it is a persistent, permission-aware system that can observe context, reason about work, and execute repeatable workflows across connected machines.
 
 ### Initial audiences
 
@@ -263,7 +263,7 @@ Track activation to first successful workflow, time to first sidecar enrollment,
 
 Before publishing the rebrand:
 
-- Confirm Motius owns or is authorized to use the upstream code and license.
+- Confirm motius owns or is authorized to use the upstream code and license.
 - Confirm the final package scopes (`@pipo/brain`, `@pipo/sidecar`) and registry ownership.
 - Confirm the GitHub repository exists and the local remote is correct.
 - Review generated diffs for source-map, fixture, or line-ending noise.
@@ -275,4 +275,4 @@ Before publishing the rebrand:
 
 ## Final operating principle
 
-Pipo should feel premium because it is calm, legible, permission-aware, and dependable under pressure—not because it hides complexity. Keep the visual system restrained, keep automation observable, and keep every consequential action reviewable.
+Ignatius should feel premium because it is calm, legible, permission-aware, and dependable under pressure—not because it hides complexity. Keep the visual system restrained, keep automation observable, and keep every consequential action reviewable.

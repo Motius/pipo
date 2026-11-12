@@ -105,7 +105,7 @@ export function updateInProgress(state: SidecarUpdateState | undefined): boolean
  * there.
  */
 const TRUSTED_MANUAL_COMMAND =
-  /^(Quit pipo first, then run: )?(bun add|npm install) -g @pipo\/sidecar@(latest|\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$|^Download and run the installer: https:\/\/github\.com\/Motius\/pipo\/releases\/tag\/installer-latest$|^Replace \/[^\s;&|`$<>]+ with bin\/pipo from @pipo\/sidecar-linux-(x64|arm64)@\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)? \(npm pack @pipo\/sidecar-linux-(x64|arm64)@\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?\)$/;
+  /^(Quit pipo first, then run: )?(bun add|npm install) -g @pipo\/sidecar@(latest|\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$|^Download and run the installer: https:\/\/github\.com\/motius\/pipo\/releases\/tag\/installer-latest$|^Replace \/[^\s;&|`$<>]+ with bin\/pipo from @pipo\/sidecar-linux-(x64|arm64)@\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)? \(npm pack @pipo\/sidecar-linux-(x64|arm64)@\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?\)$/;
 
 /**
  * How to update a sidecar that cannot do it itself (older sidecars, or an

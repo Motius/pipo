@@ -801,7 +801,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=pipo
             org.opencontainers.image.description=P.I.P.O. — Always-on autonomous AI daemon
-            org.opencontainers.image.vendor=Motius
+            org.opencontainers.image.vendor=motius
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.documentation=https://github.com/${{ github.repository }}
 

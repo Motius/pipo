@@ -21,6 +21,7 @@
  */
 
 import type { LLMMessage } from '../../../llm/provider.ts';
+import { withoutDisabledDesktopTools } from '../desktop-guard.ts';
 import type { Tier, TierMap } from '../../../llm/tiers.ts';
 import type { LLMProviderEntry } from '../../../config/types.ts';
 import type { ToolDefinition } from '../registry.ts';
@@ -273,6 +274,9 @@ export function decideTools(ctx: FilterContext): FilterDecision {
  * simply being forgotten the way it was in #475.
  */
 export function realtimeToolDecision(all: readonly ToolDefinition[]): FilterDecision {
-  return unfiltered(all, 'realtime sessions have a fixed tool list: no per-turn refilter, no working escape hatch');
+  // Not a relevance filter: with desktop.enabled off the always-desktop tools
+  // are not this install's to offer at all (#905). A session started before
+  // the switch flips keeps its list; ToolRegistry.execute refuses those calls.
+  return unfiltered(withoutDisabledDesktopTools(all), 'realtime sessions have a fixed tool list: no per-turn refilter, no working escape hatch');
 }
 

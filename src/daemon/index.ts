@@ -24,6 +24,7 @@ import { initDebugRpcGate, MIN_SECRET_LENGTH } from "./debug-rpc-gate.ts";
 import { hardenProcessInspection } from "./process-hardening.ts";
 import { modelExecDaemonWarning } from "../util/model-exec-marker.ts";
 import { getRecorder, parseInteractionEvent } from "../skills/recorder.ts";
+import { bindDesktopSwitch } from "../actions/tools/desktop-guard.ts";
 import { onRecordingStopped } from "../actions/tools/skills.ts";
 import { createObservation } from "../vault/observations.ts";
 import { replayIfLearned } from "../agents/learned-command-runner.ts";
@@ -523,6 +524,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     console.error('[Daemon] Fix the reported value in ~/.pipo/config.yaml, or delete the file to use defaults.\n');
     process.exit(1);
   }
+
+  // 9b-ter. desktop.enabled (#905). Bound to the live config object, which
+  // Settings changes in place (#1159): see desktop-guard.ts.
+  bindDesktopSwitch(pipoConfig);
 
   // Resolve the bench debug gate once, before any service starts: it refuses a
   // hosted install and deletes pipo_DEBUG_RPC from process.env so explicit

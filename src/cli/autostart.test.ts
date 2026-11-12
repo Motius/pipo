@@ -489,7 +489,7 @@ WantedBy=default.target
     // generateSystemdUnit writes (`... pipo.ts start --foreground`).
     for (const exec of [
       '/home/u/bin/run-pipo.sh',
-      '/usr/bin/docker run --rm ghcr.io/Motius/pipo',
+      '/usr/bin/docker run --rm ghcr.io/motius/pipo',
       '/bin/sh -c "exec pipo serve"',
     ]) {
       const path = unitFile(`[Service]\nExecStart=${exec}\nRestart=on-failure\nRestartSec=5\n`);

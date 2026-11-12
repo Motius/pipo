@@ -18,7 +18,7 @@
   width: min(420px, 100%);
   background: var(--raise);
   border: 1px solid var(--rule);
-  border-radius: 14px 3px 14px 14px;
+  border-radius: 14px;
   box-shadow: 0 30px 70px -30px rgba(0, 0, 0, 0.55), 0 0 0 1px color-mix(in srgb, var(--ink) 4%, transparent);
   padding: 20px 22px 18px;
   animation: jconfirm-pop 0.16s var(--ease-out, ease);
@@ -46,7 +46,7 @@
 .jconfirm__btn {
   height: 36px;
   padding: 0 15px;
-  border-radius: 8px 2px 8px 8px;
+  border-radius: 8px;
   font-family: var(--sans);
   font-size: 13px;
   font-weight: 600;

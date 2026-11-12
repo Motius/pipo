@@ -49,7 +49,7 @@ function pickVariant(): VariantId | null {
 const Drop = ({ ring }: { ring?: boolean }) => (
   <div className="ldrop"><img className="pipo-splash-logo" src={pipoAgentLogo} alt="" />{ring && <span className="ring" />}</div>
 );
-const Word = () => <div className="lword">pipo</div>;
+const Word = () => <div className="lword">Ignatius</div>;
 
 export function BootSplash() {
   // Lazy state init, not useMemo: pickVariant is impure (Math.random +
@@ -106,7 +106,7 @@ export function BootSplash() {
   const statusText = blocked ? "still mounting the vault…" : st.length ? st[Math.min(statusIdx, st.length - 1)] : "";
 
   return (
-    <div className={`jboot ${out ? "out" : ""}`} role="status" aria-label="Starting pipo" aria-live="polite">
+    <div className={`jboot ${out ? "out" : ""}`} role="status" aria-label="Starting Ignatius" aria-live="polite">
       {variant === "summon" && (
         <div className="lstage st-summon">
           <div className="dropwrap"><div className="lbloom" /><Drop /></div>

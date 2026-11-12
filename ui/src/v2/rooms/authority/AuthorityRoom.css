@@ -853,9 +853,9 @@
 .v2-auth__suggestion { border-radius: var(--corner); }
 .v2-auth__stat-value,
 .v2-auth__section-title { font-family: var(--sans); font-weight: 700; letter-spacing: -0.015em; }
-.v2-auth__tab[data-active="true"] { border-radius: 7px 2px 7px 7px; }
+.v2-auth__tab[data-active="true"] { border-radius: 7px; }
 .v2-auth__emergency-btn,
-.v2-auth__btn { border-radius: 7px 2px 7px 7px; }
+.v2-auth__btn { border-radius: 7px; }
 /* impact = the card's edge (authority §01): destructive gets a soft red halo,
    external an amber hairline; urgent keeps its inset ring. */
 .v2-auth__pending[data-tone="accent"] { box-shadow: 0 0 0 1px color-mix(in srgb, var(--listen) 22%, transparent), var(--sh-sm); }

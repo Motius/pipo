@@ -92,6 +92,11 @@ export async function assignPersistentAgentTask(
 
   const agent = deps.orchestrator.getAgent(agentId);
   if (!agent) throw new HttpError(404, `Agent "${agentId}" not found. Use list to see active agents.`);
+  // A sub-agent may give a task only to an agent strictly below it, one it
+  // could have started itself (#1014): the task is its words, run with the
+  // target's authority.
+  const shortfall = deps.orchestrator.delegationShortfall(agentId);
+  if (shortfall) throw new HttpError(403, shortfall);
 
   if (deps.taskManager.isAgentBusy(agentId)) {
     throw new HttpError(409, `Agent "${agent.agent.role.name}" is already running a task.`);

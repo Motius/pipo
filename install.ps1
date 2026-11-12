@@ -2,7 +2,7 @@
 #
 # Usage (Windows PowerShell 5.1 or PowerShell 7):
 #
-#   irm https://raw.githubusercontent.com/Motius/pipo/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/motius/pipo/main/install.ps1 | iex
 #
 # What this does:
 #   1. Checks that WSL2 is installed and has a Linux distribution
@@ -21,8 +21,8 @@
 
 $ErrorActionPreference = "Stop"
 
-$InstallShUrl = "https://raw.githubusercontent.com/Motius/pipo/main/install.sh"
-$SidecarUrl   = "https://github.com/Motius/pipo/releases/download/installer-latest/pipo-Setup.exe"
+$InstallShUrl = "https://raw.githubusercontent.com/motius/pipo/main/install.sh"
+$SidecarUrl   = "https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe"
 
 function Info([string]$m) { Write-Host "  [+] $m" }
 function Warn([string]$m) { Write-Host "  [!] $m" -ForegroundColor Yellow }

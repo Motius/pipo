@@ -10,7 +10,7 @@ set -euo pipefail
 # ── P.I.P.O. Installer ──────────────────────────────────────────
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Motius/pipo/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/motius/pipo/main/install.sh | bash
 #
 #   On WINDOWS do not run that line in PowerShell: `curl` there aliases to
 #   Invoke-WebRequest, and PowerShell re-encodes piped script text with CRLF
@@ -18,7 +18,7 @@ set -euo pipefail
 #   PowerShell bootstrap instead — it downloads this script byte-safe and
 #   runs it inside WSL2:
 #
-#     irm https://raw.githubusercontent.com/Motius/pipo/main/install.ps1 | iex
+#     irm https://raw.githubusercontent.com/motius/pipo/main/install.ps1 | iex
 #
 # What this does:
 #   1. Detects your OS (macOS / Linux / WSL)
@@ -28,7 +28,7 @@ set -euo pipefail
 #
 # ─────────────────────────────────────────────────────────────────────
 
-REPO_URL="https://github.com/Motius/pipo.git"
+REPO_URL="https://github.com/motius/pipo.git"
 INSTALL_DIR="$HOME/.pipo/daemon"
 
 CYAN='\033[0;36m'

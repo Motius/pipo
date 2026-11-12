@@ -2012,7 +2012,7 @@
 
 /* — Canvas node (design .wfnode) — */
 .wf-node {
-  border-radius: 11px 3px 11px 11px;
+  border-radius: 11px;
   background: var(--raise);
   border-color: var(--rule);
   box-shadow: var(--sh-md);
@@ -2062,7 +2062,7 @@
 
 /* zoom / controls (design .zoomctl) */
 .react-flow__controls {
-  border-radius: 8px 2px 8px 8px;
+  border-radius: 8px;
   overflow: hidden;
   border: 1px solid var(--rule);
   background: var(--raise);

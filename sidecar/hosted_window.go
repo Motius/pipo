@@ -100,7 +100,7 @@ const hostedShellHTML = `<!doctype html>
 </head>
 <body>
 <div class="pagebody" tabindex="-1">
-  <div class="bhead"><span class="word"><span class="u">use</span>pipo</span></div>
+  <div class="bhead"><span class="word">Ignatius</span></div>
   <div class="center">
     <div class="statusbox">
       <div class="dropwrap">
