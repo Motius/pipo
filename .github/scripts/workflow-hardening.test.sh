@@ -1064,7 +1064,8 @@ expect_caught 'a short SHA on the publish path' pinned "$WORKFLOWS/sidecar-relea
 		'      - name: Install osslsigncode' $'      - run: go build -o pipo-Setup.exe ./installer/\n      - name: Install osslsigncode' \
 		'builds in a job holding id-token'
 	expect_caught 'id-token back on the installer build job (#779)' narrow "$WORKFLOWS/installer-release.yml" \
-		$'    permissions:\n      contents: read\n    outputs:' $'    permissions:\n      contents: read\n      id-token: write\n    outputs:' \
+		$'  build-windows:\n    needs: [resolve, sign-sidecar-windows]\n    if: needs.resolve.outputs.should_release == \'true\'\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n    outputs:' \
+		$'  build-windows:\n    needs: [resolve, sign-sidecar-windows]\n    if: needs.resolve.outputs.should_release == \'true\'\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n      id-token: write\n    outputs:' \
 		'build-windows: builds in a job holding id-token'
 	expect_caught 'the installer Google credentials file left in the workspace (#779)' narrow "$WORKFLOWS/installer-release.yml" \
 		$'          create_credentials_file: false\n' '' \
