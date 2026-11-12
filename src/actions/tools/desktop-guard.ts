@@ -1,11 +1,11 @@
 /**
  * The `desktop.enabled` off switch (#905).
  *
- * `desktop.enabled: false` means Ignatius does not ask for or act on the user's
+ * `desktop.enabled: false` means pipo does not ask for or act on the user's
  * desktop: it requests no window lists, UI trees or screen captures, and sends
  * no clicks, typing, key presses, app launches or window focus, and does not
  * read or write the clipboard (#1159) -- on this machine or on a connected
- * sidecar. On the observer side Ignatius ignores what arrives: awareness and the
+ * sidecar. On the observer side pipo ignores what arrives: awareness and the
  * generic sidecar event pipeline drop the screen and clipboard events a
  * sidecar sends (sidecar-event-routing.ts), the pebble takes no screenshot or
  * window list of its own, and a skill recording stops. It does NOT stop a
@@ -107,8 +107,8 @@ export function isDesktopEnabled(): boolean {
 export const DESKTOP_DISABLED_CODE = 'DESKTOP_DISABLED';
 
 export const DESKTOP_DISABLED_MESSAGE =
-  'Error: Desktop control is turned off on this Ignatius (desktop.enabled: false), so this was not run. '
-  + 'Ignatius will not list windows, look at the screen, read or write the clipboard or act on desktop apps on any machine until the user turns it back on '
+  'Error: Desktop control is turned off on this pipo (desktop.enabled: false), so this was not run. '
+  + 'pipo will not list windows, look at the screen, read or write the clipboard or act on desktop apps on any machine until the user turns it back on '
   + '(Settings > General > Desktop control, or desktop.enabled: true in config.yaml and a restart). '
   + 'Browser tools still work. Do NOT retry; tell the user desktop control is off.';
 
@@ -135,7 +135,7 @@ export function toolAlwaysUsesDesktop(tool: Pick<ToolDefinition, 'category' | 'u
 /**
  * Screen awareness (#1314 m6). Turning it off blinds the pebble and pauses
  * the sidecar's own capture, so a tool that captures the screen is refused
- * too: the person's "stop looking" covers every way Ignatius looks.
+ * too: the person's "stop looking" covers every way pipo looks.
  */
 let screenSource: () => boolean = () => true;
 export function setScreenCaptureEnabledSource(source: (() => boolean) | null): void {
@@ -159,7 +159,7 @@ export const SCREEN_CAPTURE_TOOLS: ReadonlySet<string> = new Set(['desktop_scree
  * awareness off stops all of them, on every path, as it stops the screenshots.
  *
  * NOT here, by owner decision: `browser_navigate`, `browser_snapshot` and
- * `browser_evaluate`. They read the Ignatius browser's own tabs, in its own
+ * `browser_evaluate`. They read the pipo browser's own tabs, in its own
  * browser, not what the person has on their screen, so they keep working with
  * awareness off. (`browser_screenshot` stays a screenshot and stays off.)
  */
@@ -203,7 +203,7 @@ export function withoutScreenText<T>(reply: T): T {
 
 export const SCREEN_CAPTURE_DISABLED_CODE = 'SCREEN_CAPTURE_DISABLED';
 export const SCREEN_CAPTURE_DISABLED_MESSAGE =
-  'Error: Screen awareness is turned off on this Ignatius, so this was not run: Ignatius does not take screenshots or read what is on a screen '
+  'Error: Screen awareness is turned off on this pipo, so this was not run: pipo does not take screenshots or read what is on a screen '
   + '(windows, controls, page text) on any machine until the user turns awareness back on. Do NOT retry; tell the user awareness is off.';
 
 /** The refusal text for this call, or null when it may run. */
@@ -249,7 +249,7 @@ export function screenAwarenessOffSystemNote(): string | null {
     'The user has turned screen awareness off. The tool guide above documents tools that read the screen, '
     + 'but on this install you cannot take screenshots or read what is on any screen: '
     + `${[...SCREEN_READ_TOOLS].join(', ')} and desktop_click with action get_value are not available, and record_skill cannot start a recording. `
-    + `The Ignatius browser's own tabs stay readable: ${[...BROWSER_PAGE_READS].join(', ')} still work. `
+    + `The pipo browser's own tabs stay readable: ${[...BROWSER_PAGE_READS].join(', ')} still work. `
     + 'Do not read the screen another way, for example through shell commands. '
     + 'If the user asks about what is on their screen, say that screen awareness is off and that they can turn it back on.',
   ].join('\n');
@@ -266,7 +266,7 @@ export function desktopOffSystemNote(): string | null {
     + 'and record_skill cannot start a recording. '
     + 'Do not try to reach the desktop another way, for example through shell commands. '
     + 'If the user asks for something on their desktop, say that desktop control is off and that they can turn it back on '
-    + 'in Settings > General > Desktop control, or by setting desktop.enabled to true in config.yaml and restarting Ignatius.',
+    + 'in Settings > General > Desktop control, or by setting desktop.enabled to true in config.yaml and restarting pipo.',
   ].join('\n');
 }
 

@@ -1,6 +1,6 @@
 <div align="center">
 
-# IGNATIUS
+# PIPO
 
 ### Your company workflow brain
 
@@ -13,7 +13,7 @@
 
 _An autonomous workflow daemon with desktop awareness, multi-agent delegation, visual workflows, and explicit authority controls._
 
-Ignatius is more than a chatbot with tools. It is a persistent daemon that can understand context and act within the authority limits you define. Run the daemon locally, in Docker, or on an approved host, then connect sidecars on the machines where desktop access is needed.
+Pipo is more than a chatbot with tools. It is a persistent daemon that can understand context and act within the authority limits you define. Run the daemon locally, in Docker, or on an approved host, then connect sidecars on the machines where desktop access is needed.
 
 </div>
 
@@ -25,7 +25,7 @@ Ignatius is more than a chatbot with tools. It is a persistent daemon that can u
 
 ## Contents
 
-- [What makes Ignatius different](#-what-makes-pipo-different)
+- [What makes Pipo different](#-what-makes-pipo-different)
 - [Quick start](#-quick-start)
 - [Ambient mode](#-ambient-mode)
 - [Use cases](#-use-cases)
@@ -111,7 +111,7 @@ If you do not want to manage a server, run the Docker image on an approved
 managed container host. The provider must support persistent volumes, WebSocket
 connections, HTTPS termination, and outbound connections to the model providers
 you configure. Follow the provider's instructions for DNS, TLS, backups, and
-secret management; Ignatius does not provision those services for you.
+secret management; Pipo does not provision those services for you.
 
 ---
 
@@ -191,7 +191,7 @@ The first time you run `pipo start`, the daemon boots in setup mode and the dash
 
 > **Restart after first-time setup:** The daemon constructs background services (heartbeat, commitments, awareness) at boot, gated on setup having already been completed. Once you finish setup in the dashboard, those services don't activate until the next start — the dashboard shows a banner reminding you. Run `pipo restart` (or stop/start) to bring them online. This will go away in a follow-up that constructs the services in-process at setup completion.
 
-> **Windows note:** The Ignatius daemon does not run natively on Windows — it runs inside WSL2. The [install.ps1 one-liner](#one-liner-recommended) sets that up for you (WSL2, Bun, repo, CLI), or use Docker Desktop for Windows. The Windows desktop sidecar remains supported separately via [pipo-Setup.exe](https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe). The dashboard and core workflow engine do not require a native desktop sidecar.
+> **Windows note:** The Pipo daemon does not run natively on Windows — it runs inside WSL2. The [install.ps1 one-liner](#one-liner-recommended) sets that up for you (WSL2, Bun, repo, CLI), or use Docker Desktop for Windows. The Windows desktop sidecar remains supported separately via [pipo-Setup.exe](https://github.com/motius/pipo/releases/download/installer-latest/pipo-Setup.exe). The dashboard and core workflow engine do not require a native desktop sidecar.
 
 ### Docker
 

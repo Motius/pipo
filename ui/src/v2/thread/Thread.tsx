@@ -396,7 +396,7 @@ function EmptyState() {
         Tell me what’s <em>on your mind.</em>
       </h1>
       <p className="v2-thread__empty-lede">
-        Start with a thought, a question, or a task. Ignatius will help you make sense of it,
+        Start with a thought, a question, or a task. Pipo will help you make sense of it,
         take the repetitive parts off your plate, and pause whenever your judgment matters.
       </p>
       <div className="v2-thread__empty-prompts" aria-label="Conversation starters">

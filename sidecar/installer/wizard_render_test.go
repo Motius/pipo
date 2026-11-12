@@ -115,7 +115,7 @@ func TestWizardPanelSaysWhatIsOnTheMachine(t *testing.T) {
 			name:      "nothing installed yet",
 			st:        with(func(s *wizardState) { s.Phase, s.Detected, s.FirstInstall = "plan", true, true }),
 			status:    "Not installed",
-			subtitle:  "This installs the Ignatius sidecar on this machine.",
+			subtitle:  "This installs the pipo sidecar on this machine.",
 			button:    "Install",
 			autostart: true,
 			cancel:    "Cancel",
@@ -124,7 +124,7 @@ func TestWizardPanelSaysWhatIsOnTheMachine(t *testing.T) {
 			name:     "an update is waiting",
 			st:       with(func(s *wizardState) { s.Phase, s.Detected, s.Installed = "plan", true, true }),
 			status:   "Update available",
-			subtitle: "This updates the Ignatius sidecar on this machine.",
+			subtitle: "This updates the pipo sidecar on this machine.",
 			button:   "Update",
 			cancel:   "Cancel",
 		},
@@ -135,17 +135,17 @@ func TestWizardPanelSaysWhatIsOnTheMachine(t *testing.T) {
 			st:       with(func(s *wizardState) { s.Phase, s.Detected, s.Installed, s.UpToDate = "plan", true, true, true }),
 			status:   "Up to date",
 			subtitle: "You already have the latest sidecar — it runs in the system tray, near the clock.",
-			button:   "Launch Ignatius",
+			button:   "Launch pipo",
 			cancel:   "Close",
 		},
-		// --no-launch: a "Launch Ignatius" button would only close the window.
+		// --no-launch: a "Launch pipo" button would only close the window.
 		{
 			name: "already current, told not to launch",
 			st: with(func(s *wizardState) {
 				s.Phase, s.Detected, s.Installed, s.UpToDate, s.NoLaunch = "plan", true, true, true, true
 			}),
 			status:    "Up to date",
-			subtitle:  "You already have the latest sidecar. Start Ignatius from the Start menu when you want it.",
+			subtitle:  "You already have the latest sidecar. Start pipo from the Start menu when you want it.",
 			button:    "Close",
 			closeOnly: true,
 		},
@@ -189,8 +189,8 @@ func TestWizardPanelSaysWhatIsOnTheMachine(t *testing.T) {
 			name:      "a first install that finished",
 			st:        with(func(s *wizardState) { s.Phase, s.Detected, s.Installed, s.FirstInstall = "done", true, true, true }),
 			status:    "Installed",
-			subtitle:  "Installed. Ignatius lives in the system tray, near the clock.",
-			button:    "Launch Ignatius",
+			subtitle:  "Installed. pipo lives in the system tray, near the clock.",
+			button:    "Launch pipo",
 			closeOnly: true,
 		},
 		// The one macOS case: the done screen there routes through the
@@ -203,15 +203,15 @@ func TestWizardPanelSaysWhatIsOnTheMachine(t *testing.T) {
 			}),
 			status:    "Installed",
 			subtitle:  "Installed. pipo will ask for its permissions, then live in the menu bar, at the top-right of your screen.",
-			button:    "Launch Ignatius",
+			button:    "Launch pipo",
 			closeOnly: true,
 		},
 		{
 			name:      "an update that finished",
 			st:        with(func(s *wizardState) { s.Phase, s.Detected, s.Installed = "done", true, true }),
 			status:    "Updated",
-			subtitle:  "Updated. Ignatius lives in the system tray, near the clock.",
-			button:    "Launch Ignatius",
+			subtitle:  "Updated. pipo lives in the system tray, near the clock.",
+			button:    "Launch pipo",
 			closeOnly: true,
 		},
 		{
@@ -220,7 +220,7 @@ func TestWizardPanelSaysWhatIsOnTheMachine(t *testing.T) {
 				s.Phase, s.Detected, s.Installed, s.FirstInstall, s.NoLaunch = "done", true, true, true, true
 			}),
 			status:    "Installed",
-			subtitle:  "Installed. Start Ignatius from the Start menu when you want it.",
+			subtitle:  "Installed. Start pipo from the Start menu when you want it.",
 			button:    "Close",
 			closeOnly: true,
 		},

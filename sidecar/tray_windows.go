@@ -411,7 +411,7 @@ func showTrayMenu(hwnd uintptr) {
 	}
 
 	// Controls — the two toggles worth a click (checkable).
-	appendTrayCheck(hMenu, "Pause Ignatius", trayMenuPauseID, ts.Paused)
+	appendTrayCheck(hMenu, "Pause pipo", trayMenuPauseID, ts.Paused)
 	appendTrayCheck(hMenu, "Mute microphone", trayMenuMuteID, ts.Muted)
 	procAppendMenuW.Call(hMenu, trayMfSeparator, 0, 0)
 

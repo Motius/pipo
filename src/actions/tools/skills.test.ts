@@ -74,7 +74,7 @@ describe('skill tools', () => {
       getDb().prepare("UPDATE skills SET steps_json = '[]' WHERE id = ?").run(s.id);
       const failure = await outcomeOf(runSkillTool.execute({ name: 'note' }));
       expect(failure).toMatchObject({ status: 'blocked', code: 'SKILL_NOT_RUNNABLE', effect: 'not_started' });
-      expect(failure.message).toContain('content changed outside Ignatius');
+      expect(failure.message).toContain('content changed outside pipo');
       expect(calls).toHaveLength(0);
     });
 
@@ -158,7 +158,7 @@ describe('skill tools', () => {
       upsertSkill({ name: 'b', description: 'does b', steps: [{ action: 'wait', ms: 1 }] });
       getDb().prepare("UPDATE skills SET steps_json = '[{\"action\":\"wait\",\"ms\":2}]' WHERE id = ?").run(s.id);
       const listed = String(await manageSkillsTool.execute({ action: 'list' }));
-      expect(listed).toContain('- a(): does a [not runnable: content changed outside Ignatius');
+      expect(listed).toContain('- a(): does a [not runnable: content changed outside pipo');
       expect(listed).toContain('- b(): does b');
       expect(manageSkillsTool.authorityGate!({ action: 'list' })).toBeNull();
       const gate = manageSkillsTool.authorityGate!({ action: 'delete', name: 'b' })!;

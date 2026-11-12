@@ -191,7 +191,7 @@ function integrityNote(s: Skill): string {
   if (s.integrity === 'ok') return '';
   return s.integrity === 'unsigned'
     ? ' [not runnable: stored before signing; delete and record again]'
-    : ' [not runnable: content changed outside Ignatius; delete and record again]';
+    : ' [not runnable: content changed outside pipo; delete and record again]';
 }
 
 export const runSkillTool: ToolDefinition = {
@@ -357,7 +357,7 @@ export const manageSkillsTool: ToolDefinition = {
 };
 
 const RECORDING_INTENT =
-  'Start recording a skill: Ignatius watches your clicks and typing in every app until you stop it or 10 minutes pass';
+  'Start recording a skill: pipo watches your clicks and typing in every app until you stop it or 10 minutes pass';
 
 let capTimer: ReturnType<typeof setTimeout> | null = null;
 /** The sidecar whose input hooks the live recording installed. */

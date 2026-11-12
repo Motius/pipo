@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	displayName      = "Ignatius"
-	publisherName    = "Ignatius"
+	displayName      = "pipo"
+	publisherName    = "pipo"
 	uninstallExeName = "uninstall.exe"
-	startMenuLnkName = "Ignatius.lnk"
+	startMenuLnkName = "pipo.lnk"
 )
 
 // registerInstall writes the uninstall key, drops the Start Menu shortcut,
