@@ -39,7 +39,7 @@
 .rs-brand { display: flex; align-items: center; gap: 8px; padding: 2px 9px 12px; flex-shrink: 0; }
 .rshell.slim .rs-brand { padding: 2px 0 10px; }
 .rs-brand .lg { width: 19px; height: 19px; position: relative; flex-shrink: 0; }
-.rs-brand .lg .r { position: absolute; inset: 0; border: 2px solid var(--ink); border-radius: 50% 4px 50% 50%; }
+.rs-brand .lg .r { position: absolute; inset: 0; border: 2px solid var(--ink); border-radius: 50%; }
 .rs-brand .w { font-size: 13px; font-weight: 700; letter-spacing: -.03em; color: var(--ink); }
 .rs-brand .w span { color: var(--ink3); }
 

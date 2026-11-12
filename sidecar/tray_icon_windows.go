@@ -3,8 +3,8 @@
 package main
 
 // Runtime tray-icon synthesis: the notification-area icon mirrors the pebble
-// state with a coloured dot at the drop's corner, matching the macOS status
-// item (pipoMakeDropImage in tray_darwin.go). Windows ships only two static
+// state with a coloured dot at the mark's edge, matching the macOS status
+// item (pipoMakeCircleImage in tray_darwin.go). Windows ships only two static
 // .ico resources (brand / connection-error), so the stateful variants are
 // composed at runtime: pull the brand icon's colour plane into a writable
 // 32-bit DIB, paint the dot with full alpha directly into the pixel buffer

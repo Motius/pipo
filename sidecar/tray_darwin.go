@@ -93,36 +93,23 @@ extern void goTrayUpdate(void);
 static NSStatusItem*     gStatusItem = nil;
 static pipoTrayTarget* gTrayTarget = nil;
 
-// pipoDropPath builds the brand drop: a rounded box with three big-radius
-// corners and one small ("sharp") corner at the top-right, matching the web
-// cursor pebble's `border-radius: 50% 4px 50% 50%`. The dot sits over that
-// sharp corner.
-static NSBezierPath* pipoDropPath(NSRect r, CGFloat rBig, CGFloat rSharp) {
-    NSBezierPath* p = [NSBezierPath bezierPath];
-    NSPoint topMid = NSMakePoint(NSMidX(r), NSMaxY(r));
-    NSPoint tr = NSMakePoint(NSMaxX(r), NSMaxY(r));
-    NSPoint br = NSMakePoint(NSMaxX(r), NSMinY(r));
-    NSPoint bl = NSMakePoint(NSMinX(r), NSMinY(r));
-    NSPoint tl = NSMakePoint(NSMinX(r), NSMaxY(r));
-    [p moveToPoint:topMid];
-    [p appendBezierPathWithArcFromPoint:tr toPoint:br radius:rSharp]; // top-right = sharp
-    [p appendBezierPathWithArcFromPoint:br toPoint:bl radius:rBig];   // bottom-right
-    [p appendBezierPathWithArcFromPoint:bl toPoint:tl radius:rBig];   // bottom-left
-    [p appendBezierPathWithArcFromPoint:tl toPoint:topMid radius:rBig]; // top-left
-    [p closePath];
-    return p;
+// pipoCirclePath builds the brand mark: a plain circle. The old drop figure
+// (three big corners + one sharp corner) was retired - every brand mark is a
+// circle now, matching the web pebble's `border-radius: 50%`.
+static NSBezierPath* pipoCirclePath(NSRect r) {
+    return [NSBezierPath bezierPathWithOvalInRect:r];
 }
 
-// pipoMakeDropImage renders the status-item icon for the given state.
+// pipoMakeCircleImage renders the status-item icon for the given state.
 // stateCode matches pebbleStateToInt (0 idle, 1 listening, 2 thinking,
 // 3 speaking, 4 working, 5 asking, 6 done, 7 muted). muted != 0 → dashed.
-static NSImage* pipoMakeDropImage(int stateCode, int muted) {
+static NSImage* pipoMakeCircleImage(int stateCode, int muted) {
     CGFloat S = 18.0;
     NSImage* img = [[NSImage alloc] initWithSize:NSMakeSize(S, S)];
     [img lockFocus];
     [[NSGraphicsContext currentContext] setShouldAntialias:YES];
 
-    // Appearance-aware ink: the drop must read on both light and dark menu bars.
+    // Appearance-aware ink: the mark must read on both light and dark menu bars.
     BOOL dark = YES;
     if (@available(macOS 10.14, *)) {
         NSAppearanceName n = [gStatusItem.button.effectiveAppearance
@@ -132,19 +119,19 @@ static NSImage* pipoMakeDropImage(int stateCode, int muted) {
     NSColor* ink = dark ? [NSColor colorWithCalibratedWhite:0.94 alpha:1.0]
                         : [NSColor colorWithCalibratedWhite:0.11 alpha:1.0];
 
-    NSRect dropRect = NSMakeRect(2.0, 1.5, 12.0, 12.0);
-    NSBezierPath* drop = pipoDropPath(dropRect, 6.0, 2.5);
-    drop.lineWidth = 1.6;
+    NSRect markRect = NSMakeRect(2.0, 1.5, 12.0, 12.0);
+    NSBezierPath* mark = pipoCirclePath(markRect);
+    mark.lineWidth = 1.6;
     if (muted) {
         CGFloat dash[2] = {2.0, 1.6};
-        [drop setLineDash:dash count:2 phase:0.0];
+        [mark setLineDash:dash count:2 phase:0.0];
         [[ink colorWithAlphaComponent:0.55] set];
     } else {
         [ink set];
     }
-    [drop stroke];
+    [mark stroke];
 
-    // State dot at the sharp corner. Muted / idle show no dot.
+    // State dot at the mark's top-right. Muted / idle show no dot.
     if (stateCode != 0 && !muted) {
         NSColor* dc = nil;
         switch (stateCode) {
@@ -177,7 +164,7 @@ static void pipoTraySetup(void) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     gStatusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    gStatusItem.button.image = pipoMakeDropImage(0, 0);
+    gStatusItem.button.image = pipoMakeCircleImage(0, 0);
     gStatusItem.button.toolTip = @"pipo";
 
     gTrayTarget = [[pipoTrayTarget alloc] init];
@@ -228,7 +215,7 @@ static void pipoTrayRebuild(const char* header, int waiting, int paused, int mut
     (void)online;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!gStatusItem) return;
-        gStatusItem.button.image = pipoMakeDropImage(stateCode, muted);
+        gStatusItem.button.image = pipoMakeCircleImage(stateCode, muted);
 
         NSMenu* menu = [[NSMenu alloc] init];
         menu.autoenablesItems = NO;
